@@ -1,0 +1,25 @@
+*.apk -text
+*.apks -text
+*.xapk -text
+*.obb -text
+*.so -text
+*.dex -text
+*.jar -text
+*.zip -text
+*.bin -text
+*.img -text
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.ogg -text
+*.mp4 -text
+*.bik -text
+*.uasset -text
+*.upk -text
+*.tfc -text
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.smali text eol=lf
+*.xml text eol=lf
+*.yml text eol=lf

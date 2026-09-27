@@ -1,0 +1,237 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bbdf925f..44d77fba 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -220,7 +220,7 @@ void A32AddressSpace::EmitPrelude() {
+     prelude_info.add_ticks = EmitCallTrampoline<&A32::UserCallbacks::AddTicks>(code, conf.callbacks);
+     prelude_info.get_ticks_remaining = EmitCallTrampoline<&A32::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
+ 
+-    oaknut::Label return_from_run_code, l_return_to_dispatcher;
++    oaknut::Label return_from_run_code, l_return_to_dispatcher, l_fast_dispatch_table;
+ 
+     prelude_info.run_code = code.xptr<PreludeInfo::RunCodeFuncType>();
+     {
+@@ -306,7 +306,7 @@ void A32AddressSpace::EmitPrelude() {
+ 
+     prelude_info.return_to_dispatcher = code.xptr<void*>();
+     {
+-        oaknut::Label l_this, l_addr;
++        oaknut::Label l_this, l_addr, fast_dispatch_miss;
+ 
+         code.LDAR(Wscratch0, Xhalt);
+         code.CBNZ(Wscratch0, return_from_run_code);
+@@ -316,6 +316,29 @@ void A32AddressSpace::EmitPrelude() {
+             code.B(LE, return_from_run_code);
+         }
+ 
++        if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++            // A32JitState::GetLocationDescriptor() is the 32-bit PC followed
++            // by upper_location_descriptor. Probe a direct-mapped cache here
++            // so indirect branches don't enter C++ on every guest call.
++            code.LDR(W0, Xstate, offsetof(A32JitState, regs) + sizeof(u32) * 15);
++            code.LDR(W1, Xstate, offsetof(A32JitState, upper_location_descriptor));
++            code.ORR(X0, X0, X1, LSL, 32);
++
++            code.LSR(X2, X0, 1);
++            code.LSR(X1, X0, 32);
++            code.EOR(X1, X1, X2);
++            code.AND(X1, X1, fast_dispatch_table_mask);
++            code.LSL(X1, X1, 4);
++            code.LDR(X3, l_fast_dispatch_table);
++            code.ADD(X3, X3, X1);
++            code.LDP(X1, X2, X3);
++            code.CMP(X1, X0);
++            code.B(NE, fast_dispatch_miss);
++            code.CBZ(X2, fast_dispatch_miss);
++            code.BR(X2);
++            code.l(fast_dispatch_miss);
++        }
++
+         code.LDR(X0, l_this);
+         code.MOV(X1, Xstate);
+         code.LDR(Xscratch0, l_addr);
+@@ -359,6 +382,8 @@ void A32AddressSpace::EmitPrelude() {
+     code.align(8);
+     code.l(l_return_to_dispatcher);
+     code.dx(mcl::bit_cast<u64>(prelude_info.return_to_dispatcher));
++    code.l(l_fast_dispatch_table);
++    code.dx(mcl::bit_cast<u64>(fast_dispatch_table.data()));
+ 
+     prelude_info.end_of_prelude = code.offset();
+ 
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae777..421623ab 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -61,16 +61,34 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
+ }
+ 
+ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
++    FastDispatchEntry& fast_entry = fast_dispatch_table[FastDispatchIndex(descriptor)];
++    if (fast_entry.code_ptr && fast_entry.descriptor == descriptor.Value()) {
++        return fast_entry.code_ptr;
++    }
++
+     if (CodePtr block_entry = Get(descriptor)) {
++        fast_entry.code_ptr = block_entry;
++        fast_entry.descriptor = descriptor.Value();
+         return block_entry;
+     }
+ 
+     IR::Block ir_block = GenerateIR(descriptor);
+     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
++    fast_entry.code_ptr = block_info.entry_point;
++    fast_entry.descriptor = descriptor.Value();
+     return block_info.entry_point;
+ }
+ 
++void AddressSpace::ClearFastDispatchTable() {
++    for (FastDispatchEntry& entry : fast_dispatch_table) {
++        entry.code_ptr = nullptr;
++    }
++}
++
+ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
++    // Invalidations are rare and can affect linked neighbours, so discard the
++    // tiny lookup cache wholesale instead of risking a stale JIT code pointer.
++    ClearFastDispatchTable();
+     UnprotectCodeMemory();
+ 
+     for (const auto& descriptor : descriptors) {
+@@ -90,6 +108,7 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+ }
+ 
+ void AddressSpace::ClearCache() {
++    ClearFastDispatchTable();
+     block_entries.clear();
+     reverse_block_entries.clear();
+     block_infos.clear();
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 835566bd..d678ecf6 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -5,6 +5,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <map>
+ #include <optional>
+ 
+@@ -46,6 +47,23 @@ public:
+     void DumpDisassembly() const;
+ 
+ protected:
++    struct alignas(16) FastDispatchEntry {
++        u64 descriptor = 0;
++        CodePtr code_ptr = nullptr;
++    };
++
++    static constexpr size_t fast_dispatch_table_size = 16 * 1024;
++    static constexpr u64 fast_dispatch_table_mask = fast_dispatch_table_size - 1;
++    static_assert((fast_dispatch_table_size & fast_dispatch_table_mask) == 0);
++    static_assert(sizeof(FastDispatchEntry) == 16);
++
++    static size_t FastDispatchIndex(IR::LocationDescriptor descriptor) {
++        const u64 value = descriptor.Value();
++        return static_cast<size_t>(((value >> 1) ^ (value >> 32)) & fast_dispatch_table_mask);
++    }
++
++    void ClearFastDispatchTable();
++
+     virtual EmitConfig GetEmitConfig() = 0;
+     virtual void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) = 0;
+ 
+@@ -80,6 +98,11 @@ protected:
+     tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
+     tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
+ 
++    // The AArch64 backend has no implementation of IR::Term::FastDispatchHint.
++    // Keep a compact direct-mapped descriptor -> code cache that the generated
++    // dispatcher can probe before falling back to the C++ robin_map lookup.
++    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table{};
++
+     ExceptionHandler exception_handler;
+     FastmemManager fastmem_manager;
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index 909dde73..bd5847f1 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -24,10 +24,73 @@ using namespace oaknut::util;
+ 
+ oaknut::Label EmitA32Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond cond) {
+     oaknut::Label pass;
+-    // TODO: Flags in host flags
+     code.LDR(Wscratch0, Xstate, offsetof(A32JitState, cpsr_nzcv));
+-    code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+-    code.B(static_cast<oaknut::Cond>(cond), pass);
++
++    // A32JitState stores N, Z, C and V in their architectural bits 31..28.
++    // Test those bits directly instead of restoring NZCV with MSR before
++    // every conditional block. Besides being cheaper, this leaves host flags
++    // available to the first emitted guest operation.
++    switch (cond) {
++    case IR::Cond::EQ:
++        code.TBNZ(Wscratch0, 30, pass);
++        break;
++    case IR::Cond::NE:
++        code.TBZ(Wscratch0, 30, pass);
++        break;
++    case IR::Cond::CS:
++        code.TBNZ(Wscratch0, 29, pass);
++        break;
++    case IR::Cond::CC:
++        code.TBZ(Wscratch0, 29, pass);
++        break;
++    case IR::Cond::MI:
++        code.TBNZ(Wscratch0, 31, pass);
++        break;
++    case IR::Cond::PL:
++        code.TBZ(Wscratch0, 31, pass);
++        break;
++    case IR::Cond::VS:
++        code.TBNZ(Wscratch0, 28, pass);
++        break;
++    case IR::Cond::VC:
++        code.TBZ(Wscratch0, 28, pass);
++        break;
++    case IR::Cond::HI: {  // C && !Z
++        oaknut::Label fail;
++        code.TBZ(Wscratch0, 29, fail);
++        code.TBZ(Wscratch0, 30, pass);
++        code.l(fail);
++        break;
++    }
++    case IR::Cond::LS:  // !C || Z
++        code.TBZ(Wscratch0, 29, pass);
++        code.TBNZ(Wscratch0, 30, pass);
++        break;
++    case IR::Cond::GE:  // N == V
++        code.EOR(Wscratch0, Wscratch0, Wscratch0, LSL, 3);
++        code.TBZ(Wscratch0, 31, pass);
++        break;
++    case IR::Cond::LT:  // N != V
++        code.EOR(Wscratch0, Wscratch0, Wscratch0, LSL, 3);
++        code.TBNZ(Wscratch0, 31, pass);
++        break;
++    case IR::Cond::GT: {  // !Z && N == V
++        oaknut::Label fail;
++        code.TBNZ(Wscratch0, 30, fail);
++        code.EOR(Wscratch0, Wscratch0, Wscratch0, LSL, 3);
++        code.TBZ(Wscratch0, 31, pass);
++        code.l(fail);
++        break;
++    }
++    case IR::Cond::LE:  // Z || N != V
++        code.TBNZ(Wscratch0, 30, pass);
++        code.EOR(Wscratch0, Wscratch0, Wscratch0, LSL, 3);
++        code.TBNZ(Wscratch0, 31, pass);
++        break;
++    default:
++        ASSERT_MSG(false, "Unknown cond {}", static_cast<size_t>(cond));
++        break;
++    }
+     return pass;
+ }
+ 
