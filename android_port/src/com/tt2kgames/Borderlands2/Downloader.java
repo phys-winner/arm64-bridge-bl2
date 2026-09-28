@@ -54,7 +54,7 @@ public final class Downloader extends Activity {
             File main = new File(directory, "main.31.com.tt2kgames.Borderlands2.obb");
             File patch = new File(directory, "patch.31.com.tt2kgames.Borderlands2.obb");
             return main.isFile() && main.length() == 0x7dfd5000L
-                    && patch.isFile() && patch.length() == 0x77c3a000L;
+                    && patch.isFile() && patch.length() == 0x9dcc4000L;
         } catch (SecurityException error) {
             Log.e("BL2", "Cannot inspect local OBB pair", error);
             return false;

@@ -7,6 +7,7 @@
 #include "legacy_glsl_compat.h"
 #include "buffer_shadow_sync.h"
 #include "obb_sha256.h"
+#include "obb_pair_selection.h"
 #include "thunk_types.h"
 #ifndef GL_GLEXT_PROTOTYPES
 #define GL_GLEXT_PROTOTYPES 1
@@ -489,8 +490,9 @@ static GLuint BoundBufferForTarget(GLenum target) {
 }
 
 // Advertise a guest-side S3TC profile so UE3 selects its cooked texture path.
-// The paired patch OBB contains ETC2 blocks in the original DXT-sized mip slots.
-// Map the guest S3TC enums to GLES3 ETC2; the driver receives compressed blocks.
+// The validated cache supplies the compressed blocks; no runtime DXT decoder.
+// ASTC4 pairs the preserved PF IDs with16-byte blocks and patched guest sizing.
+constexpr const char* kConvertedTextureCodec = kBl2Astc4Textures ? "ASTC4" : "ETC2";
 static bool IsUnavailableHornTextureExtension(const std::string& extension) {
     if (extension == "GL_EXT_texture_compression_s3tc") return false;
     if (extension == "GL_OES_compressed_ETC1_RGB8_texture") return true;
@@ -522,7 +524,21 @@ static bool IsDxt5(GLenum format) {
     return format == kDxt5Rgba || format == kDxt5Srgba;
 }
 
-static GLenum Etc2InternalFormatForDxt(GLenum format) {
+static GLenum ConvertedInternalFormatForDxt(GLenum format) {
+    if (kBl2Astc4Textures) {
+        switch (format) {
+            case kDxt1Rgb:
+            case kDxt1Rgba:
+            case kDxt5Rgba:
+                return GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+            case kDxt1Srgb:
+            case kDxt1Srgba:
+            case kDxt5Srgba:
+                return GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR;
+            default:
+                return 0;
+        }
+    }
     switch (format) {
         case kDxt1Rgb:
         case kDxt1Rgba:
@@ -540,7 +556,7 @@ static GLenum Etc2InternalFormatForDxt(GLenum format) {
 }
 
 static size_t DxtBlockBytes(GLenum format) {
-    if (IsDxt1(format)) return 8;
+    if (IsDxt1(format)) return kBl2Astc4Textures ? 16 : 8;
     if (IsDxt3(format) || IsDxt5(format)) return 16;
     return 0;
 }
@@ -4116,7 +4132,7 @@ void ThunkManager::RegisterGLThunks() {
         const GLsizei width = args.I32();
         const GLsizei height = args.I32();
         const bool remap = DxtBlockBytes(guest_format) != 0;
-        const GLenum host_format = remap ? Etc2InternalFormatForDxt(guest_format)
+        const GLenum host_format = remap ? ConvertedInternalFormatForDxt(guest_format)
                                          : guest_format;
         if (!host_format) {
             LOGE("Unsupported DXT format for immutable texture storage: 0x%04X",
@@ -4124,7 +4140,7 @@ void ThunkManager::RegisterGLThunks() {
             return;
         }
         glTexStorage2D(target, levels, host_format, width, height);
-        CaptureGlError(remap ? "glTexStorage2D(ETC2)" : "glTexStorage2D(native)");
+        CaptureGlError(remap ? "glTexStorage2D(converted)" : "glTexStorage2D(native)");
     });
 
     RegisterThunk("glTexStorage3D", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -4136,7 +4152,7 @@ void ThunkManager::RegisterGLThunks() {
         const GLsizei height = args.I32();
         const GLsizei depth = args.I32();
         if (DxtBlockBytes(format)) {
-            LOGE("Unexpected DXT volume storage after offline ETC2 conversion: 0x%04X",
+            LOGE("Unexpected DXT volume storage after offline cache conversion: 0x%04X",
                  format);
             return;
         }
@@ -4168,18 +4184,18 @@ void ThunkManager::RegisterGLThunks() {
         size_t required = static_cast<size_t>(image_size);
         GLenum host_format = guest_format;
         if (remap) {
-            host_format = Etc2InternalFormatForDxt(guest_format);
+            host_format = ConvertedInternalFormatForDxt(guest_format);
             if (!host_format || !DxtPayloadSize(guest_format, width, height, required) ||
-                required > static_cast<size_t>(image_size)) {
-                LOGE("Unsupported or malformed preconverted ETC2 image: guest=0x%04X %dx%d size=%d",
+                required != static_cast<size_t>(image_size)) {
+                LOGE("Unsupported or malformed preconverted compressed image: guest=0x%04X %dx%d size=%d",
                      guest_format, width, height, image_size);
                 return;
             }
             static std::atomic<uint32_t> remapped{0};
             uint32_t index = 0;
-            if (ShouldLogTelemetry(remapped, 64, "ETC2 image upload", &index)) {
-                LOGI("ETC2 image upload #%u guest=0x%04X host=0x%04X %dx%d bytes=%zu",
-                     index, guest_format, host_format, width, height, required);
+            if (ShouldLogTelemetry(remapped, 64, "converted image upload", &index)) {
+                LOGI("%s image upload #%u guest=0x%04X host=0x%04X %dx%d bytes=%zu",
+                     kConvertedTextureCodec, index, guest_format, host_format, width, height, required);
             }
         }
         GLint unpack_buffer = 0;
@@ -4189,7 +4205,7 @@ void ThunkManager::RegisterGLThunks() {
         if (remap && data_address == 0 && unpack_buffer == 0) {
             glCompressedTexImage2D(target, level, host_format, width, height,
                                    border, static_cast<GLsizei>(required), nullptr);
-            CaptureGlError("glCompressedTexImage2D(ETC2 allocation)");
+            CaptureGlError("glCompressedTexImage2D(converted allocation)");
             return;
         }
         bool valid = false;
@@ -4200,7 +4216,7 @@ void ThunkManager::RegisterGLThunks() {
         ScopedUnpackBufferUnbind unpack_buffer_guard;
         glCompressedTexImage2D(target, level, host_format, width, height,
                                border, static_cast<GLsizei>(required), data);
-        CaptureGlError(remap ? "glCompressedTexImage2D(ETC2)"
+        CaptureGlError(remap ? "glCompressedTexImage2D(converted)"
                              : "glCompressedTexImage2D(native)");
         if (remap) {
             RecordSceneTextureUpload(target, level, width, height,
@@ -4226,18 +4242,18 @@ void ThunkManager::RegisterGLThunks() {
         size_t required = static_cast<size_t>(image_size);
         GLenum host_format = guest_format;
         if (remap) {
-            host_format = Etc2InternalFormatForDxt(guest_format);
+            host_format = ConvertedInternalFormatForDxt(guest_format);
             if (!host_format || !DxtPayloadSize(guest_format, width, height, required) ||
-                required > static_cast<size_t>(image_size)) {
-                LOGE("Unsupported or malformed preconverted ETC2 subimage: guest=0x%04X %dx%d size=%d",
+                required != static_cast<size_t>(image_size)) {
+                LOGE("Unsupported or malformed preconverted compressed subimage: guest=0x%04X %dx%d size=%d",
                      guest_format, width, height, image_size);
                 return;
             }
             static std::atomic<uint32_t> remapped{0};
             uint32_t index = 0;
-            if (ShouldLogTelemetry(remapped, 64, "ETC2 subimage upload", &index)) {
-                LOGI("ETC2 subimage upload #%u guest=0x%04X host=0x%04X rect=%d,%d %dx%d bytes=%zu",
-                     index, guest_format, host_format, xoffset, yoffset,
+            if (ShouldLogTelemetry(remapped, 64, "converted subimage upload", &index)) {
+                LOGI("%s subimage upload #%u guest=0x%04X host=0x%04X rect=%d,%d %dx%d bytes=%zu",
+                     kConvertedTextureCodec, index, guest_format, host_format, xoffset, yoffset,
                      width, height, required);
             }
         }
@@ -4248,8 +4264,8 @@ void ThunkManager::RegisterGLThunks() {
         if (remap && data_address == 0 && unpack_buffer == 0) {
             static std::atomic<uint32_t> null_updates{0};
             uint32_t index = 0;
-            if (ShouldLogTelemetry(null_updates, 16, "null ETC2 subimage", &index)) {
-                LOGI("Ignoring null ETC2 subimage #%u host=0x%04X rect=%d,%d %dx%d",
+            if (ShouldLogTelemetry(null_updates, 16, "null converted subimage", &index)) {
+                LOGI("Ignoring null converted subimage #%u host=0x%04X rect=%d,%d %dx%d",
                      index, host_format, xoffset, yoffset, width, height);
             }
             return;
@@ -4263,7 +4279,7 @@ void ThunkManager::RegisterGLThunks() {
         glCompressedTexSubImage2D(target, level, xoffset, yoffset, width,
                                   height, host_format,
                                   static_cast<GLsizei>(required), data);
-        CaptureGlError(remap ? "glCompressedTexSubImage2D(ETC2)"
+        CaptureGlError(remap ? "glCompressedTexSubImage2D(converted)"
                              : "glCompressedTexSubImage2D(native)");
         if (remap && xoffset == 0 && yoffset == 0) {
             RecordSceneTextureUpload(target, level, width, height,
@@ -4279,9 +4295,9 @@ void ThunkManager::RegisterGLThunks() {
                                          &actual_format);
                 glGetTexLevelParameteriv(target, level, GL_TEXTURE_COMPRESSED,
                                          &compressed);
-                LOGI("ETC2 GPU storage #%u level=%d internal=0x%04X compressed=%d expected=0x%04X",
-                     probe + 1, level, actual_format, compressed, host_format);
-                CaptureGlError("glGetTexLevelParameteriv(ETC2 storage)");
+                LOGI("%s GPU storage #%u level=%d internal=0x%04X compressed=%d expected=0x%04X",
+                     kConvertedTextureCodec, probe + 1, level, actual_format, compressed, host_format);
+                CaptureGlError("glGetTexLevelParameteriv(converted storage)");
             }
         }
     });
@@ -4300,7 +4316,7 @@ void ThunkManager::RegisterGLThunks() {
         const uint32_t data_address = args.Ptr();
         if (image_size < 0) return;
         if (DxtBlockBytes(guest_format)) {
-            LOGE("Unexpected DXT volume upload after offline ETC2 conversion: format=0x%04X %dx%dx%d",
+            LOGE("Unexpected DXT volume upload after offline cache conversion: format=0x%04X %dx%dx%d",
                  guest_format, width, height, depth);
             return;
         }
@@ -4331,7 +4347,7 @@ void ThunkManager::RegisterGLThunks() {
         const uint32_t data_address = args.Ptr();
         if (image_size < 0) return;
         if (DxtBlockBytes(guest_format)) {
-            LOGE("Unexpected DXT volume subupload after offline ETC2 conversion: format=0x%04X %dx%dx%d",
+            LOGE("Unexpected DXT volume subupload after offline cache conversion: format=0x%04X %dx%dx%d",
                  guest_format, width, height, depth);
             return;
         }

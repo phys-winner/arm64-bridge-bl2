@@ -13,6 +13,7 @@
 #include "obb_sha256.h"
 #include "virtual_file_range.h"
 #include "zip_stored_entry_bounds.h"
+#include "arm32_network_abi.h"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -36,6 +37,7 @@
 #include <limits>
 #include <memory>
 #include <netdb.h>
+#include <net/if.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/stat.h>
@@ -44,6 +46,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <linux/futex.h>
@@ -805,6 +808,173 @@ static void SetGuestErrno(DynarmicHost& host, int value) {
     host.MemoryWrite32(GuestErrnoAddress(host), static_cast<uint32_t>(value));
 }
 
+static void NetworkResult(Dynarmic::A32::Jit& jit, DynarmicHost& host,
+                          int64_t result) {
+    const int error = errno;
+    if (result < 0) SetGuestErrno(host, error);
+    jit.Regs()[0] = static_cast<uint32_t>(result);
+}
+
+static void NetworkFailure(Dynarmic::A32::Jit& jit, DynarmicHost& host, int error) {
+    SetGuestErrno(host, error);
+    jit.Regs()[0] = static_cast<uint32_t>(-1);
+}
+
+static void NetworkBindConnect(Dynarmic::A32::Jit& jit, DynarmicHost& host,
+                               bool connect_socket) {
+    const uint32_t address = jit.Regs()[1];
+    const socklen_t length = jit.Regs()[2];
+    const auto* native = address ? static_cast<const sockaddr*>(GuestSpan(
+        host.GetGuestMemoryBase(), host.GetGuestMemorySize(), address, length)) : nullptr;
+    if ((address && !native) || (!address && length)) {
+        NetworkFailure(jit, host, EFAULT); return;
+    }
+    const int fd = static_cast<int32_t>(jit.Regs()[0]);
+    NetworkResult(jit, host, connect_socket ? ::connect(fd, native, length)
+                                           : ::bind(fd, native, length));
+}
+
+static void NetworkTransfer(Dynarmic::A32::Jit& jit, DynarmicHost& host,
+                            bool receive, bool datagram) {
+    void* buffer = GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                             jit.Regs()[1], jit.Regs()[2]);
+    if (!buffer) { NetworkFailure(jit, host, EFAULT); return; }
+    const int fd = static_cast<int32_t>(jit.Regs()[0]);
+    const int flags = static_cast<int32_t>(jit.Regs()[3]);
+    if (!datagram) {
+        NetworkResult(jit, host, receive ? ::recv(fd, buffer, jit.Regs()[2], flags)
+                                       : ::send(fd, buffer, jit.Regs()[2], flags));
+        return;
+    }
+    Arm32CallArgs args(jit, host, 4);
+    const uint32_t address = args.Ptr();
+    const uint32_t length_argument = args.U32();
+    if (receive && length_argument && !GuestSpan(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), length_argument, sizeof(uint32_t))) {
+        NetworkFailure(jit, host, EFAULT); return;
+    }
+    socklen_t length = receive ? (length_argument ? host.MemoryRead32(length_argument) : 0)
+                              : length_argument;
+    auto* native_address = address ? static_cast<sockaddr*>(GuestSpan(
+        host.GetGuestMemoryBase(), host.GetGuestMemorySize(), address, length)) : nullptr;
+    if ((address && !native_address) || (receive && address && !length_argument)) {
+        NetworkFailure(jit, host, EFAULT); return;
+    }
+    const ssize_t result = receive
+        ? ::recvfrom(fd, buffer, jit.Regs()[2], flags, native_address,
+                     length_argument ? &length : nullptr)
+        : ::sendto(fd, buffer, jit.Regs()[2], flags, native_address, length);
+    const int error = errno;
+    if (receive && length_argument && result >= 0) host.MemoryWrite32(length_argument, length);
+    if (result < 0) SetGuestErrno(host, error);
+    jit.Regs()[0] = static_cast<uint32_t>(result);
+}
+
+static void NetworkSocketOption(Dynarmic::A32::Jit& jit, DynarmicHost& host,
+                                bool get) {
+    Arm32CallArgs args(jit, host, 4);
+    const uint32_t length_argument = args.U32();
+    if (get && !GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                         length_argument, sizeof(uint32_t))) {
+        NetworkFailure(jit, host, EFAULT); return;
+    }
+    socklen_t length = get ? host.MemoryRead32(length_argument) : length_argument;
+    void* value = GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                            jit.Regs()[3], length);
+    if (!value) { NetworkFailure(jit, host, EFAULT); return; }
+    const int fd = static_cast<int32_t>(jit.Regs()[0]);
+    const int level = static_cast<int32_t>(jit.Regs()[1]);
+    const int option = static_cast<int32_t>(jit.Regs()[2]);
+    int result;
+    if (level == SOL_SOCKET && (option == SO_RCVTIMEO || option == SO_SNDTIMEO)) {
+        timeval native{};
+        Arm32Timeval guest{};
+        if (!get) {
+            if (length < sizeof(guest)) { NetworkFailure(jit, host, EINVAL); return; }
+            std::memcpy(&guest, value, sizeof(guest));
+            if (!UnpackArm32Timeval(guest, native)) { NetworkFailure(jit, host, EINVAL); return; }
+            result = ::setsockopt(fd, level, option, &native, sizeof(native));
+        } else {
+            socklen_t native_length = sizeof(native);
+            result = ::getsockopt(fd, level, option, &native, &native_length);
+            if (result == 0) {
+                if (!PackArm32Timeval(native, guest)) { NetworkFailure(jit, host, EOVERFLOW); return; }
+                length = std::min<socklen_t>(length, sizeof(guest));
+                std::memcpy(value, &guest, length);
+            }
+        }
+    } else {
+        // Audited UE3/RakNet options use int, linger, or raw byte payloads.
+        result = get ? ::getsockopt(fd, level, option, value, &length)
+                     : ::setsockopt(fd, level, option, value, length);
+    }
+    const int error = errno;
+    if (get && result == 0) host.MemoryWrite32(length_argument, length);
+    if (result < 0) SetGuestErrno(host, error);
+    jit.Regs()[0] = static_cast<uint32_t>(result);
+}
+
+static void NetworkIoctl(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+    const int fd = static_cast<int32_t>(jit.Regs()[0]);
+    const unsigned long request = jit.Regs()[1];
+    const uint32_t address = jit.Regs()[2];
+    if (request == SIOCGIFCONF) {
+        auto* storage = GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                                  address, sizeof(Arm32IfConf));
+        if (!storage) { NetworkFailure(jit, host, EFAULT); return; }
+        Arm32IfConf guest{};
+        std::memcpy(&guest, storage, sizeof(guest));
+        if (guest.length < 0 || static_cast<size_t>(guest.length) / kArm32IfReqSize >
+                static_cast<size_t>(INT_MAX) / sizeof(ifreq)) {
+            NetworkFailure(jit, host, EINVAL); return;
+        }
+        void* output = guest.buffer ? GuestSpan(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), guest.buffer, guest.length) : nullptr;
+        if (guest.buffer && !output) { NetworkFailure(jit, host, EFAULT); return; }
+        const size_t capacity = guest.buffer ? guest.length / kArm32IfReqSize : 0;
+        try {
+            std::vector<ifreq> entries(guest.buffer ? std::max<size_t>(capacity, 1) : 0);
+            ifconf native{};
+            native.ifc_len = static_cast<int>(capacity * sizeof(ifreq));
+            native.ifc_req = guest.buffer ? entries.data() : nullptr;
+            const int result = ::ioctl(fd, request, &native);
+            const int error = errno;
+            if (result == 0) {
+                const size_t count = native.ifc_len / sizeof(ifreq);
+                if (guest.buffer) {
+                    if (count > capacity) { NetworkFailure(jit, host, EIO); return; }
+                    for (size_t i = 0; i < count; ++i)
+                        std::memcpy(static_cast<uint8_t*>(output) + i * kArm32IfReqSize,
+                                    &entries[i], kArm32IfReqSize);
+                }
+                guest.length = static_cast<int32_t>(count * kArm32IfReqSize);
+                std::memcpy(storage, &guest, sizeof(guest));
+            } else SetGuestErrno(host, error);
+            jit.Regs()[0] = static_cast<uint32_t>(result);
+        } catch (const std::bad_alloc&) { NetworkFailure(jit, host, ENOMEM); }
+        return;
+    }
+    size_t size = 0;
+    if (request == FIONREAD || request == FIONBIO) size = sizeof(int32_t);
+    else if (request == TIOCGWINSZ) size = sizeof(winsize);
+    else if (request == SIOCGIFADDR || request == SIOCGIFNETMASK ||
+             request == SIOCGIFBRDADDR || request == SIOCGIFDSTADDR ||
+             request == SIOCGIFFLAGS || request == SIOCGIFINDEX || request == SIOCGIFMTU)
+        size = kArm32IfReqSize;
+    else { NetworkFailure(jit, host, ENOTTY); return; }
+    void* argument = GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(), address, size);
+    if (!argument) { NetworkFailure(jit, host, EFAULT); return; }
+    if (size == kArm32IfReqSize) {
+        ifreq native{};
+        std::memcpy(&native, argument, kArm32IfReqSize);
+        const int result = ::ioctl(fd, request, &native);
+        const int error = errno;
+        if (result == 0) std::memcpy(argument, &native, kArm32IfReqSize);
+        else SetGuestErrno(host, error);
+        jit.Regs()[0] = static_cast<uint32_t>(result);
+    } else NetworkResult(jit, host, ::ioctl(fd, request, argument));
+}
+
 static uint32_t CurrentGuestThreadId() {
     if (!g_current_guest_thread) {
         g_current_guest_thread = g_next_guest_thread_id.fetch_add(1, std::memory_order_relaxed);
@@ -991,18 +1161,6 @@ struct Arm32Dirent {
     char d_name[256];
 };
 static_assert(offsetof(Arm32Dirent, d_name) == 19);
-
-struct Arm32AddrInfo {
-    int32_t ai_flags;
-    int32_t ai_family;
-    int32_t ai_socktype;
-    int32_t ai_protocol;
-    uint32_t ai_addrlen;
-    uint32_t ai_addr;
-    uint32_t ai_canonname;
-    uint32_t ai_next;
-};
-static_assert(sizeof(Arm32AddrInfo) == 32);
 
 struct Arm32ZStream {
     uint32_t next_in, avail_in, total_in;
@@ -2488,7 +2646,16 @@ void ThunkManager::RegisterLibcThunks() {
         jit.Regs()[0] = 0;
     });
     RegisterThunk("fcntl", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        jit.Regs()[0] = 0;
+        const int command = static_cast<int32_t>(jit.Regs()[1]);
+        switch (command) {
+            case F_DUPFD: case F_DUPFD_CLOEXEC: case F_GETFD: case F_SETFD:
+            case F_GETFL: case F_SETFL:
+                NetworkResult(jit, host, ::fcntl(static_cast<int32_t>(jit.Regs()[0]),
+                    command, static_cast<int32_t>(jit.Regs()[2])));
+                break;
+            default: // ARM32 record-lock/pointer layouts need their own translation.
+                NetworkFailure(jit, host, ENOSYS);
+        }
     });
 
     // Semaphores & Pthread
@@ -2967,28 +3134,93 @@ void ThunkManager::RegisterLibcThunks() {
         jit.Regs()[0] = 0;
     });
 
-    // Sockets & Net (Stubs)
-    RegisterThunk("socket", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("bind", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("listen", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("accept", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("connect", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("send", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("recv", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("select", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0; });
-    RegisterThunk("setsockopt", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0xFFFFFFFF; });
-    RegisterThunk("inet_addr", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0; });
-    RegisterThunk("inet_ntoa", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        const uint32_t address = jit.Regs()[0];
-        const auto* guest_address = static_cast<const in_addr*>(GuestSpan(
-            host.GetGuestMemoryBase(), host.GetGuestMemorySize(), address,
-            sizeof(in_addr)));
-        if (!guest_address) {
-            SetGuestErrno(host, EFAULT);
-            jit.Regs()[0] = 0;
-            return;
+    // POSIX sockets use real host fds; sockaddr_in/in6 and socklen_t are ABI-compatible.
+    RegisterThunk("socket", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        NetworkResult(jit, host, ::socket(static_cast<int32_t>(jit.Regs()[0]),
+            static_cast<int32_t>(jit.Regs()[1]), static_cast<int32_t>(jit.Regs()[2])));
+    });
+    RegisterThunk("bind", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkBindConnect(jit, host, false); });
+    RegisterThunk("connect", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkBindConnect(jit, host, true); });
+    RegisterThunk("listen", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        NetworkResult(jit, host, ::listen(static_cast<int32_t>(jit.Regs()[0]),
+                                          static_cast<int32_t>(jit.Regs()[1])));
+    });
+    RegisterThunk("accept", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        const uint32_t address = jit.Regs()[1], length_address = jit.Regs()[2];
+        if (address && !GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                                 length_address, sizeof(uint32_t))) {
+            NetworkFailure(jit, host, EFAULT); return;
         }
-        const char* text = ::inet_ntoa(*guest_address);
+        socklen_t length = address ? host.MemoryRead32(length_address) : 0;
+        auto* native = address ? static_cast<sockaddr*>(GuestSpan(
+            host.GetGuestMemoryBase(), host.GetGuestMemorySize(), address, length)) : nullptr;
+        if (address && !native) { NetworkFailure(jit, host, EFAULT); return; }
+        const int result = ::accept(static_cast<int32_t>(jit.Regs()[0]), native,
+                                     address ? &length : nullptr);
+        const int error = errno;
+        if (result >= 0 && address) host.MemoryWrite32(length_address, length);
+        if (result < 0) SetGuestErrno(host, error);
+        jit.Regs()[0] = static_cast<uint32_t>(result);
+    });
+    RegisterThunk("send", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkTransfer(jit, host, false, false); });
+    RegisterThunk("recv", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkTransfer(jit, host, true, false); });
+    RegisterThunk("sendto", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkTransfer(jit, host, false, true); });
+    RegisterThunk("recvfrom", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkTransfer(jit, host, true, true); });
+    RegisterThunk("select", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        Arm32CallArgs args(jit, host);
+        const int nfds = args.I32();
+        const uint32_t addresses[] = {args.Ptr(), args.Ptr(), args.Ptr()};
+        const uint32_t timeout_address = args.Ptr();
+        if (nfds < 0 || nfds > FD_SETSIZE) { NetworkFailure(jit, host, EINVAL); return; }
+        fd_set native[3]{};
+        void* guest[3]{};
+        for (size_t i = 0; i < 3; ++i) {
+            if (!addresses[i]) continue;
+            guest[i] = GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                                 addresses[i], sizeof(Arm32FdSet));
+            if (!guest[i]) { NetworkFailure(jit, host, EFAULT); return; }
+            Arm32FdSet value{};
+            std::memcpy(&value, guest[i], sizeof(value));
+            UnpackArm32FdSet(value, native[i].fds_bits);
+        }
+        timeval timeout{};
+        void* guest_timeout = timeout_address ? GuestSpan(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), timeout_address, sizeof(Arm32Timeval)) : nullptr;
+        if (timeout_address) {
+            if (!guest_timeout) { NetworkFailure(jit, host, EFAULT); return; }
+            Arm32Timeval value{};
+            std::memcpy(&value, guest_timeout, sizeof(value));
+            if (!UnpackArm32Timeval(value, timeout)) { NetworkFailure(jit, host, EINVAL); return; }
+        }
+        const int result = ::select(nfds, guest[0] ? &native[0] : nullptr,
+            guest[1] ? &native[1] : nullptr, guest[2] ? &native[2] : nullptr,
+            guest_timeout ? &timeout : nullptr);
+        const int error = errno;
+        if (result >= 0) {
+            for (size_t i = 0; i < 3; ++i) if (guest[i]) {
+                Arm32FdSet value{};
+                PackArm32FdSet(native[i].fds_bits, value);
+                std::memcpy(guest[i], &value, sizeof(value));
+            }
+        }
+        if (guest_timeout) {
+            Arm32Timeval value{};
+            if (PackArm32Timeval(timeout, value)) std::memcpy(guest_timeout, &value, sizeof(value));
+        }
+        if (result < 0) SetGuestErrno(host, error);
+        jit.Regs()[0] = static_cast<uint32_t>(result);
+    });
+    RegisterThunk("setsockopt", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkSocketOption(jit, host, false); });
+    RegisterThunk("getsockopt", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { NetworkSocketOption(jit, host, true); });
+    RegisterThunk("inet_addr", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        const char* text = GuestCString(host.GetGuestMemoryBase(), host.GetGuestMemorySize(), jit.Regs()[0]);
+        if (!text) { NetworkFailure(jit, host, EFAULT); return; }
+        jit.Regs()[0] = ::inet_addr(text);
+    });
+    RegisterThunk("inet_ntoa", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        in_addr address{};
+        address.s_addr = jit.Regs()[0]; // in_addr is a four-byte by-value AAPCS argument.
+        const char* text = ::inet_ntoa(address);
         if (!text) { jit.Regs()[0] = 0; return; }
         static thread_local uint32_t guest_buffer = 0;
         if (!guest_buffer) guest_buffer = host.GuestAlloc(16, 1);
@@ -3008,75 +3240,151 @@ void ThunkManager::RegisterLibcThunks() {
         if (result != 0) SetGuestErrno(host, errno);
         jit.Regs()[0] = static_cast<uint32_t>(result);
     });
-    RegisterThunk("gethostbyname", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) { jit.Regs()[0] = 0; });
+    RegisterThunk("gethostbyname", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        const char* name = GuestCString(host.GetGuestMemoryBase(), host.GetGuestMemorySize(), jit.Regs()[0]);
+        if (!name) { SetGuestErrno(host, EFAULT); jit.Regs()[0] = 0; return; }
+        const hostent* native = ::gethostbyname(name);
+        if (!native) { SetGuestErrno(host, h_errno == NETDB_INTERNAL ? errno : EHOSTUNREACH); jit.Regs()[0] = 0; return; }
+        size_t aliases = 0, addresses = 0;
+        size_t strings = std::strlen(native->h_name) + 1;
+        while (native->h_aliases && native->h_aliases[aliases])
+            strings += std::strlen(native->h_aliases[aliases++]) + 1;
+        while (native->h_addr_list && native->h_addr_list[addresses]) ++addresses;
+        const size_t bytes = sizeof(Arm32HostEnt) + (aliases + addresses + 2) * 4 +
+                             addresses * native->h_length + strings;
+        // Library-owned storage: one reusable block per host/guest thread, like inet_ntoa.
+        static thread_local uint32_t guest_buffer = 0;
+        static thread_local size_t capacity = 0;
+        if (bytes > capacity) {
+            const uint32_t replacement = host.GuestAlloc(bytes, 4);
+            if (!replacement) { SetGuestErrno(host, ENOMEM); jit.Regs()[0] = 0; return; }
+            if (guest_buffer) host.GuestFree(guest_buffer);
+            guest_buffer = replacement; capacity = bytes;
+        }
+        auto* output = static_cast<uint8_t*>(GuestSpan(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), guest_buffer, bytes));
+        if (!output) { SetGuestErrno(host, EFAULT); jit.Regs()[0] = 0; return; }
+        const uint32_t alias_list = guest_buffer + sizeof(Arm32HostEnt);
+        const uint32_t address_list = alias_list + static_cast<uint32_t>((aliases + 1) * 4);
+        uint32_t cursor = address_list + static_cast<uint32_t>((addresses + 1) * 4);
+        for (size_t i = 0; i < addresses; ++i) {
+            host.MemoryWrite32(address_list + static_cast<uint32_t>(i * 4), cursor);
+            std::memcpy(output + cursor - guest_buffer, native->h_addr_list[i], native->h_length);
+            cursor += native->h_length;
+        }
+        host.MemoryWrite32(address_list + static_cast<uint32_t>(addresses * 4), 0);
+        Arm32HostEnt value{cursor, alias_list, native->h_addrtype, native->h_length, address_list};
+        const size_t name_bytes = std::strlen(native->h_name) + 1;
+        std::memcpy(output + cursor - guest_buffer, native->h_name, name_bytes);
+        cursor += static_cast<uint32_t>(name_bytes);
+        for (size_t i = 0; i < aliases; ++i) {
+            host.MemoryWrite32(alias_list + static_cast<uint32_t>(i * 4), cursor);
+            const size_t alias_bytes = std::strlen(native->h_aliases[i]) + 1;
+            std::memcpy(output + cursor - guest_buffer, native->h_aliases[i], alias_bytes);
+            cursor += static_cast<uint32_t>(alias_bytes);
+        }
+        host.MemoryWrite32(alias_list + static_cast<uint32_t>(aliases * 4), 0);
+        std::memcpy(output, &value, sizeof(value));
+        jit.Regs()[0] = guest_buffer;
+    });
     RegisterThunk("gethostname", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        char* name = reinterpret_cast<char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]));
-        int result = name ? gethostname(name, jit.Regs()[1]) : -1;
+        char* name = static_cast<char*>(GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                                                 jit.Regs()[0], jit.Regs()[1]));
+        int result = name ? ::gethostname(name, jit.Regs()[1]) : -1;
         if (result < 0) SetGuestErrno(host, name ? errno : EFAULT);
         jit.Regs()[0] = static_cast<uint32_t>(result);
     });
     RegisterThunk("getsockname", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        sockaddr* address = reinterpret_cast<sockaddr*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]));
         uint32_t length_addr = jit.Regs()[2];
-        socklen_t length = length_addr ? host.MemoryRead32(length_addr) : 0;
-        int result = address && length_addr ? getsockname(static_cast<int>(jit.Regs()[0]), address, &length) : -1;
-        if (length_addr) host.MemoryWrite32(length_addr, length);
-        if (result < 0) SetGuestErrno(host, address && length_addr ? errno : EFAULT);
-        jit.Regs()[0] = static_cast<uint32_t>(result);
-    });
-    RegisterThunk("getsockopt", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        void* value = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[3]);
-        uint32_t length_addr = host.MemoryRead32(jit.Regs()[13]);
-        socklen_t length = length_addr ? host.MemoryRead32(length_addr) : 0;
-        int result = value && length_addr ? getsockopt(static_cast<int>(jit.Regs()[0]),
-            static_cast<int>(jit.Regs()[1]), static_cast<int>(jit.Regs()[2]), value, &length) : -1;
-        if (length_addr) host.MemoryWrite32(length_addr, length);
-        if (result < 0) SetGuestErrno(host, value && length_addr ? errno : EFAULT);
-        jit.Regs()[0] = static_cast<uint32_t>(result);
-    });
-    RegisterThunk("recvfrom", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        void* buffer = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]);
-        uint32_t address_addr = host.MemoryRead32(jit.Regs()[13]);
-        uint32_t length_addr = host.MemoryRead32(jit.Regs()[13] + 4);
-        sockaddr* address = reinterpret_cast<sockaddr*>(GuestToHost(host.GetGuestMemoryBase(), address_addr));
-        socklen_t length = length_addr ? host.MemoryRead32(length_addr) : 0;
-        ssize_t result = buffer ? recvfrom(static_cast<int>(jit.Regs()[0]), buffer, jit.Regs()[2],
-            static_cast<int>(jit.Regs()[3]), address, length_addr ? &length : nullptr) : -1;
-        if (length_addr) host.MemoryWrite32(length_addr, length);
-        if (result < 0) SetGuestErrno(host, buffer ? errno : EFAULT);
-        jit.Regs()[0] = static_cast<uint32_t>(result);
-    });
-    RegisterThunk("ioctl", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        const int fd = static_cast<int>(jit.Regs()[0]);
-        const unsigned long request = jit.Regs()[1];
-        void* argument = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[2]);
-        int result = -1;
-        if (request == FIONREAD || request == FIONBIO || request == TIOCGWINSZ) {
-            result = ioctl(fd, request, argument);
-        } else {
-            LOGE("ioctl(fd=%d, request=0x%lX): unsupported ARM32 payload layout", fd, request);
-            errno = ENOTTY;
+        if (!GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(), length_addr, 4)) {
+            NetworkFailure(jit, host, EFAULT); return;
         }
-        if (result < 0) SetGuestErrno(host, errno);
+        socklen_t length = host.MemoryRead32(length_addr);
+        auto* address = static_cast<sockaddr*>(GuestSpan(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), jit.Regs()[1], length));
+        if (!address) { NetworkFailure(jit, host, EFAULT); return; }
+        int result = ::getsockname(static_cast<int32_t>(jit.Regs()[0]), address, &length);
+        const int error = errno;
+        if (result == 0) host.MemoryWrite32(length_addr, length);
+        if (result < 0) SetGuestErrno(host, error);
         jit.Regs()[0] = static_cast<uint32_t>(result);
     });
-    // Deliberately denied until the embedding app supplies an explicit policy.
-    // These are loud failures, never silent-success compatibility stubs.
+    RegisterThunk("ioctl", NetworkIoctl);
     RegisterThunk("getaddrinfo", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        LOGE("getaddrinfo: denied by bridge network policy");
-        if (jit.Regs()[3]) host.MemoryWrite32(jit.Regs()[3], 0);
-        SetGuestErrno(host, EACCES);
-        jit.Regs()[0] = static_cast<uint32_t>(EAI_SYSTEM);
+        const uint32_t output_address = jit.Regs()[3];
+        const char* node = jit.Regs()[0] ? GuestCString(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), jit.Regs()[0]) : nullptr;
+        const char* service = jit.Regs()[1] ? GuestCString(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), jit.Regs()[1]) : nullptr;
+        auto* guest_hints = jit.Regs()[2] ? GuestSpan(host.GetGuestMemoryBase(),
+            host.GetGuestMemorySize(), jit.Regs()[2], sizeof(Arm32AddrInfo)) : nullptr;
+        if (!GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(), output_address, 4) ||
+            (jit.Regs()[0] && !node) || (jit.Regs()[1] && !service) || (jit.Regs()[2] && !guest_hints)) {
+            SetGuestErrno(host, EFAULT); jit.Regs()[0] = static_cast<uint32_t>(EAI_SYSTEM); return;
+        }
+        host.MemoryWrite32(output_address, 0);
+        addrinfo hints{};
+        if (guest_hints) {
+            Arm32AddrInfo value{};
+            std::memcpy(&value, guest_hints, sizeof(value));
+            hints.ai_flags = value.flags; hints.ai_family = value.family;
+            hints.ai_socktype = value.socktype; hints.ai_protocol = value.protocol;
+        }
+        addrinfo* list = nullptr;
+        int result = ::getaddrinfo(node, service, guest_hints ? &hints : nullptr, &list);
+        if (result != 0) {
+            if (result == EAI_SYSTEM) SetGuestErrno(host, errno);
+            jit.Regs()[0] = static_cast<uint32_t>(result); return;
+        }
+        std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> native_owner(list, ::freeaddrinfo);
+        GuestAddrInfoAllocation allocation;
+        uint32_t head = 0, previous = 0;
+        try {
+            for (const addrinfo* native = list; native; native = native->ai_next) {
+                const size_t name_bytes = native->ai_canonname ? std::strlen(native->ai_canonname) + 1 : 0;
+                const size_t bytes = sizeof(Arm32AddrInfo) + native->ai_addrlen + name_bytes;
+                const uint32_t address = host.GuestAlloc(bytes, 4);
+                if (!address) { result = EAI_MEMORY; break; }
+                try { allocation.blocks.push_back(address); }
+                catch (...) { host.GuestFree(address); throw; }
+                Arm32AddrInfo value{native->ai_flags, native->ai_family, native->ai_socktype,
+                    native->ai_protocol, native->ai_addrlen, 0, 0, 0};
+                if (native->ai_addr && native->ai_addrlen) {
+                    value.addr = address + sizeof(value);
+                    std::memcpy(host.GetGuestMemoryBase() + value.addr, native->ai_addr, native->ai_addrlen);
+                }
+                if (name_bytes) {
+                    value.canonname = address + sizeof(value) + native->ai_addrlen;
+                    std::memcpy(host.GetGuestMemoryBase() + value.canonname, native->ai_canonname, name_bytes);
+                }
+                std::memcpy(host.GetGuestMemoryBase() + address, &value, sizeof(value));
+                if (previous) host.MemoryWrite32(previous + offsetof(Arm32AddrInfo, next), address);
+                else head = address;
+                previous = address;
+            }
+            if (result == 0 && head) {
+                std::lock_guard<std::mutex> lock(g_addrinfo_mutex);
+                auto inserted = g_addrinfo_allocations.try_emplace(head);
+                inserted.first->second = std::move(allocation);
+            }
+        } catch (const std::bad_alloc&) { result = EAI_MEMORY; }
+        if (result != 0) for (uint32_t block : allocation.blocks) host.GuestFree(block);
+        else host.MemoryWrite32(output_address, head);
+        jit.Regs()[0] = static_cast<uint32_t>(result);
     });
-    RegisterThunk("freeaddrinfo", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {
-        LOGE("freeaddrinfo: no bridge-owned list exists (getaddrinfo is policy-denied), ptr=0x%08X",
-             jit.Regs()[0]);
-    });
-    RegisterThunk("sendto", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        LOGE("sendto: denied by bridge network policy (fd=%d, bytes=%u)",
-             static_cast<int>(jit.Regs()[0]), jit.Regs()[2]);
-        SetGuestErrno(host, EACCES);
-        jit.Regs()[0] = static_cast<uint32_t>(-1);
+    RegisterThunk("freeaddrinfo", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        if (!jit.Regs()[0]) return;
+        GuestAddrInfoAllocation allocation;
+        {
+            std::lock_guard<std::mutex> lock(g_addrinfo_mutex);
+            auto found = g_addrinfo_allocations.find(jit.Regs()[0]);
+            if (found == g_addrinfo_allocations.end()) {
+                SetGuestErrno(host, EINVAL); return;
+            }
+            allocation = std::move(found->second);
+            g_addrinfo_allocations.erase(found);
+        }
+        for (uint32_t block : allocation.blocks) host.GuestFree(block);
     });
 
     // Android & Runtime
@@ -4857,15 +5165,16 @@ void ThunkManager::RegisterLibcThunks() {
                 return;
             }
         }
-        jit.Regs()[0] = (fd >= 0) ? static_cast<uint32_t>(close(fd)) : static_cast<uint32_t>(-1);
+        NetworkResult(jit, host, ::close(fd));
     });
 
     RegisterThunk("read", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         int fd = static_cast<int>(jit.Regs()[0]);
-        void* buf = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]);
+        void* buf = GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                             jit.Regs()[1], jit.Regs()[2]);
         size_t count = jit.Regs()[2];
         HornPerfScope perf(HornPerfCategory::FileRead);
-        if (!buf) { jit.Regs()[0] = static_cast<uint32_t>(-1); return; }
+        if (!buf) { NetworkFailure(jit, host, EFAULT); return; }
 
         {
             std::lock_guard<std::mutex> lock(g_vfd_mutex);
@@ -4879,27 +5188,35 @@ void ThunkManager::RegisterLibcThunks() {
                 size_t avail = vfd.file_size - vfd.current_pos;
                 size_t to_read = (count < avail) ? count : avail;
                 ssize_t nread = pread(vfd.real_apk_fd, buf, to_read, vfd.file_offset + vfd.current_pos);
+                const int error = errno;
                 if (nread > 0) {
                     vfd.current_pos += nread;
                     perf.SetBytes(static_cast<uint64_t>(nread));
                 }
-                jit.Regs()[0] = (nread >= 0) ? static_cast<uint32_t>(nread) : static_cast<uint32_t>(-1);
+                if (nread < 0) SetGuestErrno(host, error);
+                jit.Regs()[0] = static_cast<uint32_t>(nread);
                 return;
             }
         }
 
-        ssize_t res = (fd >= 0) ? read(fd, buf, count) : -1;
+        ssize_t res = ::read(fd, buf, count);
+        const int error = errno;
         if (res > 0) perf.SetBytes(static_cast<uint64_t>(res));
+        if (res < 0) SetGuestErrno(host, error);
         jit.Regs()[0] = static_cast<uint32_t>(res);
     });
 
     RegisterThunk("write", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         int fd = static_cast<int>(jit.Regs()[0]);
-        const void* buf = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]);
+        const void* buf = GuestSpan(host.GetGuestMemoryBase(), host.GetGuestMemorySize(),
+                                   jit.Regs()[1], jit.Regs()[2]);
         size_t count = jit.Regs()[2];
         HornPerfScope perf(HornPerfCategory::FileWrite);
-        ssize_t res = (buf && fd >= 0) ? write(fd, buf, count) : -1;
+        if (!buf) { NetworkFailure(jit, host, EFAULT); return; }
+        ssize_t res = ::write(fd, buf, count);
+        const int error = errno;
         if (res > 0) perf.SetBytes(static_cast<uint64_t>(res));
+        if (res < 0) SetGuestErrno(host, error);
         jit.Regs()[0] = static_cast<uint32_t>(res);
     });
 

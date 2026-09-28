@@ -1096,8 +1096,27 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
             if (it != m_free_huge.end() && !it->second.empty()) {
                 base = it->second.back();
                 it->second.pop_back();
+                if (it->second.empty()) m_free_huge.erase(it);
                 recycled = true;
             }
+        }
+    }
+    if (!recycled) {
+        std::lock_guard<std::mutex> lock(m_free_huge_mutex);
+        auto fit = m_free_huge.end();
+        // ponytail: scan reusable spans on an exact-class miss; order the map only if this scan becomes measurable.
+        for (auto it = m_free_huge.begin(); it != m_free_huge.end(); ++it) {
+            if (!it->second.empty() && it->first >= capacity &&
+                (fit == m_free_huge.end() || it->first < fit->first)) fit = it;
+        }
+        if (fit != m_free_huge.end()) {
+            const uint32_t remainder = fit->first - capacity;
+            base = fit->second.back();
+            fit->second.pop_back();
+            if (fit->second.empty()) m_free_huge.erase(fit);
+            if (remainder >= (1u << kMinClassShift))
+                m_free_huge[remainder].push_back(base + capacity);
+            recycled = true;
         }
     }
     if (!recycled) {
@@ -1107,6 +1126,43 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
         uint32_t current = m_heap_current.load(std::memory_order_relaxed);
         for (;;) {
             if (static_cast<uint64_t>(current) + capacity > kHeapLimit) {
+                static std::atomic<bool> heap_failure_logged{false};
+                if (!heap_failure_logged.exchange(true, std::memory_order_relaxed)) {
+                    uint64_t free_small = 0, free_huge = 0, fit_bytes = 0;
+                    size_t fit_count = 0;
+                    uint32_t largest_huge = 0;
+                    for (int cls = 0; cls < kNumSizeClasses; ++cls) {
+                        std::lock_guard<std::mutex> lock(m_free_small_mutex[cls]);
+                        free_small += uint64_t(m_free_small[cls].size()) << (cls + kMinClassShift);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(m_free_huge_mutex);
+                        for (const auto& [bytes, blocks] : m_free_huge) {
+                            free_huge += uint64_t(bytes) * blocks.size();
+                            if (!blocks.empty()) largest_huge = std::max(largest_huge, bytes);
+                            if (bytes >= capacity) {
+                                fit_count += blocks.size();
+                                fit_bytes += uint64_t(bytes) * blocks.size();
+                            }
+                        }
+                    }
+                    const uint64_t reserved = m_heap_current.load(std::memory_order_relaxed) - kHeapBase;
+                    const uint64_t free_bytes = free_small + free_huge;
+                    LOGE("Guest heap failure snapshot requested=%zu alignment=%zu capacity=%u "
+                         "reserved=%llu tail=%u free_small=%llu free_huge=%llu "
+                         "live_reserved_estimate=%llu huge_fit_count=%zu huge_fit_bytes=%llu "
+                         "largest_huge=%u; concurrent snapshot",
+                         size, alignment, capacity, static_cast<unsigned long long>(reserved),
+                         kHeapLimit - current, static_cast<unsigned long long>(free_small),
+                         static_cast<unsigned long long>(free_huge),
+                         static_cast<unsigned long long>(reserved > free_bytes ? reserved - free_bytes : 0),
+                         fit_count, static_cast<unsigned long long>(fit_bytes), largest_huge);
+                    if (s_active_jit) {
+                        const auto& registers = s_active_jit->Regs();
+                        LOGE("Guest heap failure args r0..r3={%08X,%08X,%08X,%08X}",
+                             registers[0], registers[1], registers[2], registers[3]);
+                    }
+                }
                 Dl_info caller_info{};
                 const void* caller = __builtin_return_address(0);
                 const bool found_caller = dladdr(caller, &caller_info) != 0 &&
@@ -1241,7 +1297,44 @@ bool DynarmicHost::HeapSelfCheck() {
     GuestFree(big);
     uint32_t big2 = GuestAlloc(8 * 1024 * 1024, 0x10000);
     HEAP_CHECK(big2 == big);
+    const uint32_t split_begin = MemoryRead32(big2 - 12);
+    const uint32_t split_end = split_begin + MemoryRead32(big2 - 8);
+    const uint32_t heap_before = m_heap_current.load(std::memory_order_relaxed);
     GuestFree(big2);
+
+    // A large free span must serve both small classes and differently sized
+    // large requests without advancing the arena or overlapping live payloads.
+    uint32_t split_small = GuestAlloc(512 * 1024, 0x1000);
+    uint32_t split_large = GuestAlloc(2 * 1024 * 1024, 0x1000);
+    HEAP_CHECK(split_small && split_large && (split_small & 0xFFF) == 0 && (split_large & 0xFFF) == 0);
+    HEAP_CHECK(m_heap_current.load(std::memory_order_relaxed) == heap_before);
+    HEAP_CHECK(split_small >= split_begin && split_small + 512 * 1024 <= split_large - kHeaderSize);
+    HEAP_CHECK(split_large + 2 * 1024 * 1024 <= split_end);
+    HEAP_CHECK(GuestAllocSize(split_small) == 512 * 1024 && GuestAllocSize(split_large) == 2 * 1024 * 1024);
+    MemoryWrite32(split_small, 0x12345678);
+    MemoryWrite32(split_small + 512 * 1024 - 4, 0xABCDEF01);
+    MemoryWrite32(split_large, 0x87654321);
+    HEAP_CHECK(MemoryRead32(split_small) == 0x12345678 && MemoryRead32(split_small + 512 * 1024 - 4) == 0xABCDEF01);
+    GuestFree(split_small);
+    uint32_t split_again = GuestAlloc(512 * 1024, 0x1000);
+    HEAP_CHECK(split_again == split_small && MemoryRead32(split_again) == 0);
+    HEAP_CHECK(MemoryRead32(split_large) == 0x87654321);
+    GuestFree(split_again);
+    GuestFree(split_large);
+
+    // Keep these live so each request splits a span rather than reusing one
+    // small-class block. Exhausted size buckets must not accumulate per split.
+    uint32_t churn[128]{};
+    const size_t free_sizes_before = m_free_huge.size();
+    for (auto& address : churn) {
+        address = GuestAlloc(16, 8);
+        HEAP_CHECK(address && address >= split_begin && address + 16 <= split_end);
+        HEAP_CHECK(GuestAllocSize(address) == 16);
+    }
+    HEAP_CHECK(m_heap_current.load(std::memory_order_relaxed) == heap_before);
+    HEAP_CHECK(m_free_huge.size() <= free_sizes_before + 1);
+    for (const auto& [bytes, blocks] : m_free_huge) HEAP_CHECK(!blocks.empty());
+    for (const auto address : churn) GuestFree(address);
 
     GuestFree(b);
     GuestFree(reused);

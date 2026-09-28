@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)][string]$RunDirectory,
     [Parameter(Mandatory)][ValidateRange(1,255)][int]$KeyCode,
     [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9-]+$')][string]$Label,
-    [ValidateSet('61151JEA326613','HA22AHP1','83c14820','f4668e7b')]
+    [ValidateSet('61151JEA326613','HA22AHP1','83c14820','f4668e7b','abb24fae')]
     [string]$Serial = '61151JEA326613',
     [ValidateRange(100,2000)][int]$HoldMs = 250
 )

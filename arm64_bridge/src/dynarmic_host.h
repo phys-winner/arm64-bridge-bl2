@@ -170,8 +170,8 @@ private:
 
     // Guest heap: bump pointer for fresh memory, free lists for reuse. Requests up
     // to kMaxClassSize round to a power-of-two size class; anything larger (asset
-    // payloads, thread stacks) is sized exactly and recycled by exact capacity, so
-    // repeated 8 MB stacks do not round up to 16 MB.
+    // payloads, thread stacks) is sized exactly. Exact reuse is preferred; any
+    // fitting free span can be split, including tails smaller than 1 MB.
     // BL2 guest image at 0x40000000 is 0x03089000 bytes. Keep a 15 MiB+
     // gap after it, while recovering 192 MiB of ARM32 heap for level loading.
     static constexpr uint32_t kHeapBase  = 0x44000000;
@@ -190,7 +190,7 @@ private:
     std::mutex m_free_small_mutex[kNumSizeClasses];
     std::vector<uint32_t> m_free_small[kNumSizeClasses];             // class -> block bases
     std::mutex m_free_huge_mutex;
-    std::unordered_map<uint32_t, std::vector<uint32_t>> m_free_huge; // capacity -> block bases
+    std::unordered_map<uint32_t, std::vector<uint32_t>> m_free_huge; // capacity -> large blocks and split free tails
     std::atomic<uint32_t> m_heap_current{kHeapBase};
     std::atomic<uint32_t> m_map_current{kMapBase};
 

@@ -31,6 +31,7 @@
 #include "bl2_io_failure_probe.h"
 #include "bl2_touch_physical.h"
 #include "bl2_locale.h"
+#include "obb_pair_selection.h"
 
 #define LOG_TAG "Arm32Bridge_JNI"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
@@ -1695,6 +1696,49 @@ static bool InstallOfflineDlcEnumerationPatch(DynarmicHost& host) {
     return true;
 }
 
+static bool InstallBl2AstcBlockBytes(DynarmicHost& host) {
+    if (!kBl2Astc4Textures) return true;
+    auto& loader = host.GetElfLoader();
+    constexpr uint32_t table_rva = 0x02F468EC;
+    constexpr uint32_t table_bytes = 28 * 40;
+    const uint32_t table = loader.GetSymbolAddress("GPixelFormats");
+    if (loader.GetImageSize() != 0x03089000u ||
+        uint64_t(loader.GetBaseAddress()) + loader.GetImageSize() > host.GetGuestMemorySize() ||
+        table_rva + table_bytes > loader.GetImageSize() ||
+        table != loader.GetBaseAddress() + table_rva) {
+        LOGE("ASTC4 texture allocation refused: pinned GPixelFormats mismatch");
+        return false;
+    }
+    const uint32_t dxt1 = table + 5 * 40;
+    const uint32_t dxt5 = table + 7 * 40;
+    constexpr uint32_t expected[2][9] = {
+        {4, 4, 1, 8, 3, 0, 0, 1, 5},
+        {4, 4, 1, 16, 4, 0, 0, 1, 7},
+    };
+    unsigned row = 0;
+    for (const uint32_t entry : {dxt1, dxt5}) {
+        for (unsigned word = 0; word < 9; ++word) {
+            const uint32_t value = host.MemoryRead32(entry + (word + 1) * 4);
+            if (value != expected[row][word] && !(row == 0 && word == 3 && value == 16)) {
+                LOGE("ASTC4 texture allocation refused: record%u word%u value=%u",
+                     row, word, value);
+                return false;
+            }
+        }
+        ++row;
+    }
+    const uint32_t original = host.MemoryRead32(dxt1 + 16);
+    if ((original != 8 && original != 16) || host.MemoryRead32(dxt5 + 16) != 16) {
+        LOGE("ASTC4 texture allocation refused: block-byte preimage mismatch");
+        return false;
+    }
+    host.MemoryWrite32(dxt1 + 16, 16);
+    if (host.MemoryRead32(dxt1 + 16) != 16) return false;
+    LOGI("ASTC4 allocation: GPixelFormats PF_DXT1 bytes=%u->16 PF_DXT5=16; IDs/channels unchanged",
+         original);
+    return true;
+}
+
 static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
     std::lock_guard<std::recursive_mutex> load_lock(g_load_mutex);
     CaptureHostPaths(env, context);
@@ -1772,7 +1816,7 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
         return false;
     }
 
-    if (!InstallBl2NativeResolutionPatch(*g_host)) {
+    if (!InstallBl2AstcBlockBytes(*g_host) || !InstallBl2NativeResolutionPatch(*g_host)) {
         g_host.reset();
         g_guest_load_state = GuestLoadState::Fatal;
         return false;

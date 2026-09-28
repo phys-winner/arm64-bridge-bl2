@@ -178,6 +178,10 @@ public final class LaunchControls extends FrameLayout
             controls.requestApplyInsets();
             Log.i(TAG, "Attached provisional dual-stick controls, controller=" +
                     CONTROLLER);
+            if (android.os.Build.VERSION.SDK_INT >= 37 &&
+                    owner.checkSelfPermission("android.permission.ACCESS_LOCAL_NETWORK") != 0) {
+                owner.requestPermissions(new String[]{"android.permission.ACCESS_LOCAL_NETWORK"}, 0x4C41);
+            }
         } catch (ReflectiveOperationException | RuntimeException error) {
             Log.e(TAG, "Cannot attach launch controls", error);
         }

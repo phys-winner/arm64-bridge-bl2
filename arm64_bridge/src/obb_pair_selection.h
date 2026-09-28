@@ -33,11 +33,14 @@ constexpr std::string_view kMainObbName =
 constexpr std::string_view kPatchObbName =
     "patch.31.com.tt2kgames.Borderlands2.obb";
 constexpr uint64_t kMainObbSize = 2113753088ULL;
-constexpr uint64_t kPatchObbSize = 2009309184ULL;
+// This base is paired with the fully verified ASTC4 cache. Earlier seed280
+// and its ETC2 cache remain the rollback pair; never infer a codec from size.
+constexpr bool kBl2Astc4Textures = true;
+constexpr uint64_t kPatchObbSize = 2647408640ULL;
 constexpr std::string_view kMainObbSha256 =
     "0A7C277D91B59006A5D38148953DD1203DD0BAEE4533AB5395889EA5F49F7883";
 constexpr std::string_view kPatchObbSha256 =
-    "8CFC8A76747EDA5CF01A6D7625F2D612B2119CF034ECA8537CD27D8B4A38EA24";
+    "815D96D323A71C50CCC87C3B89147E19205C17E55EA0D4D7A8D9568C8C854C77";
 
 constexpr bool IsExpectedObb(const ObbCandidate& candidate, bool main) {
     return candidate.direct_readable &&
