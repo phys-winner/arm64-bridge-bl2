@@ -35,6 +35,17 @@ try {
         throw 'Verified native 100% resolution policy is missing from the bridge'
     }
     $nativeText = $null
+    # Apktool -f can retain deleted resource files in its APK staging directory.
+    $appRoot = [IO.Path]::GetFullPath((Join-Path $root 'app'))
+    $apkStaging = [IO.Path]::GetFullPath((Join-Path $appRoot 'build'))
+    if (!$apkStaging.StartsWith($appRoot + '\',[StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($apkStaging) -ne 'build') { throw 'Unsafe apktool staging path' }
+    if (Test-Path -LiteralPath $apkStaging) {
+        if ((Get-Item -LiteralPath $apkStaging).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Refusing an apktool staging directory link'
+        }
+        Remove-Item -LiteralPath $apkStaging -Recurse -Force
+    }
     & $java -jar $apktool b -f (Join-Path $root 'app') -p (Join-Path $root 'work\tool-cache\apktool-framework') -o $unsigned
     if ($LASTEXITCODE) { throw 'Apktool build failed' }
     & "$androidTools\zipalign.exe" -P 16 -f 4 $unsigned $aligned

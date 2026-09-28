@@ -1042,6 +1042,10 @@ void FakeJniEnv::DispatchEnvSlot(uint32_t offset, Dynarmic::A32::Jit& jit) {
         // ---- class / object basics ----
         case 24: { // FindClass
             const char* name = ReadGuestStr(*m_host, jit.Regs()[1]);
+            // Preserve the immutable guest ABI after removing the vendor SDK.
+            if (name && std::strcmp(name, "com/nvidia/nvsi/NvSecureInterfaceUtil") == 0) {
+                name = "com/tt2kgames/Borderlands2/LocalPlatform";
+            }
             jclass c = e->FindClass(name);
             if (!c) { e->ExceptionClear(); jit.Regs()[0] = 0; }
             else jit.Regs()[0] = AddLocalObjectRef(e, c);
@@ -1127,6 +1131,9 @@ void FakeJniEnv::DispatchEnvSlot(uint32_t offset, Dynarmic::A32::Jit& jit) {
             jclass c = static_cast<jclass>(ResolveObject(jit.Regs()[1]));
             const char* name = ReadGuestStr(*m_host, jit.Regs()[2]);
             const char* sig = ReadGuestStr(*m_host, jit.Regs()[3]);
+            if (sig && std::strcmp(sig, "()Lcom/nvidia/nvsi/NvSecureInterfaceUtil;") == 0) {
+                sig = "()Lcom/tt2kgames/Borderlands2/LocalPlatform;";
+            }
             if (!c) { jit.Regs()[0] = 0; break; }
             jmethodID mid = e->GetStaticMethodID(c, name, sig);
             if (!mid) {

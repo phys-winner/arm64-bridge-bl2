@@ -5,6 +5,7 @@ import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.input.InputManager;
 import android.os.Handler;
@@ -327,20 +328,54 @@ public final class LaunchControls extends FrameLayout
 
     @Override protected void onLayout(boolean changed, int l, int t, int r, int b) {
         super.onLayout(changed, l, t, r, b);
+        fitControls();
+        if (changed) loggedLayout = false;
         if (!loggedLayout && getWidth() > 0) {
             loggedLayout = true;
-            int[] position = new int[2];
-            for (KeyButton button : buttons) {
-                button.getLocationOnScreen(position);
-                Log.i(TAG, "bounds key=" + button.key + " screen=" + position[0] + "," +
-                        position[1] + " size=" + button.getWidth() + "x" + button.getHeight());
-            }
-            stick.getLocationOnScreen(position);
-            Log.i(TAG, "bounds left-stick screen=" + position[0] + "," + position[1] +
-                    " size=" + stick.getWidth() + "x" + stick.getHeight());
-            cameraStick.getLocationOnScreen(position);
-            Log.i(TAG, "bounds right-stick screen=" + position[0] + "," + position[1] +
-                    " size=" + cameraStick.getWidth() + "x" + cameraStick.getHeight());
+            for (KeyButton button : buttons) logBounds(button, "key=" + button.key);
+            logBounds(stick, "left-stick");
+            logBounds(cameraStick, "right-stick");
+        }
+    }
+
+    private void logBounds(View view, String label) {
+        Rect bounds = new Rect();
+        if (!view.getGlobalVisibleRect(bounds)) return;
+        int[] rootPosition = new int[2];
+        view.getRootView().getLocationOnScreen(rootPosition);
+        bounds.offset(rootPosition[0], rootPosition[1]);
+        Log.i(TAG, "bounds " + label + " screen=" + bounds.left + "," + bounds.top +
+                " size=" + bounds.width() + "x" + bounds.height());
+    }
+
+    private void fitControls() {
+        int width = getWidth() - getPaddingLeft() - getPaddingRight();
+        int height = getHeight() - getPaddingTop() - getPaddingBottom();
+        if (width <= 0 || height <= 0) return;
+        LayoutParams left = (LayoutParams) stick.getLayoutParams();
+        LayoutParams right = (LayoutParams) cameraStick.getLayoutParams();
+        int requiredWidth = left.leftMargin + stick.getWidth() +
+                right.rightMargin + cameraStick.getWidth() + dp(12);
+        int requiredHeight = 1;
+        for (int i = 0; i < getChildCount(); i++) {
+            View child = getChildAt(i);
+            LayoutParams params = (LayoutParams) child.getLayoutParams();
+            requiredHeight = Math.max(requiredHeight,
+                    child.getHeight() + params.topMargin + params.bottomMargin);
+        }
+        float scale = Math.min(1f, Math.min((float) width / requiredWidth,
+                (float) height / requiredHeight));
+        for (int i = 0; i < getChildCount(); i++) {
+            View child = getChildAt(i);
+            LayoutParams params = (LayoutParams) child.getLayoutParams();
+            boolean rightSide = (params.gravity & Gravity.HORIZONTAL_GRAVITY_MASK) == Gravity.RIGHT;
+            if (scale != child.getScaleX()) loggedLayout = false;
+            child.setPivotX(rightSide ? child.getWidth() : 0f);
+            child.setPivotY(child.getHeight());
+            child.setScaleX(scale);
+            child.setScaleY(scale);
+            child.setTranslationX((rightSide ? params.rightMargin : -params.leftMargin) * (1f - scale));
+            child.setTranslationY(params.bottomMargin * (1f - scale));
         }
     }
 

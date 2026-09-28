@@ -24,6 +24,7 @@
 #include "thunks_opensles.h"
 #include "thunks_tegra.h"
 #include "bl2_native_resolution.h"
+#include "bl2_pause_debug_menu.h"
 #include "bl2_vertex_element_fastpath.h"
 #include "bl2_convex_fastpath.h"
 #include "bl2_touch_runtime.h"
@@ -57,7 +58,7 @@ constexpr const char* kGuestLibAux2 = "";
 // Java classes carrying native methods. Every name here must exist in the APK
 // or RegisterNatives silently registers nothing (see LESSONS 6.7).
 constexpr const char* kActivityClass = "com/tt2kgames/Borderlands2/UE3JavaApp";
-constexpr const char* kNvsiClass = "com/nvidia/nvsi/NvSecureInterfaceUtil";
+constexpr const char* kNvsiClass = "com/tt2kgames/Borderlands2/LocalPlatform";
 constexpr const char* kZipClass =
     "com/android/vending/expansion/zipfile/ZipResourceFile";
 constexpr const char* kGuestJniOnLoad = "JNI_OnLoad";
@@ -1752,6 +1753,7 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
         if (MmapGuestFromApk(g_saved_apk_path, ApkCandidates(cfg::kGuestLib),
                              guest_view)) {
             VerifyBl2TouchInput(guest_view.data, guest_view.size);
+            VerifyBl2PauseDebugMenuInput(guest_view.data, guest_view.size);
             VerifyBl2IoFailureProbeInput(guest_view.data, guest_view.size);
             VerifyBl2LocaleGuest(guest_view.data, guest_view.size);
             loaded = VerifyBl2NativeResolutionInput(guest_view.data, guest_view.size) &&
@@ -1774,6 +1776,9 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
         g_host.reset();
         g_guest_load_state = GuestLoadState::Fatal;
         return false;
+    }
+    if (!InstallBl2PauseDebugMenu(*g_host)) {
+        LOGE("Pause Debug visibility unavailable; retaining original pause menu");
     }
     if (!InstallOfflineDlcEnumerationPatch(*g_host)) {
         LOGE("Offline DLC enumeration optimization unavailable; retaining guest path");

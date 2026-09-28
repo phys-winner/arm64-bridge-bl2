@@ -7,11 +7,9 @@ $androidJar = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\platforms\android-36\a
 $d8Jar = 'D:\ai_test\old_game_restoration\tools\android\sdk\build-tools\37.0.0\lib\d8.jar'
 $toolsRoot = 'D:\ai_test\old_game_restoration\tools\android'
 $relativePackage = 'com\tt2kgames\Borderlands2'
-$source = @(
-    (Join-Path $root "android_port\src\$relativePackage\LaunchControls.java"),
-    (Join-Path $root "android_port\src\$relativePackage\GameStorage.java"),
-    (Join-Path $root "android_port\src\$relativePackage\DisplayModePolicy.java")
-)
+$portNames = @('LaunchControls','GameStorage','DisplayModePolicy','Downloader',
+    'LocalPlatform','LocalIdentity','LocalSaveGame','LocalAchievements')
+$source = @($portNames | ForEach-Object { Join-Path $root "android_port\src\$relativePackage\$_.java" })
 $touchNames = @('NativeTouchControls','TouchBridge','TouchContract','TouchInput','TouchLayout','TouchPreferences','TouchSources')
 foreach ($name in $touchNames) {
     $source += Join-Path $root "android_port\src\$relativePackage\touch\$name.java"
@@ -26,8 +24,19 @@ try {
     if ($LASTEXITCODE) { throw 'Launch controls d8 failed' }
     & "$jdk\java.exe" -jar "$toolsRoot\baksmali.jar" d (Join-Path $temporary 'dex\classes.dex') -o (Join-Path $temporary 'smali')
     if ($LASTEXITCODE) { throw 'Launch controls baksmali failed' }
+    # D8's synthetic lambda marker is not a runtime dependency of the game.
+    foreach ($file in Get-ChildItem -LiteralPath (Join-Path $temporary 'smali') -Recurse -Filter '*.smali') {
+        $text = [IO.File]::ReadAllText($file.FullName)
+        $text = [regex]::Replace($text, '(?ms)^\.annotation runtime Lcom/android/tools/r8/annotations/LambdaMethod;\r?\n.*?^\.end annotation\r?\n', '')
+        [IO.File]::WriteAllText($file.FullName, $text, [Text.UTF8Encoding]::new($false))
+    }
     $generated = @(Get-ChildItem -LiteralPath (Join-Path $temporary "smali\$relativePackage") -File)
-    if (!$generated -or ($generated | Where-Object { $_.Name -notmatch '^(?:LaunchControls|GameStorage|DisplayModePolicy)(?:\$[^\\]+)?\.smali$' })) { throw 'Unexpected generated class ownership' }
+    $portPattern = '^(?:' + ($portNames -join '|') + ')(?:\$[^\\]+)?\.smali$'
+    if (!$generated -or ($generated | Where-Object { $_.Name -notmatch $portPattern })) { throw 'Unexpected generated class ownership' }
+    $portDestination = Join-Path $root "app\smali\$relativePackage"
+    foreach ($old in Get-ChildItem -LiteralPath $portDestination -File) {
+        if ($old.Name -match $portPattern -and $old.Name -notin $generated.Name) { Remove-Item -LiteralPath $old.FullName }
+    }
     foreach ($file in $generated) {
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $root "app\smali\$relativePackage\$($file.Name)") -Force
     }
@@ -37,6 +46,10 @@ try {
     }
     $touchDestination = Join-Path $root "app\smali\$relativePackage\touch"
     [IO.Directory]::CreateDirectory($touchDestination) | Out-Null
+    foreach ($old in Get-ChildItem -LiteralPath $touchDestination -File) {
+        if ($old.Name -match '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources)(?:\$[^\\]+)?\.smali$' -and
+            $old.Name -notin $touchGenerated.Name) { Remove-Item -LiteralPath $old.FullName }
+    }
     foreach ($file in $touchGenerated) {
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $touchDestination $file.Name) -Force
     }

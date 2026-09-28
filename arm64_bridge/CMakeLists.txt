@@ -90,6 +90,7 @@ set(BRIDGE_SOURCES
     src/jni_fake_env.cpp
     src/jni_bridge.cpp
     src/bl2_native_resolution.cpp
+    src/bl2_pause_debug_menu.cpp
     src/bl2_vertex_element_fastpath.cpp
     src/bl2_convex_fastpath.cpp
 )
