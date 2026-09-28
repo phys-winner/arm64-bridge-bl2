@@ -5,13 +5,14 @@
 namespace bl2_locale_payload {
 struct File { const char* asset; uint64_t bytes; const char* sha256; };
 struct Binding { const char* path; size_t file; };
-inline constexpr char kDescriptorSha256[] = "EFD3EF476D48F0F9F4E8988939586BF8CB1F52EC8978104C856CDAF935D6B75E";
-inline constexpr uint64_t kDescriptorBytes = 2984;
+inline constexpr char kDescriptorSha256[] = "1836FD442AD1CD1DF1D11B8B68F11D69883FB0DE62E4DF11E22323F69E8D660E";
+inline constexpr uint64_t kDescriptorBytes = 2991;
+inline constexpr char kCompatiblePatchSha256[] = "815D96D323A71C50CCC87C3B89147E19205C17E55EA0D4D7A8D9568C8C854C77";
 inline constexpr File kFiles[] = {
     {"assets/bl2_locale/ru_text/payload/Coalesced_INT.bin", 5656118, "5C858C87724F6812E2E699E8CC3BAC950F317AF18F725B2D8CB8CFFD99178992"},
-    {"assets/bl2_locale/ru_text/payload/packages/Startup.xxx", 22449643, "968EFB94222F3B82F2A86A8CE4DD6C78DD18ED87807C0E3186CDAFFC96F8CAC5"},
-    {"assets/bl2_locale/ru_text/payload/packages/Startup.xxx.uncompressed_size", 11, "0DD78C72505C512A93034B21B0EB36B78F867E20A2DF0FB897DAC7BF6FCC52D7"},
-    {"assets/bl2_locale/ru_text/payload/packages/Startup_LOC_INT.xxx", 1614717, "51E725B51BC9F5A0F3801C3AC8A813284681624100E3BE20CAA6DB5BA980369E"},
+    {"assets/bl2_locale/ru_text/payload/packages/Startup.xxx", 25511602, "721438F4736D2B45B1C51EDE28122333B44312E5F5F639C0CC8C19D9833C4F4D"},
+    {"assets/bl2_locale/ru_text/payload/packages/Startup.xxx.uncompressed_size", 11, "A52123F4DA5F01BC00FB304C4B037FAEA8339ABB1FD656A3AAF75212521B46E5"},
+    {"assets/bl2_locale/ru_text/payload/packages/Startup_LOC_INT.xxx", 1210106, "A0A05272AA0839577F48306EA070A3DC2AA95506F6189780D34723A95DF3D422"},
     {"assets/bl2_locale/ru_text/payload/packages/Startup_LOC_INT.xxx.uncompressed_size", 9, "4280B8817742DADA3FF6D079F3974DA02B8560CC4B9312A838233C9E049F9125"},
 };
 inline constexpr Binding kBindings[] = {

@@ -2967,6 +2967,7 @@ static void SceneAuditLogGfxAtlasContent(GLuint texture, GLint width) {
         glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
                      rgba.data());
         error = glGetError();
+        PreserveSceneAuditGlError(error);
         if (error == GL_NO_ERROR) {
             for (size_t i = 0; i < rgba.size(); i += 4) {
                 const uint8_t red = rgba[i];
@@ -3000,6 +3001,7 @@ static void SceneAuditLogGfxAtlasContent(GLuint texture, GLint width) {
     glReadBuffer(static_cast<GLenum>(prior_read_buffer));
     glDeleteFramebuffers(1, &read_fbo);
     const GLenum cleanup_error = glGetError();
+    PreserveSceneAuditGlError(cleanup_error);
     LOGI("GFx atlas content texture=%u size=%dx%d status=0x%04X "
          "readError=0x%04X cleanupError=0x%04X nonzero=%zu/%zu hash=%016llX",
          texture, width, height, status, error, cleanup_error, nonzero,

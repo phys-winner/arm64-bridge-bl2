@@ -30,6 +30,7 @@
 #include "perf_probe.h"
 #include "guest_mapped_dirty_tracker.h"
 #include "gl_blit_compat.h"
+#include "scene_upper_readback.h"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
 #define LOGE(...) HORN_LOGE(LOG_TAG, __VA_ARGS__)
 
@@ -948,22 +949,24 @@ void ResetGuestMappedDirtyTracker() {
     }
 }
 
-bool SceneAuditEnabled() {
+static int SceneAuditMode() {
     // Permit a bounded audit to be armed after the intro: the first 48 samples
     // otherwise belong to the menumap and never describe class/gameplay frames.
-    static thread_local bool enabled = false;
+    static thread_local int mode = 0;
     static thread_local uint32_t calls = 0;
     if ((++calls & 127u) == 1u) {
         char value[PROP_VALUE_MAX] = {};
-        enabled = __system_property_get("debug.horn.scene_audit", value) > 0 &&
-                  value[0] != '\0' && strcmp(value, "0") != 0 &&
-                  strcmp(value, "false") != 0;
+        __system_property_get("debug.horn.scene_audit", value);
+        mode = SceneAuditModeFromValue(value);
     }
-    return enabled;
+    return mode;
 }
+
+bool SceneAuditEnabled() { return SceneAuditMode() != 0; }
 
 struct SceneAuditPass {
     uint32_t draws = 0;
+    uint32_t upper_dump_draw = 0;
     uint32_t samples = 0;
     bool color_writes = false;
     GLuint last_program = 0;
@@ -1014,7 +1017,77 @@ void SceneAuditNoteDraw(GLuint program) {
     pass.color_writes = pass.color_writes || mask[0] || mask[1] || mask[2] || mask[3];
 }
 
-static void SceneAuditDumpGfxFramebuffer(GLuint framebuffer, uint32_t draw) {
+static void SceneAuditDumpUpperFramebuffer(GLuint framebuffer, uint32_t draw,
+                                          const char* operation) {
+    SceneUpperReadback capture;
+    if (!CaptureUpperSceneFramebuffer(framebuffer, capture)) {
+        LOGI("Scene upper skipped framebuffer=%u draw=%u operation=%s "
+             "attachment=0x%04X object=%d level=%d target=%dx%d unit=%d "
+             "scanned=%d/%d error=0x%04X restore=0x%04X",
+             framebuffer, draw, operation, capture.object_type, capture.object,
+             capture.level, capture.target_width, capture.target_height,
+             capture.texture_unit, capture.scanned_units, capture.available_units,
+             capture.error, capture.restore_error);
+        return;
+    }
+    const std::string path =
+        "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/scene-upper-pid" +
+        std::to_string(getpid()) + "-tid" + std::to_string(gettid()) + "-fbo" +
+        std::to_string(framebuffer) + "-ctx" +
+        std::to_string(reinterpret_cast<uintptr_t>(capture.context)) +
+        "-draw" + std::to_string(draw) + "-x" +
+        std::to_string(capture.x) + "-y" + std::to_string(capture.y) +
+        (capture.type == GL_FLOAT ? ".rgba32f" : ".rgba8");
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (!file) { LOGE("Scene upper dump open failed path=%s", path.c_str()); return; }
+    const bool complete = std::fwrite(capture.pixels.data(), 1, capture.pixels.size(), file) ==
+        capture.pixels.size();
+    const int close = std::fclose(file);
+    LOGI("Scene upper dump framebuffer=%u draw=%u bytes=%zu complete=%d close=%d path=%s",
+         framebuffer, draw, capture.pixels.size(), complete, close, path.c_str());
+    if (!complete || close != 0) return;
+    char metadata[3072];
+    const int bytes = std::snprintf(metadata, sizeof(metadata),
+        "{\"schema\":\"scene-upper-v1\",\"mode\":2,\"pid\":%d,\"tid\":%d,"
+        "\"context\":%llu,\"read_surface\":%llu,\"read_framebuffer\":%u,"
+        "\"draw_framebuffer\":%d,\"draw\":%u,\"operation\":\"%s\",\"program\":%d,"
+        "\"attachment_type\":%d,\"attachment_object\":%d,\"level\":%d,\"samples\":%d,"
+        "\"texture_unit\":%d,\"scanned_units\":%d,\"available_units\":%d,"
+        "\"viewport\":[%d,%d,%d,%d],\"target_extent\":[%d,%d],\"roi\":[%d,%d,896,512],"
+        "\"component_type\":%d,\"implementation_format\":%d,\"implementation_type\":%d,"
+        "\"format\":%d,\"type\":%u,\"bytes\":%zu,\"read_error\":%u,\"restore_error\":%u,"
+        "\"raw_complete\":true,\"raw_close\":0,\"raw_file\":\"%s\"}\n",
+        getpid(), gettid(), static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(capture.context)),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(capture.read_surface)),
+        framebuffer, capture.draw_framebuffer, draw, operation, capture.program,
+        capture.object_type, capture.object, capture.level, capture.samples,
+        capture.texture_unit, capture.scanned_units, capture.available_units,
+        capture.viewport[0], capture.viewport[1], capture.viewport[2], capture.viewport[3],
+        capture.target_width, capture.target_height, capture.x, capture.y,
+        capture.component_type, capture.implementation_format, capture.implementation_type,
+        GL_RGBA, capture.type, capture.pixels.size(), capture.error, capture.restore_error,
+        path.substr(path.find_last_of('/') + 1).c_str());
+    if (bytes <= 0 || static_cast<size_t>(bytes) >= sizeof(metadata)) return;
+    const std::string receipt = path + ".json";
+    file = std::fopen(receipt.c_str(), "wb");
+    if (!file) { LOGE("Scene upper receipt open failed path=%s", receipt.c_str()); return; }
+    const bool receipt_complete = std::fwrite(metadata, 1, bytes, file) == static_cast<size_t>(bytes);
+    const int receipt_close = std::fclose(file);
+    LOGI("Scene upper receipt bytes=%d complete=%d close=%d path=%s",
+         bytes, receipt_complete, receipt_close, receipt.c_str());
+}
+
+static void SceneAuditDumpGfxFramebuffer(GLuint framebuffer, uint32_t draw,
+                                        const char* operation = "transition") {
+    const int mode = SceneAuditMode();
+    if (!mode) return;
+    if (mode == 2) {
+        const auto pass = s_scene_audit_passes.find(framebuffer);
+        if (pass == s_scene_audit_passes.end() ||
+            !SceneUpperTakeDraw(draw, pass->second.upper_dump_draw)) return;
+        SceneAuditDumpUpperFramebuffer(framebuffer, draw, operation);
+        return;
+    }
     constexpr GLsizei width = 896, height = 512;
     GLint old_read_framebuffer = 0, old_read_buffer = 0;
     GLint old_pack_buffer = 0, old_pack_alignment = 0;
@@ -1067,7 +1140,14 @@ static void SceneAuditDumpGfxFramebuffer(GLuint framebuffer, uint32_t draw) {
          close_result, path.c_str());
 }
 
-static void SceneAuditDumpDefaultFramebuffer(uint32_t index) {
+static void SceneAuditDumpDefaultFramebuffer(uint32_t index,
+                                             const char* operation = "blit") {
+    const int mode = SceneAuditMode();
+    if (!mode) return;
+    if (mode == 2) {
+        SceneAuditDumpUpperFramebuffer(0, index, operation);
+        return;
+    }
     constexpr GLsizei width = 896, height = 512;
     GLint old_read_framebuffer = 0, old_read_buffer = 0;
     GLint old_pack_buffer = 0, old_pack_alignment = 0;
@@ -1114,7 +1194,8 @@ static void SceneAuditDumpDefaultFramebuffer(uint32_t index) {
 }
 
 static void SceneAuditTrackGroundPixels(uint32_t draw, GLuint program,
-                                        const char* operation) {
+                                       const char* operation) {
+    if (SceneAuditMode() != 1) return;
     if (draw > 1300) return;
     constexpr std::array<std::array<GLint, 2>, 12> points{{
         {{280, 172}}, {{300, 212}}, {{340, 152}},
@@ -1211,7 +1292,8 @@ static void SceneAuditTrackGroundPixels(uint32_t draw, GLuint program,
 }
 
 static void SceneAuditTrackUiLine(uint32_t draw, GLuint program,
-                                  const char* operation) {
+                                const char* operation) {
+    if (SceneAuditMode() != 1) return;
     if (draw > 64) return;
     constexpr std::array<GLint, 3> rows{48, 58, 62};
     static thread_local std::array<std::array<uint16_t, 4>, rows.size()> last{};
@@ -1282,7 +1364,7 @@ void SceneAuditDrawCompleted(const char* operation) {
                      "viewport=%d,%d %dx%d", ++default_draws, operation,
                      program, viewport[0], viewport[1], viewport[2], viewport[3]);
                 if (default_draws <= 4) {
-                    SceneAuditDumpDefaultFramebuffer(100 + default_draws);
+                    SceneAuditDumpDefaultFramebuffer(100 + default_draws, operation);
                 }
             }
         } else if (framebuffer == 28) {
@@ -1293,7 +1375,7 @@ void SceneAuditDrawCompleted(const char* operation) {
                                       operation);
                 if (draws == 2 || draws == 30 || draws == 31 ||
                     draws == 51 || draws == 52) {
-                    SceneAuditDumpGfxFramebuffer(28, draws);
+                    SceneAuditDumpGfxFramebuffer(28, draws, operation);
                 }
             }
         } else if (framebuffer == 15) {
@@ -1307,12 +1389,12 @@ void SceneAuditDrawCompleted(const char* operation) {
                     draws == 255 || draws == 294 || draws == 350 ||
                     draws == 529 || draws == 590 || draws == 950 ||
                     draws == 1200) {
-                    SceneAuditDumpGfxFramebuffer(15, draws);
+                    SceneAuditDumpGfxFramebuffer(15, draws, operation);
                 }
             }
         }
     }
-    if (!SceneAuditEnabled() || s_scene_audit_post_draw_samples >= 8) return;
+    if (SceneAuditMode() != 1 || s_scene_audit_post_draw_samples >= 8) return;
     GLint framebuffer = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
     if (framebuffer != 8) return;
@@ -1402,7 +1484,7 @@ void SceneAuditFramebufferTransition(GLenum target, GLuint next_framebuffer) {
              attachment_name, level, pass.draws,
              viewport[0], viewport[1], viewport[2], viewport[3]);
     }
-    if (viewport[0] < 0 || viewport[1] < 0 || viewport[2] <= 0 ||
+    if (SceneAuditMode() != 1 || viewport[0] < 0 || viewport[1] < 0 || viewport[2] <= 0 ||
         viewport[3] <= 0 || viewport[2] > 2048 || viewport[3] > 2048) return;
 
     GLint old_read_framebuffer = 0;
@@ -1747,9 +1829,11 @@ ResolveDrawElementsBaseVertexProc(bool prefer_ext) {
 static bool DrawGfxTextWithAlignedVertices(
     GLenum mode, GLsizei count, GLenum type, const void* indices,
     GLint base_vertex, PFNGLDRAWELEMENTSBASEVERTEXOESPROC function) {
+    // ponytail: bound to 2048 glyph quads; widen only if a real UI exceeds it.
+    constexpr uint32_t kMaxVertices = 8192;
     if (!CurrentLegacyPipelineIsGfxText() || !function ||
         mode != GL_TRIANGLES || type != GL_UNSIGNED_SHORT ||
-        count <= 0 || count > 4096 || base_vertex != 0) return false;
+        count <= 0 || count > (kMaxVertices / 4) * 6 || base_vertex != 0) return false;
     GLint source = 0, position_type = 0, position_stride = 0;
     void* position_pointer = nullptr;
     glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &source);
@@ -1809,7 +1893,7 @@ static bool DrawGfxTextWithAlignedVertices(
                             index_data.data())) return false;
     const auto [first, last] = std::minmax_element(index_data.begin(),
                                                    index_data.end());
-    if (*first != 0 || *last >= 8192) return false;
+    if (*first != 0 || *last >= kMaxVertices) return false;
     const size_t vertex_bytes = (static_cast<size_t>(*last) + 1) * record_stride;
     std::vector<uint8_t> records(vertex_bytes);
     if (!CopyGlBufferShadow(static_cast<GLuint>(source), origin,
@@ -2959,7 +3043,9 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
                  active_draw_mask, all_draw_buffers_read, max_draw_buffers,
                  identity_noop);
         }
-        if (SceneAuditEnabled() && read_framebuffer == 23 &&
+        // A viewport belongs to a draw, not to this blit's source rectangle.
+        // Mode2 deliberately observes only post-draw/transition upper regions.
+        if (SceneAuditMode() == 1 && read_framebuffer == 23 &&
             draw_framebuffer == 0) {
             static thread_local uint32_t scene_presents = 0;
             if (scene_presents < 3 || scene_presents == 96 ||

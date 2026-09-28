@@ -9,6 +9,7 @@
 #include "thunk_manager.h"
 #endif
 #include "obb_sha256.h"
+#include "obb_pair_selection.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,9 @@
 #define LOG_TAG "Arm32Bridge_Locale"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
 #define LOGE(...) HORN_LOGE(LOG_TAG, __VA_ARGS__)
+
+static_assert(std::string_view(bl2_locale_payload::kCompatiblePatchSha256) == kPatchObbSha256,
+              "Russian startup packages and the base must use the same texture cache");
 
 namespace {
 using namespace bl2_locale_payload;
