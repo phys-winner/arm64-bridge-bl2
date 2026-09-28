@@ -301,7 +301,7 @@ static float CurrentPolygonOffsetUnitsScale(DynarmicHost& host, GLint& depth_bit
     return s_depth_bias_units_scale;
 }
 
-static bool GlStateAuditEnabled() {
+bool GlStateAuditEnabled() {
     static const bool enabled = [] {
         char value[PROP_VALUE_MAX] = {};
         return __system_property_get("debug.horn.gl_audit", value) > 0 &&
@@ -330,15 +330,16 @@ void PreserveSceneAuditGlError(GLenum error) {
     }
 }
 
-static void CaptureGlError(const char* operation) {
-    if (!GlStateAuditEnabled()) return;
+GLenum CaptureGlError(const char* operation) {
+    if (!GlStateAuditEnabled()) return GL_NO_ERROR;
     const GLenum error = glGetError();
-    if (error == GL_NO_ERROR) return;
+    if (error == GL_NO_ERROR) return error;
     if (s_deferred_gl_error == GL_NO_ERROR) s_deferred_gl_error = error;
     const uint32_t index = s_gl_error_logs.fetch_add(1, std::memory_order_relaxed);
     if (index < 128) {
         LOGE("GL audit: %s produced 0x%04X (tid=%d)", operation, error, gettid());
     }
+    return error;
 }
 
 static void AuditBufferBinding(

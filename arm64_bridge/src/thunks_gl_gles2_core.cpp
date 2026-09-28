@@ -29,6 +29,7 @@
 #include "bl2_fog_audit.h"
 #include "perf_probe.h"
 #include "guest_mapped_dirty_tracker.h"
+#include "gl_blit_compat.h"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
 #define LOGE(...) HORN_LOGE(LOG_TAG, __VA_ARGS__)
 
@@ -55,6 +56,8 @@ void SceneAuditLogFinalInvocation(const char* operation, GLint first,
                                   GLint base_vertex, GLsizei instances);
 GLuint GetBoundGlBuffer(GLenum target);
 void PreserveSceneAuditGlError(GLenum error);
+bool GlStateAuditEnabled();
+GLenum CaptureGlError(const char* operation);
 void SceneAuditCaptureLightingState(uint32_t draw, size_t point);
 void InvalidateGlAttribCache();
 void InvalidateLegacyTextureCache();
@@ -2898,8 +2901,55 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
             LogFramebufferPixels("source", index,
                                  src_x0, src_y0, src_x1, src_y1);
         }
-        glBlitFramebuffer(src_x0, src_y0, src_x1, src_y1,
-                          dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+        const bool error_audit = GlStateAuditEnabled();
+        GLint read_buffer = 0, draw_buffer0 = 0, max_draw_buffers = 0;
+        uint32_t active_draw_mask = 0;
+        bool all_draw_buffers_read = true;
+        if (error_audit) {
+            glGetIntegerv(GL_READ_BUFFER, &read_buffer);
+            glGetIntegerv(GL_MAX_DRAW_BUFFERS, &max_draw_buffers);
+            // ponytail: snapshot at most16 draw buffers; log the host maximum
+            // so a larger host cannot be mistaken for complete coverage.
+            for (GLint i = 0; i < std::min(max_draw_buffers, 16); ++i) {
+                GLint draw_buffer = 0;
+                glGetIntegerv(GL_DRAW_BUFFER0 + i, &draw_buffer);
+                if (i == 0) draw_buffer0 = draw_buffer;
+                if (draw_buffer == GL_NONE) continue;
+                active_draw_mask |= 1u << i;
+                all_draw_buffers_read &= draw_buffer == read_buffer;
+            }
+        }
+        const bool identity_noop = IsIdentityColorBlit(
+            read_framebuffer, draw_framebuffer,
+            src_x0, src_y0, src_x1, src_y1,
+            dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+        const GLenum before_error = error_audit
+            ? CaptureGlError("before glBlitFramebuffer") : GL_NO_ERROR;
+        if (!identity_noop) {
+            glBlitFramebuffer(src_x0, src_y0, src_x1, src_y1,
+                              dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
+        } else {
+            static std::atomic<uint32_t> identity_copies{0};
+            if (identity_copies.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOGI("GL compatibility: identity color self-blit #%u "
+                     "framebuffer=%d retained unchanged", index, read_framebuffer);
+            }
+        }
+        const GLenum after_error = error_audit
+            ? CaptureGlError("after glBlitFramebuffer") : GL_NO_ERROR;
+        static std::atomic<uint32_t> audit_error_snapshots{0};
+        if (error_audit && (index <= 24 ||
+            ((before_error != GL_NO_ERROR || after_error != GL_NO_ERROR) &&
+             audit_error_snapshots.fetch_add(1, std::memory_order_relaxed) < 16))) {
+            LOGI("GL blit audit #%u before=0x%04X after=0x%04X "
+                 "read=%d draw=%d readBuffer=0x%04X drawBuffer0=0x%04X "
+                 "activeDrawMask=0x%04X allDrawRead=%d maxDrawBuffers=%d "
+                 "identityNoop=%d",
+                 index, before_error, after_error, read_framebuffer,
+                 draw_framebuffer, read_buffer, draw_buffer0,
+                 active_draw_mask, all_draw_buffers_read, max_draw_buffers,
+                 identity_noop);
+        }
         if (SceneAuditEnabled() && read_framebuffer == 23 &&
             draw_framebuffer == 0) {
             static thread_local uint32_t scene_presents = 0;
