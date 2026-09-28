@@ -24,7 +24,7 @@
 *.xml text eol=lf
 *.yml text eol=lf
 
-# Exact current bridge build inputs (seed294 source-build-match.json).
+# Exact current bridge build inputs (seed295 source-build-match295.json).
 .gitattributes -text
 /arm64_bridge/src/arm32_network_abi.h -text
 /arm64_bridge/src/bl2_convex_fastpath.cpp -text
@@ -166,3 +166,17 @@
 /work/evidence/device-abb24fae-seed294-r4-setup/commands.jsonl -text
 /work/evidence/device-abb24fae-seed294-r4-setup/post-rejection-integrity/result.json -text
 /work/evidence/device-abb24fae-seed294-r4-preflight/restore-after-294-noverity-normal.json -text
+/arm64_bridge/tests/guest_mapped_dirty_tracker_test.cpp -text
+/work/scripts/install_bridge_candidate.ps1 -text
+/work/scripts/invoke_game_button.ps1 -text
+/work/scripts/run_bridge_probe.ps1 -text
+/work/build/seed295-build.json -text
+/work/evidence/lan-new-pair-20260929/** -text
+/work/evidence/lan-warband-reference-20260929/independent-reference-review.md -text
+/work/evidence/lan-seed295-*/** -text
+/work/evidence/pixel-seed295-16k-ordinary-20260929/** -text
+/work/evidence/pixel-seed295-16k-resume-20260929/** -text
+/work/evidence/device-pixel-seed295-setup/** -text
+/work/evidence/device-f4668e7b-seed295-setup/** -text
+/work/evidence/device-jrjz95hut455yxq4-seed295-setup/** -text
+/work/evidence/device-pixel-seed292-preflight/restore-after-295-ordinary-resume.json -text

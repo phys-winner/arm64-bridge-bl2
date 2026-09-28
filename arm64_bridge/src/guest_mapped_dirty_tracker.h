@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <signal.h>
 #include <vector>
 
@@ -26,6 +27,11 @@ public:
     void MarkDirtyScanComplete(uint32_t epoch) { last_scanned_epoch_ = epoch; }
     size_t PageSize() const { return page_size_; }
     void Rearm(std::vector<size_t>& pages);
+    // Caller holds the mapping mutex through the native write and publication.
+    bool PrepareNativeWrite(uint32_t guest_address, size_t length);
+    void CompleteNativeWrite() {
+        dirty_epoch_.fetch_add(1, std::memory_order_release);
+    }
     void Shutdown();
 
 private:
@@ -48,4 +54,15 @@ private:
     std::vector<uint16_t> page_references_;
     struct sigaction previous_segv_{};
     bool installed_ = false;
+};
+
+// Native memcpy/memmove/memset must not fault through ART for each watched page.
+// Keep GPU synchronization excluded until the completed write is published.
+class GuestMappedWriteGuard {
+public:
+    GuestMappedWriteGuard(uint32_t guest_address, size_t length);
+    ~GuestMappedWriteGuard();
+private:
+    std::unique_lock<std::mutex> lock_;
+    bool dirty_ = false;
 };

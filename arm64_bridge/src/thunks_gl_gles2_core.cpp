@@ -775,12 +775,23 @@ static_assert(sizeof(GLenum) == 4);
 static_assert(std::is_pointer_v<GLsync>);
 static_assert(sizeof(GLsync) == sizeof(void*));
 
+GuestMappedWriteGuard::GuestMappedWriteGuard(uint32_t guest_address,
+                                             size_t length)
+    : lock_(s_mapping_mutex) {
+    dirty_ = MappedDirtyTracker().PrepareNativeWrite(guest_address, length);
+}
+
+GuestMappedWriteGuard::~GuestMappedWriteGuard() {
+    if (dirty_) MappedDirtyTracker().CompleteNativeWrite();
+}
+
 void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
     constexpr GLbitfield kMapPersistentBit = 0x0040;
     constexpr GLbitfield kMapCoherentBit = 0x0080;
     const EGLContext context = eglGetCurrentContext();
     if (context == EGL_NO_CONTEXT) return;
 
+    std::lock_guard mapping_lock(s_mapping_mutex);
     GuestMappedDirtyTracker* tracker = nullptr;
     if (DirtySyncRequested() &&
         MappedDirtyTracker().Initialize(host.GetGuestMemoryBase(),
@@ -793,7 +804,6 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
     size_t mapped_bytes = 0;
     size_t byte_count = 0;
     size_t copied_bytes = 0;
-    std::lock_guard mapping_lock(s_mapping_mutex);
     const uint32_t dirty_epoch = tracker ? tracker->DirtyEpoch() : 0;
     const bool scan_dirty_pages = tracker && tracker->NeedsDirtyScan(dirty_epoch);
     if (scan_dirty_pages) {

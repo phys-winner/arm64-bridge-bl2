@@ -1,6 +1,7 @@
 #include "guest_mapped_dirty_tracker.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <limits>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -130,6 +131,24 @@ void GuestMappedDirtyTracker::Rearm(std::vector<size_t>& pages) {
             dirty_epoch_.fetch_add(1, std::memory_order_release);
         }
     }
+}
+
+bool GuestMappedDirtyTracker::PrepareNativeWrite(uint32_t guest_address,
+                                                 size_t length) {
+    size_t first = 0, past_last = 0;
+    if (!PageRange(guest_address, length, &first, &past_last)) return false;
+    const int saved_errno = errno;
+    bool tracked = false;
+    for (size_t page = first; page < past_last; ++page) {
+        if (!page_references_[page]) continue;
+        tracked = true;
+        // A guest fault racing a previous re-arm may leave a dirty page RO.
+        if (ProtectPage(PagePointer(page), page_size_, PROT_READ | PROT_WRITE)) {
+            page_state_[page].store(kDirty, std::memory_order_release);
+        }
+    }
+    errno = saved_errno;
+    return tracked;
 }
 
 void GuestMappedDirtyTracker::Shutdown() {

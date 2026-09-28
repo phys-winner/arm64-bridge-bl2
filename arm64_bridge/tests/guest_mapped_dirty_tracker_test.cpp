@@ -1,6 +1,8 @@
 #include "guest_mapped_dirty_tracker.h"
 
 #include <cstdio>
+#include <cerrno>
+#include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -36,6 +38,36 @@ int main() {
     expect(!tracker.IsDirty(0) && dirty_pages.size() == 1, "rearm first page");
     bytes[page + 2] = 0x45;
     expect(tracker.IsDirty(1) && !tracker.IsDirty(0), "second page isolated");
+    dirty_pages = {0, 1};
+    tracker.Rearm(dirty_pages);
+    const uint32_t epoch = tracker.DirtyEpoch();
+    errno = EDOM;
+    expect(tracker.PrepareNativeWrite(static_cast<uint32_t>(page - 2), 4),
+           "native range unlocks both referenced pages");
+    expect(errno == EDOM && tracker.DirtyEpoch() == epoch,
+           "prepare preserves errno and waits to publish completed write");
+    const uint8_t source[] = {1, 2, 3, 4};
+    std::memcpy(static_cast<uint8_t*>(memory) + page - 2, source, sizeof(source));
+    tracker.CompleteNativeWrite();
+    expect(tracker.DirtyEpoch() == epoch + 1 && tracker.IsDirty(0) &&
+               tracker.IsDirty(1) && bytes[page - 2] == 1 && bytes[page + 1] == 4,
+           "cross-page memcpy writes exactly and publishes once without faults");
+    expect(mprotect(memory, page, PROT_READ) == 0 &&
+               tracker.PrepareNativeWrite(1, 1),
+           "native write confirms RW for dirty reprotected page");
+    bytes[1] = 0x47;
+    tracker.CompleteNativeWrite();
+    expect(tracker.DirtyEpoch() == epoch + 2 && bytes[1] == 0x47,
+           "dirty reprotected native write avoids the fault path");
+    expect(!tracker.PrepareNativeWrite(static_cast<uint32_t>(page * 2), page),
+           "untracked destination is not dirtied");
+    expect(!tracker.PrepareNativeWrite(static_cast<uint32_t>(size - 1), 2) &&
+               !tracker.PrepareNativeWrite(1, 0),
+           "invalid and empty native spans do not arm pages");
+    tracker.Rearm(dirty_pages);
+    bytes[page + 2] = 0x46;
+    expect(tracker.DirtyEpoch() == epoch + 3 && tracker.IsDirty(1) &&
+               !tracker.IsDirty(0), "guest fault path remains active after native write");
     tracker.Untrack(1, page + 8);
     expect(!tracker.IsDirty(1), "untrack resets dirty state");
     bytes[1] = 0x67;

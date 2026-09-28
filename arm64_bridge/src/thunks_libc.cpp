@@ -14,6 +14,7 @@
 #include "virtual_file_range.h"
 #include "zip_stored_entry_bounds.h"
 #include "arm32_network_abi.h"
+#include "guest_mapped_dirty_tracker.h"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -1998,7 +1999,10 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t n = jit.Regs()[2];
         void* h_dst = GuestToHost(host.GetGuestMemoryBase(), dst);
         const void* h_src = GuestToHost(host.GetGuestMemoryBase(), src);
-        if (h_dst && h_src && n > 0) memmove(h_dst, h_src, n);
+        if (h_dst && h_src && n > 0) {
+            GuestMappedWriteGuard write(dst, n);
+            memmove(h_dst, h_src, n);
+        }
         jit.Regs()[0] = dst;
     });
     RegisterThunk("memmem", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -4186,14 +4190,20 @@ void ThunkManager::RegisterLibcThunks() {
         void* s = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]);
         int c = static_cast<int>(jit.Regs()[1]);
         size_t n = jit.Regs()[2];
-        if (s) memset(s, c, n);
+        if (s) {
+            GuestMappedWriteGuard write(jit.Regs()[0], n);
+            memset(s, c, n);
+        }
     });
 
     RegisterThunk("memcpy", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         void* dest = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]);
         const void* src = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]);
         size_t n = jit.Regs()[2];
-        if (dest && src) memcpy(dest, src, n);
+        if (dest && src) {
+            GuestMappedWriteGuard write(jit.Regs()[0], n);
+            memcpy(dest, src, n);
+        }
     });
 
     RegisterThunk("memcmp", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -4364,6 +4374,7 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t dest = jit.Regs()[0];
         uint32_t n = jit.Regs()[1];
         if (dest && n) {
+            GuestMappedWriteGuard write(dest, n);
             memset(GuestToHost(host.GetGuestMemoryBase(), dest), 0, n);
         }
     };
@@ -4376,6 +4387,7 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t n = jit.Regs()[1];
         int c = static_cast<int>(jit.Regs()[2]);
         if (dest && n) {
+            GuestMappedWriteGuard write(dest, n);
             memset(GuestToHost(host.GetGuestMemoryBase(), dest), c, n);
         }
     };
@@ -4388,6 +4400,7 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t src = jit.Regs()[1];
         uint32_t n = jit.Regs()[2];
         if (dest && src && n) {
+            GuestMappedWriteGuard write(dest, n);
             memcpy(GuestToHost(host.GetGuestMemoryBase(), dest),
                    GuestToHost(host.GetGuestMemoryBase(), src), n);
         }
@@ -4401,6 +4414,7 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t src = jit.Regs()[1];
         uint32_t n = jit.Regs()[2];
         if (dest && src && n) {
+            GuestMappedWriteGuard write(dest, n);
             memmove(GuestToHost(host.GetGuestMemoryBase(), dest),
                     GuestToHost(host.GetGuestMemoryBase(), src), n);
         }
