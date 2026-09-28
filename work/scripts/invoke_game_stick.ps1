@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory)][ValidateSet('left','right')][string]$Stick,
     [Parameter(Mandatory)][ValidateSet('up','down','left','right')][string]$Direction,
     [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9-]+$')][string]$Label,
-    [ValidateSet('61151JEA326613','HA22AHP1','83c14820','f4668e7b')]
+    [ValidatePattern('^[a-zA-Z0-9-]+$')]
     [string]$Serial = '61151JEA326613',
     [ValidateRange(100,5000)][int]$HoldMs = 750
 )

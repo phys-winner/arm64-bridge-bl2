@@ -15,10 +15,21 @@ constexpr ObbSplitEntryMetadata kPatch{
     "assets/patch.31.com.tt2kgames.Borderlands2.obb",
     "assets/patch.31.com.tt2kgames.Borderlands2.obb",
     0, 0, 0, 0, kPatchObbSize, kPatchObbSize,
-    2147483647ULL, 2147480000ULL, 32768ULL, 46, 0};
+    2647421364ULL, 2647420928ULL, 628ULL, 46, 0};
 static_assert(InspectObbSplitEntry(kPatch).status ==
               ObbSplitEntryStatus::NeedsContentVerification);
 static_assert(!InspectObbSplitEntry(kPatch).main);
+static_assert(InspectObbSplitEntry(kPatch).data_offset == 704ULL);
+static_assert(InspectObbSplitEntry(kPatch).size == kPatchObbSize);
+
+constexpr auto kPatchSignedLimit = [] {
+    auto entry = kPatch;
+    entry.apk_size = 2147483647ULL;
+    entry.central_offset = 2147480000ULL;
+    return entry;
+}();
+static_assert(InspectObbSplitEntry(kPatchSignedLimit).status ==
+              ObbSplitEntryStatus::Rejected);
 
 constexpr ObbSplitEntryMetadata kOther{
     "assets/other.obb", "assets/other.obb", 0, 0, 0, 0,
