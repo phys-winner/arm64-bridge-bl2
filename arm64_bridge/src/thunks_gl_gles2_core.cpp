@@ -59,6 +59,8 @@ void PreserveSceneAuditGlError(GLenum error);
 bool GlStateAuditEnabled();
 GLenum CaptureGlError(const char* operation);
 void SceneAuditCaptureLightingState(uint32_t draw, size_t point);
+void SceneAuditCaptureTargetLightingState(GLuint framebuffer, uint32_t draw,
+                                         GLuint expected_program, const char* operation);
 void InvalidateGlAttribCache();
 void InvalidateLegacyTextureCache();
 void InvalidateLegacyTextureCacheAcrossContexts();
@@ -1263,6 +1265,13 @@ void SceneAuditDrawCompleted(const char* operation) {
     if (SceneAuditEnabled()) {
         GLint framebuffer = 0;
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+        if (framebuffer > 2) {
+            const auto pass = s_scene_audit_passes.find(static_cast<GLuint>(framebuffer));
+            if (pass != s_scene_audit_passes.end() && pass->second.draws && pass->second.last_program) {
+                SceneAuditCaptureTargetLightingState(static_cast<GLuint>(framebuffer),
+                    pass->second.draws, pass->second.last_program, operation);
+            }
+        }
         if (framebuffer == 0) {
             static thread_local uint32_t default_draws = 0;
             if (default_draws < 16) {

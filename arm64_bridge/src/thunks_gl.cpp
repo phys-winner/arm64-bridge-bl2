@@ -7,6 +7,7 @@
 #include "legacy_glsl_compat.h"
 #include "buffer_shadow_sync.h"
 #include "obb_sha256.h"
+#include "scene_texture_targets.h"
 #include "obb_pair_selection.h"
 #include "thunk_types.h"
 #ifndef GL_GLEXT_PROTOTYPES
@@ -2053,42 +2054,180 @@ static void SceneAuditCaptureLightingTexture(GLuint texture, GLint width,
     PreserveSceneAuditGlError(glGetError());
 }
 
-void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
+static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
+                                               GLuint expected_framebuffer,
+                                               GLuint expected_program,
+                                               const char* operation) {
     if (!SceneAuditEnabled()) return;
     std::lock_guard<std::mutex> lock(s_legacy_program_mutex);
     const auto vertex = s_legacy_stages.find(s_bound_legacy_vertex);
     const auto fragment = s_legacy_stages.find(s_bound_legacy_fragment);
-    if (vertex == s_legacy_stages.end() || fragment == s_legacy_stages.end() ||
+    const bool target_mode = SceneTextureHashEnabled();
+    if (vertex == s_legacy_stages.end() || fragment == s_legacy_stages.end()) return;
+    if (!target_mode &&
         (fragment->second.name != "DirectionalLightPixelShader" &&
          fragment->second.name != "BasePassPixelShader" &&
          fragment->second.name != "HeightFogPixelShader")) return;
     const bool fog = fragment->second.name == "HeightFogPixelShader";
     static thread_local std::unordered_set<GLuint> captured_programs;
-    static thread_local std::unordered_set<uint32_t> captured_draws;
-    static thread_local std::unordered_set<uint32_t> captured_fog_draws;
+    static thread_local std::unordered_set<uint64_t> captured_draws;
+    static thread_local std::unordered_set<uint64_t> captured_fog_draws;
+    static thread_local std::unordered_set<uint64_t> captured_targets;
+    struct TargetBinding {
+        size_t unit;
+        int target;
+        GLuint texture;
+        uint64_t handle;
+        GLint location;
+    };
+    std::array<TargetBinding, 16> targets{};
+    size_t target_count = 0;
+    uint32_t pending_targets = 0;
+    GLint actual_framebuffer = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &actual_framebuffer);
+    const uint64_t draw_key = (static_cast<uint64_t>(actual_framebuffer) << 32) | draw;
+    if (target_mode) {
+        if (vertex->second.target != kVertexProgramArb || !vertex->second.shader ||
+            fragment->second.target != kFragmentProgramArb || !fragment->second.shader ||
+            actual_framebuffer <= 2 || (expected_framebuffer &&
+            expected_framebuffer != static_cast<GLuint>(actual_framebuffer))) return;
+        const auto pipeline = s_legacy_pipelines.find(
+            LegacyPipelineKey(s_bound_legacy_vertex, s_bound_legacy_fragment));
+        if (pipeline == s_legacy_pipelines.end() || !pipeline->second.program ||
+            pipeline->second.program != s_current_program ||
+            (expected_program && expected_program != s_current_program)) return;
+        GLint previous_active = 0;
+        bool changed_active = false, checked_program = false;
+        for (size_t unit = 0; unit < fragment->second.sampler_registers.size(); ++unit) {
+            const int reg = fragment->second.sampler_registers[unit];
+            if (reg < 0 || fragment->second.sampler_targets[unit] != GL_TEXTURE_2D) continue;
+            const size_t word = static_cast<size_t>(reg) * 4;
+            if (word + 1 >= fragment->second.local_parameters.size()) continue;
+            const uint64_t handle = fragment->second.local_parameters[word] |
+                (static_cast<uint64_t>(fragment->second.local_parameters[word + 1]) << 32);
+            const auto resolved = s_legacy_texture_handles.find(handle);
+            if (resolved == s_legacy_texture_handles.end() || !resolved->second.texture) continue;
+            SceneTextureFingerprint fingerprint;
+            {
+                std::lock_guard<std::mutex> hash_lock(s_scene_texture_fingerprints_mutex);
+                const auto found = s_scene_texture_fingerprints.find(resolved->second.texture);
+                if (found == s_scene_texture_fingerprints.end()) continue;
+                fingerprint = found->second;
+            }
+            const int target = SceneTextureTargetIndex(fingerprint.sha256.data(),
+                                                      fingerprint.width, fingerprint.height);
+            if (target < 0 || captured_targets.contains(
+                (static_cast<uint64_t>(s_current_program) << 32) | target)) continue;
+            if (!checked_program) {
+                GLint actual_program = 0;
+                glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
+                if (static_cast<GLuint>(actual_program) != s_current_program) return;
+                checked_program = true;
+            }
+            const std::string name = "PSampler" + std::to_string(unit);
+            const GLint location = glGetUniformLocation(s_current_program, name.c_str());
+            GLint actual_unit = -1;
+            if (location >= 0) glGetUniformiv(s_current_program, location, &actual_unit);
+            if (location < 0 || actual_unit != static_cast<GLint>(unit)) continue;
+            if (!changed_active) {
+                glGetIntegerv(GL_ACTIVE_TEXTURE, &previous_active);
+                changed_active = true;
+            }
+            glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
+            GLint texture = 0, width = 0, height = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+            if (static_cast<GLuint>(texture) != resolved->second.texture) continue;
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+            if (width != fingerprint.width || height != fingerprint.height) continue;
+            targets[target_count++] = {unit, target, resolved->second.texture, handle, location};
+            pending_targets |= 1u << target;
+        }
+        if (changed_active) glActiveTexture(static_cast<GLenum>(previous_active));
+        if (!target_count || captured_draws.contains(draw_key)) return;
+        size_t pending_count = 0;
+        for (unsigned int bits = pending_targets; bits; bits &= bits - 1) ++pending_count;
+        // ponytail: 24 diagnostic attempts/tuples, expand only for a demonstrated coverage gap.
+        if (captured_draws.size() >= 24 || captured_targets.size() + pending_count > 24) {
+            static thread_local bool exhausted = false;
+            if (!exhausted) LOGI("Scene lighting target budget exhausted attempts=%zu tuples=%zu pending=%zu",
+                                captured_draws.size(), captured_targets.size(), pending_count);
+            exhausted = true;
+            return;
+        }
+        captured_draws.insert(draw_key);
+        for (size_t i = 0; i < target_count; ++i) {
+            const auto& binding = targets[i];
+            const auto& target = kSceneTextureTargets[binding.target];
+            LOGI("Scene lighting target binding draw=%u host=%u fbo=%d trigger=%s operation=%s "
+                 "unit=%zu location=%d actualUnit=%zu handle=0x%016llX texture=%u target=%d "
+                 "size=%dx%d uploadSHA256=%s tid=%d context=%p",
+                 draw, s_current_program, actual_framebuffer, operation ? "postdraw" : "historical",
+                 operation ? operation : "pixel-history", binding.unit, binding.location,
+                 binding.unit, static_cast<unsigned long long>(binding.handle), binding.texture,
+                 binding.target, target.width, target.height, target.sha256, gettid(), eglGetCurrentContext());
+        }
+    }
     // A program is reused with different mesh inputs. Rock samples need the
     // state at their actual draw even if this program was seen on the plank.
     // Give fog its own bounded budget so opaque geometry cannot exhaust it.
-    if (fog) {
+    else if (fog) {
         if (captured_fog_draws.size() >= 4 ||
-            !captured_fog_draws.insert(draw).second) return;
+            !captured_fog_draws.insert(draw_key).second) return;
     } else if (captured_draws.size() >= 24 ||
                (point < 9 && captured_programs.contains(s_current_program)) ||
-               !captured_draws.insert(draw).second) return;
+               !captured_draws.insert(draw_key).second) return;
     captured_programs.insert(s_current_program);
     const std::string prefix =
-        "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/scene-lighting-draw" +
-        std::to_string(draw) + "-program" + std::to_string(s_current_program);
+        "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/scene-lighting-" +
+        (target_mode ? "fbo" + std::to_string(actual_framebuffer) + "-" : "") +
+        "draw" + std::to_string(draw) + "-program" + std::to_string(s_current_program);
     const auto write_file = [](const std::string& path, const void* data, size_t size) {
         FILE* file = std::fopen(path.c_str(), "wb");
-        if (!file) return;
+        if (!file) {
+            LOGE("Scene lighting file open=failed path=%s", path.c_str());
+            return false;
+        }
         const size_t written = std::fwrite(data, 1, size, file);
         const int closed = std::fclose(file);
         LOGI("Scene lighting file bytes=%zu written=%zu close=%d path=%s",
              size, written, closed, path.c_str());
+        return written == size && closed == 0;
     };
-    LOGI("Scene lighting capture draw=%u point=%zu host=%u vertex=%u fragment=%u",
-         draw, point, s_current_program, s_bound_legacy_vertex, s_bound_legacy_fragment);
+    if (target_mode) {
+        LOGI("Scene lighting capture draw=%u point=none host=%u vertex=%u fragment=%u fbo=%d trigger=target",
+             draw, s_current_program, s_bound_legacy_vertex, s_bound_legacy_fragment, actual_framebuffer);
+    } else {
+        LOGI("Scene lighting capture draw=%u point=%zu host=%u vertex=%u fragment=%u",
+             draw, point, s_current_program, s_bound_legacy_vertex, s_bound_legacy_fragment);
+    }
+    bool complete = true;
+    std::string target_receipt;
+    const auto record = [&](const char* format, auto... values) {
+        if (!target_mode) return;
+        char row[2048];
+        const int length = std::snprintf(row, sizeof(row), format, values...);
+        if (length < 0 || static_cast<size_t>(length) >= sizeof(row)) {
+            complete = false;
+            return;
+        }
+        target_receipt.append(row, static_cast<size_t>(length));
+    };
+    record("capture draw=%u host=%u vertex=%u fragment=%u fbo=%d expectedFbo=%u "
+           "expectedProgram=%u trigger=%s operation=%s tid=%d context=%p\n",
+           draw, s_current_program, s_bound_legacy_vertex, s_bound_legacy_fragment,
+           actual_framebuffer, expected_framebuffer, expected_program,
+           operation ? "postdraw" : "historical", operation ? operation : "pixel-history",
+           gettid(), eglGetCurrentContext());
+    for (size_t i = 0; i < target_count; ++i) {
+        const auto& binding = targets[i];
+        const auto& target = kSceneTextureTargets[binding.target];
+        record("target unit=%zu location=%d actualUnit=%zu handle=0x%016llX texture=%u "
+               "target=%d size=%dx%d uploadSHA256=%s\n",
+               binding.unit, binding.location, binding.unit,
+               static_cast<unsigned long long>(binding.handle), binding.texture,
+               binding.target, target.width, target.height, target.sha256);
+    }
     // Query at this draw: once-per-program bindings can describe an earlier
     // pass. This also detects sampling an image attached to the draw FBO.
     GLint framebuffer = 0, color_type = 0, color_object = 0, color_level = -1;
@@ -2118,6 +2257,8 @@ void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
     glGetIntegerv(GL_VIEWPORT, viewport);
     glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
     glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    const GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+    const GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
     LOGI("Scene lighting state draw=%u host=%u name=%s fbo=%d "
          "colorType=0x%X colorObject=%d colorLevel=%d viewport=%d,%d,%d,%d "
          "blend=%d blendRGB=0x%X/0x%X/0x%X blendA=0x%X/0x%X/0x%X "
@@ -2125,10 +2266,18 @@ void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
          draw, s_current_program, fragment->second.name.c_str(), framebuffer,
          color_type, color_object, color_level,
          viewport[0], viewport[1], viewport[2], viewport[3],
-         glIsEnabled(GL_BLEND), src_rgb, dst_rgb, blend_rgb,
+         blend_enabled, src_rgb, dst_rgb, blend_rgb,
          src_alpha, dst_alpha, blend_alpha,
          color_mask[0], color_mask[1], color_mask[2], color_mask[3],
-         glIsEnabled(GL_DEPTH_TEST), depth_func, depth_mask);
+         depth_enabled, depth_func, depth_mask);
+    record("state draw=%u host=%u name=%s fbo=%d colorType=0x%X colorObject=%d "
+           "colorLevel=%d viewport=%d,%d,%d,%d blend=%d blendRGB=0x%X/0x%X/0x%X "
+           "blendA=0x%X/0x%X/0x%X colorMask=%d,%d,%d,%d depth=%d depthFunc=0x%X depthMask=%d\n",
+           draw, s_current_program, fragment->second.name.c_str(), framebuffer,
+           color_type, color_object, color_level, viewport[0], viewport[1], viewport[2], viewport[3],
+           blend_enabled, src_rgb, dst_rgb, blend_rgb, src_alpha, dst_alpha, blend_alpha,
+           color_mask[0], color_mask[1], color_mask[2], color_mask[3],
+           depth_enabled, depth_func, depth_mask);
     for (const auto& [stage, label] :
          {std::pair{&vertex->second, "vertex"}, std::pair{&fragment->second, "fragment"}}) {
         const std::string base = prefix + "-" + label;
@@ -2143,9 +2292,10 @@ void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
                 source.resize(static_cast<size_t>(std::max(written, 0)));
             }
         }
-        write_file(base + ".glsl", source.data(), source.size());
-        write_file(base + ".locals.bin", stage->local_parameters.data(),
-                   stage->local_parameters.size() * sizeof(uint32_t));
+        complete = write_file(base + ".glsl", source.data(), source.size()) && complete;
+        complete = !source.empty() && complete;
+        complete = write_file(base + ".locals.bin", stage->local_parameters.data(),
+                              stage->local_parameters.size() * sizeof(uint32_t)) && complete;
         std::string metadata = "name=" + stage->name + "\n";
         for (size_t group = 0; group < stage->constant_groups.size(); ++group) {
             metadata += "group=" + std::to_string(group) + " first=" +
@@ -2158,7 +2308,7 @@ void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
                 std::to_string(stage->sampler_registers[unit]) + " target=" +
                 std::to_string(stage->sampler_targets[unit]) + "\n";
         }
-        write_file(base + ".metadata.txt", metadata.data(), metadata.size());
+        complete = write_file(base + ".metadata.txt", metadata.data(), metadata.size()) && complete;
         // Query active vector uniforms, independently of the upload cache.
         // Raw words make any float/int register or cache mismatch reviewable.
         constexpr const char* banks[] = {"VConstGlobal", "VConstFloat", "VConstBones",
@@ -2195,7 +2345,7 @@ void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
                 uniforms += row;
             }
         }
-        write_file(base + ".uniforms.tsv", uniforms.data(), uniforms.size());
+        complete = write_file(base + ".uniforms.tsv", uniforms.data(), uniforms.size()) && complete;
         // Compare the driver's booleans with the original NV scalar lanes.
         // Both representations are needed before changing register unpacking.
         const size_t bool_group = stage->target == kVertexProgramArb ? 4 : 8;
@@ -2230,6 +2380,7 @@ void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
         const std::string sampler_name = "PSampler" + std::to_string(unit);
         const GLint sampler_location = glGetUniformLocation(s_current_program, sampler_name.c_str());
         if (sampler_location >= 0) glGetUniformiv(s_current_program, sampler_location, &actual_unit);
+        if (target_mode && (sampler_location < 0 || actual_unit != static_cast<GLint>(unit))) continue;
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
         glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
         if (texture > 0) {
@@ -2257,18 +2408,58 @@ void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
         LOGI("Scene lighting sampler draw=%u host=%u unit=%zu texture=%d size=%dx%d "
              "internal=0x%04X swizzle={0x%04X,0x%04X,0x%04X,0x%04X} uploadSHA256=%s "
              "sampler=%d location=%d actualUnit=%d min=0x%X mag=0x%X base=%d max=%d "
-             "sameDrawImage=%d",
+             "sameDrawImage=%d fbo=%d trigger=%s",
              draw, s_current_program, unit, texture, width, height, format,
              swizzle[0], swizzle[1], swizzle[2], swizzle[3], hash.c_str(),
              sampler, sampler_location, actual_unit, min_filter, mag_filter, base_level, max_level,
-             color_type == GL_TEXTURE && texture > 0 && texture == color_object &&
-                 color_level >= base_level && color_level <= max_level);
-        if (point >= 9 && unit == 0 && format == GL_RGBA8 &&
+              color_type == GL_TEXTURE && texture > 0 && texture == color_object &&
+                  color_level >= base_level && color_level <= max_level,
+              actual_framebuffer, target_mode ? "target" : "historical");
+        record("sampler unit=%zu texture=%d size=%dx%d internal=0x%04X "
+               "swizzle={0x%04X,0x%04X,0x%04X,0x%04X} uploadSHA256=%s sampler=%d "
+               "location=%d actualUnit=%d min=0x%X mag=0x%X base=%d max=%d sameDrawImage=%d\n",
+               unit, texture, width, height, format, swizzle[0], swizzle[1], swizzle[2], swizzle[3],
+               hash.c_str(), sampler, sampler_location, actual_unit, min_filter, mag_filter,
+               base_level, max_level, color_type == GL_TEXTURE && texture > 0 &&
+               texture == color_object && color_level >= base_level && color_level <= max_level);
+        if (!target_mode && point >= 9 && unit == 0 && format == GL_RGBA8 &&
             fragment->second.name == "DirectionalLightPixelShader") {
             SceneAuditCaptureLightingTexture(static_cast<GLuint>(texture), width, height, prefix);
         }
     }
     glActiveTexture(static_cast<GLenum>(previous_active));
+    if (target_mode) {
+        GLint restored_active = 0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &restored_active);
+        complete = restored_active == previous_active && complete;
+        record("result sourceFilesComplete=%d targets=0x%X attempts=%zu tuplesBefore=%zu "
+               "activeBefore=0x%X activeAfter=0x%X\n",
+               complete, pending_targets, captured_draws.size(), captured_targets.size(),
+               previous_active, restored_active);
+        // Persist the binding witness beside the sources: logcat can lose an entire capture.
+        complete = write_file(prefix + ".target.txt", target_receipt.data(),
+                              target_receipt.size()) && complete;
+        if (complete) {
+            for (int target = 0; target < 6; ++target) {
+                if (pending_targets & (1u << target)) captured_targets.insert(
+                    (static_cast<uint64_t>(s_current_program) << 32) | target);
+            }
+        }
+        LOGI("Scene lighting target result draw=%u host=%u fbo=%d status=%s "
+             "targets=0x%X attempts=%zu tuples=%zu prefix=%s",
+             draw, s_current_program, actual_framebuffer, complete ? "complete" : "write-failed",
+             pending_targets, captured_draws.size(), captured_targets.size(), prefix.c_str());
+    }
+}
+
+void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
+    SceneAuditCaptureLightingStateImpl(draw, point, 0, 0, nullptr);
+}
+
+void SceneAuditCaptureTargetLightingState(GLuint framebuffer, uint32_t draw,
+                                         GLuint expected_program, const char* operation) {
+    if (!SceneTextureHashEnabled()) return;
+    SceneAuditCaptureLightingStateImpl(draw, 0, framebuffer, expected_program, operation);
 }
 
 static void SceneAuditLogFinalQuadVertices(const char* operation,
