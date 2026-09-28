@@ -954,7 +954,7 @@ static void RecordSceneTextureUpload(GLenum target, GLint level,
                                      GLenum format, const void* data,
                                      size_t bytes) {
     if (!SceneTextureHashEnabled() || target != GL_TEXTURE_2D || level != 0 ||
-        width < 128 || height < 128 || !data || bytes == 0) return;
+        width <= 0 || height <= 0 || !data || bytes == 0) return;
     GLint texture = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
     if (texture <= 0) return;
