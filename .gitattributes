@@ -180,3 +180,7 @@
 /work/evidence/device-f4668e7b-seed295-setup/** -text
 /work/evidence/device-jrjz95hut455yxq4-seed295-setup/** -text
 /work/evidence/device-pixel-seed292-preflight/restore-after-295-ordinary-resume.json -text
+/work/build/seed299-build.json -text
+/work/build/cache-patch-astc4-code1-noverity-build.json -text
+/work/evidence/hidden-code1-phase7-20260929/** -text
+/work/evidence/hidden-code1-f299-*/** -text

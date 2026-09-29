@@ -17,7 +17,8 @@ struct Bl2DirectorySnapshot {
     std::vector<Bl2DirectoryEntry> entries;
 };
 
-// Opt-in via debug.bl2.dir_cache=1; value 2 observes the native baseline only.
+// Production caches allowed asset directories; 0/unset/1 use that default.
+// debug.bl2.dir_cache=2 observes the uncached native baseline instead.
 // A hit is checked against a fresh stat(path).
 // Literal "." is resolved against a fresh cwd, then the same allowlist applies.
 // Null means use the existing native opendir/readdir/closedir implementation.

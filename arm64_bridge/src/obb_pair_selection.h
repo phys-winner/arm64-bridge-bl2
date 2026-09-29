@@ -40,7 +40,7 @@ constexpr uint64_t kPatchObbSize = 2647408640ULL;
 constexpr std::string_view kMainObbSha256 =
     "0A7C277D91B59006A5D38148953DD1203DD0BAEE4533AB5395889EA5F49F7883";
 constexpr std::string_view kPatchObbSha256 =
-    "815D96D323A71C50CCC87C3B89147E19205C17E55EA0D4D7A8D9568C8C854C77";
+    "5AF9364A4DF8C38D2CAD281EAB57E3A5B875AD1A3C77597322ECFC2303B81FB8";
 
 constexpr bool IsExpectedObb(const ObbCandidate& candidate, bool main) {
     return candidate.direct_readable &&

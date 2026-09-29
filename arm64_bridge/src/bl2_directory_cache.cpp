@@ -57,9 +57,8 @@ uint64_t g_untracked_path_opens = 0;
 int Mode() {
     static const int mode = [] {
         char value[PROP_VALUE_MAX]{};
-        if (__system_property_get("debug.bl2.dir_cache", value) <= 0) return 0;
-        if (std::strcmp(value, "1") == 0) return 1;
-        return std::strcmp(value, "2") == 0 ? 2 : 0;
+        __system_property_get("debug.bl2.dir_cache", value);
+        return std::strcmp(value, "2") == 0 ? 2 : 1;
     }();
     return mode;
 }
