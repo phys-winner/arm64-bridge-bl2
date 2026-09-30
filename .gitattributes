@@ -184,3 +184,19 @@
 /work/build/cache-patch-astc4-code1-noverity-build.json -text
 /work/evidence/hidden-code1-phase7-20260929/** -text
 /work/evidence/hidden-code1-f299-*/** -text
+
+# Exact302 optimization source, tests and scoped runtime receipts.
+/arm64_bridge/CMakeLists.txt -text
+/arm64_bridge/patches/dynarmic-arm64-fastmem-fpsr.patch -text
+/arm64_bridge/tests/fastmem_fpsr_test.cpp -text
+/arm64_bridge/tests/fastmem_fpsr_matrix.bin -text
+/work/scripts/build_bridge_apk.ps1 -text
+/work/scripts/measure_game_frames.py -text
+/work/scripts/native_clock.c -text
+/work/build/seed300-build.json -text
+/work/build/seed302-build.json -text
+/work/evidence/bridge-optimization-20260930/** -text
+/work/evidence/pixel302-*/** -text
+/work/evidence/device-pixel-seed300-setup*/** -text
+/work/evidence/device-pixel-seed302-setup*/** -text
+/work/evidence/pixel299-checks-20260930/** -text

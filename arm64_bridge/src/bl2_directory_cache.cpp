@@ -1,6 +1,6 @@
 #include "bl2_directory_cache.h"
 
-#include <android/log.h>
+#include "bridge_log.h"
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
@@ -108,7 +108,7 @@ void Erase(std::unordered_map<std::string, CachedDirectory>::iterator it) {
 
 void LogFallback(const char* path, const char* reason, int error) {
     if (++g_fallbacks <= 16) {
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "DIR_CACHE fallback path='%s' reason=%s errno=%d count=%llu",
             path, reason, error, static_cast<unsigned long long>(g_fallbacks));
     }
@@ -152,7 +152,7 @@ std::shared_ptr<const Bl2DirectorySnapshot> Bl2GetDirectorySnapshot(const char* 
             diagnostic->last_cwd = current_cwd;
             ++diagnostic->cwd_changes;
             if (diagnostic->cwd_changes <= 8) {
-                __android_log_print(ANDROID_LOG_INFO, kTag,
+                HORN_LOGI(kTag,
                     "DIR_CACHE cwd_change path='%s' cwd='%s' changes=%llu opens=%llu",
                     path, current_cwd.c_str(),
                     static_cast<unsigned long long>(diagnostic->cwd_changes),
@@ -167,7 +167,7 @@ std::shared_ptr<const Bl2DirectorySnapshot> Bl2GetDirectorySnapshot(const char* 
             else first_cwd = "unavailable_errno_" + std::to_string(errno);
         }
         g_paths.push_back(DiagnosticPath{request, first_cwd, first_cwd, 1, 0});
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "DIR_CACHE path='%s' first_cwd='%s' eligible=%d mode=%d opens=%llu",
             path, g_paths.back().first_cwd.c_str(), eligible ? 1 : 0, mode,
             static_cast<unsigned long long>(g_open_requests));
@@ -194,7 +194,7 @@ std::shared_ptr<const Bl2DirectorySnapshot> Bl2GetDirectorySnapshot(const char* 
             found->second.last_use = ++g_serial;
             ++g_hits;
             if ((g_hits & (g_hits - 1)) == 0) {
-                __android_log_print(ANDROID_LOG_INFO, kTag,
+                HORN_LOGI(kTag,
                     "DIR_CACHE hit opens=%llu eligible=%llu hits=%llu builds=%llu invalidations=%llu directories=%zu bytes=%zu",
                     static_cast<unsigned long long>(g_open_requests),
                     static_cast<unsigned long long>(g_eligible_requests),
@@ -270,7 +270,7 @@ std::shared_ptr<const Bl2DirectorySnapshot> Bl2GetDirectorySnapshot(const char* 
     g_directories.emplace(key, CachedDirectory{before, snapshot, ++g_serial, bytes});
     ++g_builds;
     if (g_builds <= 32) {
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "DIR_CACHE build path='%s' entries=%zu builds=%llu directories=%zu bytes=%zu",
             resolved_path, snapshot->entries.size(), static_cast<unsigned long long>(g_builds),
             g_directories.size(), g_cache_bytes);
@@ -293,7 +293,7 @@ void Bl2DirectoryCacheReportStartup() {
     const int saved_errno = errno;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "DIR_CACHE startup mode=%d opens=%llu eligible=%llu hits=%llu builds=%llu "
             "invalidations=%llu fallbacks=%llu native_reads=%llu snapshot_reads=%llu "
             "closes=%llu directories=%zu bytes=%zu tracked_paths=%zu untracked_opens=%llu",
@@ -311,7 +311,7 @@ void Bl2DirectoryCacheReportStartup() {
         std::sort(order.begin(), order.begin() + g_paths.size(),
             [](const auto* a, const auto* b) { return a->opens > b->opens; });
         for (size_t i = 0; i < g_paths.size(); ++i) {
-            __android_log_print(ANDROID_LOG_INFO, kTag,
+            HORN_LOGI(kTag,
                 "DIR_CACHE hotpath rank=%zu path='%s' first_cwd='%s' last_cwd='%s' opens=%llu cwd_changes=%llu",
                 i + 1, order[i]->path.c_str(), order[i]->first_cwd.c_str(),
                 order[i]->last_cwd.c_str(), static_cast<unsigned long long>(order[i]->opens),
@@ -319,9 +319,9 @@ void Bl2DirectoryCacheReportStartup() {
         }
         char cwd[4096]{};
         if (::getcwd(cwd, sizeof(cwd))) {
-            __android_log_print(ANDROID_LOG_INFO, kTag, "DIR_CACHE cwd_final path='%s'", cwd);
+            HORN_LOGI(kTag, "DIR_CACHE cwd_final path='%s'", cwd);
         } else {
-            __android_log_print(ANDROID_LOG_INFO, kTag, "DIR_CACHE cwd_final errno=%d", errno);
+            HORN_LOGI(kTag, "DIR_CACHE cwd_final errno=%d", errno);
         }
     }
     errno = saved_errno;

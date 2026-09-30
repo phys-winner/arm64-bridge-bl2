@@ -3855,6 +3855,7 @@ void ThunkManager::RegisterLibcThunks() {
         jit.Regs()[0] = 0;
     });
     RegisterThunk("__android_log_assert", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+#if HORN_ENABLE_LOGGING
         const char* condition = GuestCString(host.GetGuestMemoryBase(),
                                              host.GetGuestMemorySize(), jit.Regs()[0]);
         const char* tag = GuestCString(host.GetGuestMemoryBase(),
@@ -3870,6 +3871,12 @@ void ThunkManager::RegisterLibcThunks() {
         const std::string message = FormatGuestString(jit, host, format, 3);
         __android_log_assert(condition, tag ? tag : "Borderlands2", "%s",
                              message.c_str());
+#else
+        // Assertions remain fatal when log output is compiled out.
+        (void)jit;
+        (void)host;
+        std::abort();
+#endif
     });
 
     RegisterThunk("printf", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {

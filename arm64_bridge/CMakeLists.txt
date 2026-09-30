@@ -61,6 +61,23 @@ else()
 endif()
 FetchContent_MakeAvailable(dynarmic)
 
+# FETCHCONTENT_SOURCE_DIR skips PATCH_COMMAND for the pinned offline checkout.
+# Apply the measured memory fix there too; a different tree must match its patch.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-fastmem-fpsr.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE fpsr_patch_result)
+if(NOT fpsr_patch_result EQUAL 0)
+    message(FATAL_ERROR "Fastmem FPSR patch is incompatible with the selected Dynarmic")
+endif()
+
+# Reuse the Warband fastmem/FPSCR regression against this project's Dynarmic.
+add_executable(bl2_fastmem_fpsr_test EXCLUDE_FROM_ALL tests/fastmem_fpsr_test.cpp)
+target_link_libraries(bl2_fastmem_fpsr_test PRIVATE dynarmic)
+target_link_options(bl2_fastmem_fpsr_test PRIVATE "-Wl,-z,max-page-size=16384")
+
 set(BRIDGE_SOURCES
     src/elf_loader.cpp
     src/dynarmic_host.cpp

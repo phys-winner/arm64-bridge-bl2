@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)][ValidateRange(1,99999)][int]$Seed,
     [ValidateRange(0,99999)][int]$PreviousSeed = 0,
-    [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$NativeBuildDir = 'bridge-seed2'
+    [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$NativeBuildDir = 'bridge-seed2',
+    [switch]$Diagnostics
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -21,7 +22,11 @@ try {
     if (Test-Path -LiteralPath (Join-Path $root 'android_port\src\com\tt2kgames\Borderlands2\LaunchControls.java')) {
         & (Join-Path $PSScriptRoot 'build_launch_controls.ps1')
     }
-    & 'C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\cmake.exe' --build $nativeBuild --config Release --parallel
+    $cmake = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\cmake.exe'
+    $diagnosticFlag = if ($Diagnostics) { 'ON' } else { 'OFF' }
+    & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag"
+    if ($LASTEXITCODE) { throw 'Native configuration failed' }
+    & $cmake --build $nativeBuild --config Release --parallel
     if ($LASTEXITCODE) { throw 'Native build failed' }
     Copy-Item -LiteralPath (Join-Path $nativeBuild 'libUnrealEngine3.so') -Destination (Join-Path $root 'app\lib\arm64-v8a\libUnrealEngine3.so') -Force
     $nativePath = Join-Path $root 'app\lib\arm64-v8a\libUnrealEngine3.so'
@@ -30,7 +35,9 @@ try {
         !$nativeText.Contains('debug.horn.play_movies')) {
         throw 'Arm64 bridge movie-skip option is missing from the native payload'
     }
-    if (!$nativeText.Contains('bl2-native-surface-v1') -or
+    # The policy label is log-only and is removed from a silent build.
+    # These properties are used by the actual resolution policy.
+    if (!$nativeText.Contains('debug.bl2.render_scale') -or
         !$nativeText.Contains('debug.bl2.legacy_resolution')) {
         throw 'Verified native 100% resolution policy is missing from the bridge'
     }
@@ -68,6 +75,13 @@ try {
             if (!$entry -or $entry.Length -ne $entry.CompressedLength) { throw "STORED payload gate failed: $name" }
         }
     } finally { $zip.Dispose() }
+    if (!$Diagnostics) {
+        $llvmBin = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin'
+        $dynamic = & "$llvmBin\llvm-readelf.exe" -d $nativePath
+        if ($LASTEXITCODE -or ($dynamic -match 'liblog\.so')) { throw 'Silent bridge retains a liblog dependency' }
+        $imports = & "$llvmBin\llvm-nm.exe" -D --undefined-only $nativePath
+        if ($LASTEXITCODE -or ($imports -match '__android_log_')) { throw 'Silent bridge retains an Android log import' }
+    }
     if ($PreviousSeed -gt 0 -and $PreviousSeed -ne $Seed) {
         $previous = Join-Path $build "bl2-arm64-bridge-seed$PreviousSeed.apk"
         if (Test-Path -LiteralPath $previous) {
@@ -84,6 +98,9 @@ try {
     }
 }
 $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;bytes=(Get-Item -LiteralPath $signed).Length;
+    bridge_logging=[bool]$Diagnostics.IsPresent;perf_probe_compiled=[bool]$Diagnostics.IsPresent;
+    cmake_source_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'arm64_bridge\CMakeLists.txt')).Hash;
+    fastmem_fpsr_patch_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'arm64_bridge\patches\dynarmic-arm64-fastmem-fpsr.patch')).Hash;
     sha256=(Get-FileHash -LiteralPath $signed).Hash;
     bridge_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'app\lib\arm64-v8a\libUnrealEngine3.so')).Hash;
     guest_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'app\assets\guest_libs\libUnrealEngine3.so')).Hash;

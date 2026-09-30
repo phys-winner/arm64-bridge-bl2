@@ -2,7 +2,7 @@
 
 #include <dynarmic/interface/A32/a32.h>
 
-#include <android/log.h>
+#include "bridge_log.h"
 #include <sys/prctl.h>
 #include <sys/system_properties.h>
 #include <time.h>
@@ -162,7 +162,7 @@ void LogActivity(uint64_t wall) {
         const uint64_t call = slot.call.load(std::memory_order_relaxed);
         if (before != slot.sequence.load(std::memory_order_acquire)) continue;
         const uint32_t id = static_cast<uint32_t>(id_lr >> 32);
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "STARTUP_ACTIVE tid=%u elapsed_ms=%.3f id=%u name=%s lr=0x%08X "
             "call=%llu observed_by=%d registry_overflow=%zu",
             tid, Ms(Since(wall, g_start_ns.load(std::memory_order_relaxed))),
@@ -182,7 +182,7 @@ void Flush(ThreadProfile& state, uint64_t wall, uint64_t cpu,
         ? wall_delta - state.selected_wall : 0;
     const uint64_t residual_cpu = cpu_delta > state.selected_cpu
         ? cpu_delta - state.selected_cpu : 0;
-    __android_log_print(ANDROID_LOG_INFO, kTag,
+    HORN_LOGI(kTag,
         "STARTUP_WINDOW tid=%d seq=%u reason=%s elapsed_ms=%.3f "
         "wall_ms=%.3f cpu_ms=%.3f selected_wall_ms=%.3f selected_cpu_ms=%.3f "
         "residual_wall_ms=%.3f residual_cpu_ms=%.3f calls=%llu dropped=%llu",
@@ -204,7 +204,7 @@ void Flush(ThreadProfile& state, uint64_t wall, uint64_t cpu,
     for (size_t i = 0; i < std::min(count, kLoggedRows); ++i) {
         const Row& row = *order[i];
         logged_wall += row.wall_ns;
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "STARTUP_THUNK tid=%d seq=%u id=%u name=%s lr=0x%08X "
             "calls=%llu wall_ms=%.3f cpu_ms=%.3f max_ms=%.3f "
             "a0_min=%u a0_max=%u a0_sum=%llu a0_zero=%llu "
@@ -216,7 +216,7 @@ void Flush(ThreadProfile& state, uint64_t wall, uint64_t cpu,
             static_cast<unsigned long long>(row.arg0_zero), row.arg2_last,
             row.result_last);
     }
-    __android_log_print(ANDROID_LOG_INFO, kTag,
+    HORN_LOGI(kTag,
         "STARTUP_COVERAGE tid=%d seq=%u rows=%zu logged=%zu "
         "logged_wall_ms=%.3f selected_wall_ms=%.3f",
         gettid(), state.sequence, count, std::min(count, kLoggedRows),
@@ -271,7 +271,7 @@ Bl2StartupThunkScope::Bl2StartupThunkScope(uint32_t id, const char* name,
     uint64_t start = g_start_ns.load(std::memory_order_relaxed);
     if (!start && g_start_ns.compare_exchange_strong(start, now)) {
         start = now;
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "STARTUP_PROFILE enabled=1 limit_s=300 interval_s=5 "
             "stop=first_swap_call timing=selected_thunks_only");
     }
@@ -287,7 +287,7 @@ Bl2StartupThunkScope::Bl2StartupThunkScope(uint32_t id, const char* name,
     if (!state.window_wall) {
         state.window_wall = now;
         state.window_cpu = cpu;
-        __android_log_print(ANDROID_LOG_INFO, kTag,
+        HORN_LOGI(kTag,
             "STARTUP_THREAD tid=%d timer_slack_ns=%d first_id=%u first_name=%s",
             gettid(), ::prctl(PR_GET_TIMERSLACK), id, name);
     }
