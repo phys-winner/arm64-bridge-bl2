@@ -12,7 +12,7 @@
 // Helper to convert 32-bit guest pointer to 64-bit host pointer
 inline void* GuestToHost(uint8_t* base, uint32_t gaddr) {
     if (gaddr == 0) return nullptr;
-    return reinterpret_cast<void*>(base + gaddr);
+    return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(base) + gaddr);
 }
 
 // Helper to convert 64-bit host pointer into 32-bit guest address (if within guest arena)
@@ -21,21 +21,36 @@ inline uint32_t HostToGuest(uint8_t* base, void* hptr) {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hptr) - reinterpret_cast<uintptr_t>(base));
 }
 
+// True when a guest data range starts in the guarded bottom pages (exit traps,
+// SVC trampolines). Native Android maps nothing there: only a NULL-based
+// pointer can name it, so thunks treat it like the kernel does (EFAULT).
+inline bool GuestLowGuardHit(uint32_t gaddr, size_t size) {
+#if defined(BL2_NATIVE_ARM32)
+    (void)gaddr;
+    (void)size;
+    return false;
+#else
+    return size != 0 && gaddr < DynarmicHost::kLowGuardEnd;
+#endif
+}
+
 inline bool GuestRangeValid(size_t arena_size, uint32_t gaddr, size_t size) {
+    if (GuestLowGuardHit(gaddr, size)) return false;
     return gaddr != 0 ? (gaddr <= arena_size && size <= arena_size - gaddr)
                       : size == 0;
 }
 
 inline void* GuestSpan(uint8_t* base, size_t arena_size, uint32_t gaddr,
                        size_t size) {
-    return GuestRangeValid(arena_size, gaddr, size) ? base + gaddr : nullptr;
+    return GuestRangeValid(arena_size, gaddr, size)
+        ? reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(base) + gaddr) : nullptr;
 }
 
 inline const char* GuestCString(uint8_t* base, size_t arena_size,
                                 uint32_t gaddr) {
     constexpr size_t kMaxGuestCString = 1024 * 1024;
     if (!GuestRangeValid(arena_size, gaddr, 1)) return nullptr;
-    const char* value = reinterpret_cast<const char*>(base + gaddr);
+    const char* value = reinterpret_cast<const char*>(reinterpret_cast<uintptr_t>(base) + gaddr);
     const size_t limit = std::min(arena_size - gaddr, kMaxGuestCString);
     return std::memchr(value, 0, limit) ? value : nullptr;
 }

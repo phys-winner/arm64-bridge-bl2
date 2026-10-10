@@ -97,7 +97,7 @@ static void testFrameCapacityRetainsTail() {
         expected.push_back(action);
     }
     const auto first = h.drain();
-    CHECK(first.actionEdgeCount == first.actionEdges.size());
+    CHECK(first.actionEdges.size() >= 25 && first.actionEdgeCount == 25);
     CHECK(first.heldActions == actionBit(Action::Confirm)); // Edge 25 is DOWN.
     CHECK(h.commands.size() == 12);
     CHECK(!h.mailbox.consumeFrame(h.tick, 100).fresh);

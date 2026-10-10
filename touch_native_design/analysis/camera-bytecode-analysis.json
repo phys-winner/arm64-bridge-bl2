@@ -1,0 +1,62 @@
+[
+  {
+    "package": "Engine.xxx",
+    "path": "PlayerController.UpdateRotation",
+    "export": 4830,
+    "offset": 3383467,
+    "bytes": 303,
+    "package_sha256": "B72D2445023CE3FEBB51C480C5A02987A957876AC73AD0ADB457723D007EAEAD",
+    "status": "PASS",
+    "script_offset": 3383501,
+    "stored_bytes": 263,
+    "vm_bytes": 411
+  },
+  {
+    "package": "Engine.xxx",
+    "path": "PlayerController.ProcessViewRotation",
+    "export": 4834,
+    "offset": 3383862,
+    "bytes": 188,
+    "package_sha256": "B72D2445023CE3FEBB51C480C5A02987A957876AC73AD0ADB457723D007EAEAD",
+    "status": "PASS",
+    "script_offset": 3383896,
+    "stored_bytes": 148,
+    "vm_bytes": 212
+  },
+  {
+    "package": "Engine.xxx",
+    "path": "PlayerInput.PlayerInput",
+    "export": 11777,
+    "offset": 3840408,
+    "bytes": 473,
+    "package_sha256": "B72D2445023CE3FEBB51C480C5A02987A957876AC73AD0ADB457723D007EAEAD",
+    "status": "PASS",
+    "script_offset": 3840446,
+    "stored_bytes": 429,
+    "vm_bytes": 637
+  },
+  {
+    "package": "WillowGame.xxx",
+    "path": "WillowPlayerController.ProcessViewRotation",
+    "export": 9892,
+    "offset": 5972158,
+    "bytes": 603,
+    "package_sha256": "0288525A8CABF532279CBC632112B89F84C209C00D37B1A5AC7D6F5B5DEEB5A4",
+    "status": "PASS",
+    "script_offset": 5972192,
+    "stored_bytes": 563,
+    "vm_bytes": 871
+  },
+  {
+    "package": "WillowGame.xxx",
+    "path": "WillowPlayerInput.PlayerInput",
+    "export": 42764,
+    "offset": 8663343,
+    "bytes": 804,
+    "package_sha256": "0288525A8CABF532279CBC632112B89F84C209C00D37B1A5AC7D6F5B5DEEB5A4",
+    "status": "PASS",
+    "script_offset": 8663385,
+    "stored_bytes": 756,
+    "vm_bytes": 1080
+  }
+]

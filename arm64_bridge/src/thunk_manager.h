@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -39,6 +41,13 @@ public:
         return m_symbol_to_address;
     }
 
+    // ARM64 SVC trampolines: [TrampolineBase, TrampolineEnd) in steps of
+    // kTrampolineStride, thunk id 1 first. The end only grows, published
+    // after the slot's words are written, so any thread may read it.
+    static constexpr uint32_t TrampolineBase() { return kThunkBase; }
+    static constexpr uint32_t TrampolineStride() { return kThunkStride; }
+    uint32_t TrampolineEnd() const { return m_next_thunk_addr.load(std::memory_order_acquire); }
+
     static uint32_t s_screenWidth;
     static uint32_t s_screenHeight;
     // Virtual screen size reported to the guest for UI scaling; 0 = report the real one.
@@ -53,12 +62,17 @@ private:
     DynarmicHost& m_host;
     static constexpr uint32_t kThunkBase = 0x00010000;
     static constexpr uint32_t kThunkStride = 8;
-    uint32_t m_next_thunk_addr = kThunkBase;
+    std::atomic<uint32_t> m_next_thunk_addr{kThunkBase};
     std::unordered_map<std::string, uint32_t> m_symbol_to_address;
     // IDs are dense and start at one. A vector avoids two unordered-map
     // probes on every imported function call; index zero is the sentinel.
     std::vector<ThunkHandler> m_id_to_handler;
     std::vector<std::string> m_id_to_name;
+    std::vector<uint8_t> m_id_writes_observed;
+    // Opt-in, bounded first-seen diagnostics; no per-call string lookup/map.
+    bool m_write_watch_diagnostics = false;
+    std::array<std::atomic<uint8_t>, 2048> m_unknown_first_seen{};
+    std::atomic<uint32_t> m_unknown_seen_logs{0};
     bool m_registration_failed = false;
 };
 

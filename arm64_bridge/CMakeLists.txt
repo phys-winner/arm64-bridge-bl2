@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(HORN_ENABLE_PERF_PROBE "Compile on-device performance diagnostics" OFF)
 option(HORN_ENABLE_LOGGING "Compile bridge and forwarded guest logcat output" OFF)
+option(HORN_ENABLE_PHYSX_COOKIE_WATCH "Compile optional default-off BL2 PhysX first-write diagnostic" OFF)
+option(HORN_GL_SELF_CHECK "Compile bounded real GLES guest-thunk regression" OFF)
+option(BL2_ENABLE_DEBUG_MENU_DEFAULT "Show Pause Debug by default in development builds" OFF)
 
 include(FetchContent)
 
@@ -62,6 +65,16 @@ endif()
 FetchContent_MakeAvailable(dynarmic)
 
 # FETCHCONTENT_SOURCE_DIR skips PATCH_COMMAND for the pinned offline checkout.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-fast-dispatch.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE dispatch_patch_result)
+if(NOT dispatch_patch_result EQUAL 0)
+    message(FATAL_ERROR "Fast dispatch patch is incompatible with the selected Dynarmic")
+endif()
+
 # Apply the measured memory fix there too; a different tree must match its patch.
 execute_process(
     COMMAND "${CMAKE_COMMAND}"
@@ -73,15 +86,134 @@ if(NOT fpsr_patch_result EQUAL 0)
     message(FATAL_ERROR "Fastmem FPSR patch is incompatible with the selected Dynarmic")
 endif()
 
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-vmov-select.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE vmov_patch_result)
+if(NOT vmov_patch_result EQUAL 0)
+    message(FATAL_ERROR "Conditional VMOV patch is incompatible with the selected Dynarmic")
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-fpcr-cluster.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE fpcr_patch_result)
+if(NOT fpcr_patch_result EQUAL 0)
+    message(FATAL_ERROR "Vector FPCR patch is incompatible with the selected Dynarmic")
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-vldr-literal.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE literal_patch_result)
+if(NOT literal_patch_result EQUAL 0)
+    message(FATAL_ERROR "VLDR literal patch is incompatible with the selected Dynarmic")
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-jit-compile-probe.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE compile_probe_patch_result)
+if(NOT compile_probe_patch_result EQUAL 0)
+    message(FATAL_ERROR "JIT compile probe patch is incompatible with the selected Dynarmic")
+endif()
+if(HORN_ENABLE_PERF_PROBE)
+    target_compile_definitions(dynarmic PRIVATE HORN_ENABLE_JIT_COMPILE_PROBE=1)
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-precompile-api.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE precompile_patch_result)
+if(NOT precompile_patch_result EQUAL 0)
+    message(FATAL_ERROR "Precompile API patch is incompatible with the selected Dynarmic")
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-a32-write-watch.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE write_watch_patch_result)
+if(NOT write_watch_patch_result EQUAL 0)
+    message(FATAL_ERROR "A32 write-watch patch is incompatible with the selected Dynarmic")
+endif()
+
+# Emitted-block observer and callback-time precompile for the learned warmup.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-learned-warmup.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE learned_warmup_patch_result)
+if(NOT learned_warmup_patch_result EQUAL 0)
+    message(FATAL_ERROR "Learned warmup patch is incompatible with the selected Dynarmic")
+endif()
+
+# An unattached coprocessor (a guest jump into data decodes LDC/STC) raises the
+# guest undefined-instruction exception instead of aborting while compiling.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-coprocessor-undefined.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE coprocessor_patch_result)
+if(NOT coprocessor_patch_result EQUAL 0)
+    message(FATAL_ERROR "Coprocessor undefined patch is incompatible with the selected Dynarmic")
+endif()
+
 # Reuse the Warband fastmem/FPSCR regression against this project's Dynarmic.
 add_executable(bl2_fastmem_fpsr_test EXCLUDE_FROM_ALL tests/fastmem_fpsr_test.cpp)
 target_link_libraries(bl2_fastmem_fpsr_test PRIVATE dynarmic)
 target_link_options(bl2_fastmem_fpsr_test PRIVATE "-Wl,-z,max-page-size=16384")
 
+add_executable(bl2_shader_warmup_test EXCLUDE_FROM_ALL tests/bl2_shader_warmup_test.cpp)
+target_include_directories(bl2_shader_warmup_test PRIVATE src)
+target_link_options(bl2_shader_warmup_test PRIVATE "-Wl,-z,max-page-size=16384")
+
+add_executable(bl2_conditional_vmov_test EXCLUDE_FROM_ALL tests/conditional_vmov_selfcheck.cpp)
+target_link_libraries(bl2_conditional_vmov_test PRIVATE dynarmic)
+target_link_options(bl2_conditional_vmov_test PRIVATE "-Wl,-z,max-page-size=16384")
+
+add_executable(bl2_precompile_api_test EXCLUDE_FROM_ALL tests/precompile_api_selfcheck.cpp)
+target_link_libraries(bl2_precompile_api_test PRIVATE dynarmic fmt::fmt mcl)
+target_link_options(bl2_precompile_api_test PRIVATE "-Wl,-z,max-page-size=16384"
+                    "-Wl,--wrap=__system_property_get")
+
+add_executable(bl2_jit_warmup_test EXCLUDE_FROM_ALL tests/bl2_jit_warmup_test.cpp)
+target_include_directories(bl2_jit_warmup_test PRIVATE src)
+target_link_options(bl2_jit_warmup_test PRIVATE "-Wl,-z,max-page-size=16384")
+
+add_executable(bl2_fpcr_literal_test EXCLUDE_FROM_ALL tests/fpcr_literal_selfcheck.cpp)
+target_link_libraries(bl2_fpcr_literal_test PRIVATE dynarmic fmt::fmt mcl)
+target_link_options(bl2_fpcr_literal_test PRIVATE "-Wl,-z,max-page-size=16384"
+                    "-Wl,--wrap=__system_property_get")
+
+add_executable(bl2_software_write_watch_test EXCLUDE_FROM_ALL tests/software_write_watch_selfcheck.cpp)
+target_link_libraries(bl2_software_write_watch_test PRIVATE dynarmic fmt::fmt mcl)
+target_link_options(bl2_software_write_watch_test PRIVATE "-Wl,-z,max-page-size=16384"
+                    "-Wl,--wrap=__system_property_get")
+
+add_executable(bl2_gl_storage_control EXCLUDE_FROM_ALL tests/gl_storage_control.cpp)
+target_link_libraries(bl2_gl_storage_control PRIVATE EGL GLESv3)
+target_link_options(bl2_gl_storage_control PRIVATE "-Wl,-z,max-page-size=16384")
+
 set(BRIDGE_SOURCES
     src/elf_loader.cpp
     src/dynarmic_host.cpp
+    src/engine_hooks.cpp
     src/guest_mapped_dirty_tracker.cpp
+    src/guest_software_write_watch.cpp
     src/obb_split_inventory.cpp
     src/horn_fastpaths.cpp
     src/thunk_manager.cpp
@@ -96,8 +228,17 @@ set(BRIDGE_SOURCES
     src/bl2_touch_physical.cpp
     src/bl2_touch_ui_sink.cpp
     src/bl2_touch_ui_transactions.cpp
+    src/bl2_touch_inventory_gesture.cpp
+    src/bl2_touch_text_chat.cpp
     src/bl2_touch_ui_model.cpp
     src/bl2_touch_ui_model_probe.cpp
+    src/bl2_touch_gfx_values.cpp
+    src/bl2_touch_gfx_transport.cpp
+    src/bl2_touch_widget_registry.cpp
+    src/bl2_touch_widget_gestures.cpp
+    src/bl2_touch_widget_commands.cpp
+    src/bl2_touch_widget_router.cpp
+    src/bl2_touch_widget_sink.cpp
     src/thunks_gl.cpp
     src/thunks_gl_gles2_core.cpp
     src/thunks_android.cpp
@@ -107,9 +248,20 @@ set(BRIDGE_SOURCES
     src/jni_fake_env.cpp
     src/jni_bridge.cpp
     src/bl2_native_resolution.cpp
+    src/bl2_graphics_settings.cpp
+    src/bl2_fresh_buffer_names.cpp
     src/bl2_pause_debug_menu.cpp
     src/bl2_vertex_element_fastpath.cpp
     src/bl2_convex_fastpath.cpp
+    src/bl2_limiter_peak_fastpath.cpp
+    src/bl2_program_locals_fastpath.cpp
+    src/bl2_performance_settings.cpp
+    src/bl2_audio_decode_fastpath.cpp
+    src/bl2_perf_hint.cpp
+    src/bl2_program_upgrade.cpp
+    src/bl2_jit_learning.cpp
+    src/bl2_hitch_report.cpp
+    src/bl2_guest_integrity.cpp
 )
 
 if(HORN_ENABLE_PERF_PROBE)
@@ -117,6 +269,15 @@ if(HORN_ENABLE_PERF_PROBE)
 endif()
 
 add_library(${BRIDGE_TARGET} SHARED ${BRIDGE_SOURCES})
+if(HORN_GL_SELF_CHECK)
+    target_compile_definitions(${BRIDGE_TARGET} PRIVATE HORN_GL_SELF_CHECK=1)
+    add_executable(bl2_gl_parity_selfcheck EXCLUDE_FROM_ALL tests/gl_parity_selfcheck.cpp)
+    target_link_libraries(bl2_gl_parity_selfcheck PRIVATE ${BRIDGE_TARGET})
+    target_link_options(bl2_gl_parity_selfcheck PRIVATE "-Wl,-z,max-page-size=16384")
+    add_executable(bl2_fresh_buffer_names_selfcheck EXCLUDE_FROM_ALL tests/bl2_fresh_buffer_names_selfcheck.cpp)
+    target_link_libraries(bl2_fresh_buffer_names_selfcheck PRIVATE ${BRIDGE_TARGET} EGL)
+    target_link_options(bl2_fresh_buffer_names_selfcheck PRIVATE "-Wl,-z,max-page-size=16384")
+endif()
 file(STRINGS "${dynarmic_SOURCE_DIR}/src/dynarmic/interface/A32/config.h"
      HORN_DYNARMIC_INTERPRETER_FALLBACK_DECL
      REGEX "virtual void InterpreterFallback")
@@ -128,12 +289,20 @@ add_subdirectory(
     "${CMAKE_CURRENT_SOURCE_DIR}/../touch_native_design/arm64_bridge"
     "${CMAKE_CURRENT_BINARY_DIR}/bl2_touch")
 target_link_libraries(${BRIDGE_TARGET} PRIVATE bl2_touch_sources)
+target_compile_definitions(${BRIDGE_TARGET} PRIVATE
+    BL2_ENABLE_DEBUG_MENU_DEFAULT=$<BOOL:${BL2_ENABLE_DEBUG_MENU_DEFAULT}>)
+target_compile_definitions(bl2_touch_sources PRIVATE
+    BL2_ENABLE_DEBUG_MENU_DEFAULT=$<BOOL:${BL2_ENABLE_DEBUG_MENU_DEFAULT}>)
+
+if(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    target_compile_definitions(${BRIDGE_TARGET} PRIVATE HORN_ENABLE_PHYSX_COOKIE_WATCH=1)
+endif()
 
 if(HORN_ENABLE_PERF_PROBE)
     target_compile_definitions(${BRIDGE_TARGET} PRIVATE HORN_ENABLE_PERF_PROBE=1)
 endif()
 
-if(HORN_ENABLE_LOGGING)
+if(HORN_ENABLE_LOGGING OR HORN_ENABLE_PHYSX_COOKIE_WATCH)
     target_compile_definitions(${BRIDGE_TARGET} PRIVATE HORN_ENABLE_LOGGING=1)
 endif()
 
@@ -149,13 +318,10 @@ target_link_libraries(${BRIDGE_TARGET} PRIVATE
     EGL
     OpenSLES
     android
+    log  # Bounded backend/cache/display witnesses also survive quiet builds.
     m
     z
 )
-
-if(HORN_ENABLE_LOGGING OR HORN_ENABLE_PERF_PROBE)
-    target_link_libraries(${BRIDGE_TARGET} PRIVATE log)
-endif()
 
 target_compile_definitions(${BRIDGE_TARGET} PRIVATE
     ANDROID

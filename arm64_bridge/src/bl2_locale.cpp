@@ -1,11 +1,17 @@
 #include "bl2_locale.h"
 #include "bl2_locale_payload.h"
+#include "bl2_voice_payload.h"
+#include "bl2_cache_payload.h"
 #if defined(BL2_LOCALE_HOST_TEST)
 #include "bl2_locale_host_port.h"
 #else
 #include "bridge_log.h"
+#if defined(BL2_NATIVE_ARM32)
+#include "native_host.h"
+#else
 #include "dynarmic_host.h"
 #include "elf_loader.h"
+#endif
 #include "thunk_manager.h"
 #endif
 #include "obb_sha256.h"
@@ -35,24 +41,41 @@
 static_assert(std::string_view(bl2_locale_payload::kCompatiblePatchSha256) == kPatchObbSha256,
               "Russian startup packages and the base must use the same texture cache");
 
+static_assert(std::string_view(bl2_voice_payload::kCompatibleMainSha256) == kMainObbSha256,
+              "Russian voice media must use the verified Android base audio index");
+
 namespace {
 using namespace bl2_locale_payload;
 constexpr char kDescriptor[] = "assets/bl2_locale/ru_text/pack.json";
+constexpr char kVoiceDescriptor[] = "assets/bl2_locale/ru_voice/pack.json";
 constexpr char kGuestSha256[] =
     "A0B06EF59F4C89C0889654196951D2DEB966CFEAC7180699B5724F0E26938814";
 constexpr uint32_t kLookupRva = 0x01E1CA4C;
 constexpr uint32_t kLookupPreimage[] = {0xE92D43F8, 0xE1A07000,
                                       0xE59F30B0, 0xE08F3003};
 constexpr size_t kMaxPath = 4096;
-constexpr size_t kFileCount = std::size(kFiles);
-[[maybe_unused]] constexpr size_t kBindingCount = std::size(kBindings);
+constexpr size_t kTextFileCount = std::size(kFiles);
+constexpr size_t kVoiceFileCount = std::size(bl2_voice_payload::kFiles);
+constexpr size_t kLocaleFileCount = kTextFileCount + kVoiceFileCount;
+constexpr size_t kFileCount = kLocaleFileCount + std::size(bl2_cache_payload::kFiles);
+[[maybe_unused]] constexpr size_t kBindingCount = std::size(kBindings) + std::size(bl2_voice_payload::kBindings);
+File ExpectedFile(size_t file) {
+    if (file < kTextFileCount) return kFiles[file];
+    if (file < kLocaleFileCount) return bl2_voice_payload::kFiles[file - kTextFileCount];
+    const auto& relocated = bl2_cache_payload::kFiles[file - kLocaleFileCount];
+    return {relocated.asset, relocated.bytes, relocated.sha256};
+}
 std::array<Bl2LocaleEntry, kFileCount> s_entries{};
 std::array<std::atomic<uint32_t>, kFileCount> s_opens{};
 std::atomic<bool> s_active{false};
 bool s_indexed = false;
 bool s_payload_valid = false;
 bool s_guest_valid = false;
-int s_apk_fd = -1;
+bool s_cache_valid = false;
+bool s_russian = true;  // Legacy callers; the ARM64 Context selects ru/en before indexing.
+int s_cache_fd = -1;
+std::array<int, 2> s_apk_fds{{-1, -1}};
+std::array<bool, 2> s_component_valid{};
 std::string s_files_root;
 
 uint16_t U16(const uint8_t* p) {
@@ -136,8 +159,9 @@ struct Zip {
             at += record_size;
             // Only these records participate in the locale contract. Other
             // package resources remain Android's responsibility.
-            if (name != "AndroidManifest.xml" && name != kDescriptor &&
-                !std::string_view(name).starts_with("assets/bl2_locale/ru_text/")) continue;
+            if (name != "AndroidManifest.xml" &&
+                !std::string_view(name).starts_with("assets/bl2_locale/") &&
+                !std::string_view(name).starts_with("assets/bl2_cache/")) continue;
             if (name.find('\0') != std::string::npos || name.size() > 512 || Find(name)) return false;
             const uint16_t flags = U16(c + 8), method = U16(c + 10);
             const uint32_t local_offset = U32(c + 42);
@@ -186,6 +210,11 @@ struct Zip {
     }
     bool Verify(const ZipEntry& entry, uint64_t expected_size, const char* digest) const {
         if (entry.method != 0 || entry.bytes != expected_size || entry.packed != expected_size) return false;
+#if !defined(BL2_LOCALE_HOST_TEST)
+        // Installed signed APKs already carry authenticated payloads. Hash only
+        // the small pack descriptor used to select this exact compatible locale.
+        if (expected_size > 65536) return true;
+#endif
         std::array<uint8_t, 65536> buffer;
         ObbSha256 hash;
         uLong crc = 0;
@@ -250,12 +279,12 @@ struct Strings {
     }
 };
 
-bool ManifestIdentity(const std::vector<uint8_t>& xml, bool& is_text_split) {
-    is_text_split = false;
+bool ManifestIdentity(const std::vector<uint8_t>& xml, std::string& split) {
+    split.clear();
     if (xml.size() < 8 || U16(xml.data()) != 3 || U16(xml.data()+2) != 8 || U32(xml.data()+4) != xml.size()) return false;
     Strings strings;
     bool manifest_seen = false, application_seen = false, has_code = true;
-    std::string package, split;
+    std::string package;
     uint32_t version = 0;
     for (size_t at = 8; at < xml.size();) {
         if (!Bounds(xml.size(), at, 8)) return false;
@@ -298,8 +327,8 @@ bool ManifestIdentity(const std::vector<uint8_t>& xml, bool& is_text_split) {
         }
         at += size;
     }
-    is_text_split = split == "ru_text";
-    return manifest_seen && (!is_text_split || (application_seen && !has_code &&
+    const bool locale_split = split == "ru_text" || split == "ru_voice";
+    return manifest_seen && (!locale_split || (application_seen && !has_code &&
         package == "com.tt2kgames.Borderlands2" && version == 33));
 }
 
@@ -375,7 +404,41 @@ size_t FileForPath(const char* path) {
     std::string key;
     if (!Normalize(path, key)) return kFileCount;
     for (const auto& binding : kBindings) if (EqualFold(key, binding.path)) return binding.file;
+    for (const auto& binding : bl2_voice_payload::kBindings)
+        if (EqualFold(key, binding.path)) return kTextFileCount + binding.file;
+    for (size_t i = 0; i < std::size(bl2_cache_payload::kFiles); ++i)
+        if (EqualFold(key, bl2_cache_payload::kFiles[i].path)) return kLocaleFileCount + i;
     return kFileCount;
+}
+
+bool IndexLocaleComponent(Zip& zip, size_t component) {
+    const bool voice = component == 1;
+    const auto* descriptor = zip.Find(voice ? kVoiceDescriptor : kDescriptor);
+    if (!descriptor || !zip.Verify(*descriptor,
+            voice ? bl2_voice_payload::kDescriptorBytes : kDescriptorBytes,
+            voice ? bl2_voice_payload::kDescriptorSha256 : kDescriptorSha256)) return false;
+    const size_t first = voice ? kTextFileCount : 0;
+    const size_t stop = first + (voice ? kVoiceFileCount : kTextFileCount);
+    std::array<Bl2LocaleEntry, kFileCount> candidate{};
+    for (size_t f = first; f < stop; ++f) {
+        const auto expected = ExpectedFile(f);
+        const auto* entry = zip.Find(expected.asset);
+        if (!entry || !zip.Verify(*entry, expected.bytes, expected.sha256) ||
+            entry->name.size() >= sizeof(candidate[f].name)) return false;
+        std::memcpy(candidate[f].name, entry->name.c_str(), entry->name.size() + 1);
+        candidate[f].data_offset = static_cast<off_t>(entry->offset);
+        candidate[f].file_size = static_cast<off_t>(entry->bytes);
+    }
+    const int fd = dup(zip.fd);
+    if (fd < 0) return false;
+    if (s_apk_fds[component] >= 0) close(s_apk_fds[component]);
+    s_apk_fds[component] = fd;
+    for (size_t f = first; f < stop; ++f) {
+        candidate[f].apk_fd = fd;
+        s_entries[f] = candidate[f];
+    }
+    s_component_valid[component] = s_payload_valid = true;
+    return true;
 }
 
 #if !defined(BL2_LOCALE_HOST_TEST)
@@ -392,57 +455,85 @@ bool ReadGuestPath(DynarmicHost& host, uint32_t address, std::string& path) {
 #endif
 }  // namespace
 
+void SetBl2LocaleLanguage(const char* language) {
+    if (!s_indexed) s_russian = language && EqualFold(language, "ru");
+}
+bool Bl2RussianLocaleSelected() { return s_russian; }
+
+bool IndexBl2CacheBase(const char* path) {
+    if (s_cache_fd >= 0) return s_cache_valid;
+    if (!path) return false;
+    Zip zip;
+    if (!zip.Open(path)) return false;
+    if (s_russian && zip.Find(kDescriptor)) {
+        if (IndexLocaleComponent(zip, 0)) LOGI("base Russian text indexed: direct=1");
+        else LOGE("base Russian text rejected: incomplete or incompatible assets");
+    }
+    // Base assets are admitted as one set: a slim OBB must never become usable
+    // without every relocated file and its exact original content.
+    std::array<Bl2LocaleEntry, std::size(bl2_cache_payload::kFiles)> candidate{};
+    for (size_t i = 0; i < candidate.size(); ++i) {
+        const auto& expected = bl2_cache_payload::kFiles[i];
+        const auto* entry = zip.Find(expected.asset);
+        if (!entry || !zip.Verify(*entry, expected.bytes, expected.sha256) ||
+            entry->name.size() >= sizeof(candidate[i].name)) return false;
+        std::memcpy(candidate[i].name, entry->name.c_str(), entry->name.size() + 1);
+        candidate[i].apk_fd = zip.fd;
+        candidate[i].data_offset = static_cast<off_t>(entry->offset);
+        candidate[i].file_size = static_cast<off_t>(entry->bytes);
+    }
+    for (size_t i = 0; i < candidate.size(); ++i) s_entries[kLocaleFileCount + i] = candidate[i];
+    s_cache_fd = std::exchange(zip.fd, -1);
+    s_cache_valid = s_payload_valid = true;
+    LOGI("base cache payload verified: files=%zu direct=1", candidate.size());
+    return true;
+}
+
+bool HasBl2RelocatedCache() { return s_cache_valid; }
+
 void IndexBl2LocaleSplits(const char* const* paths, size_t count, const char* game_files_root) {
     if (s_indexed) return;
     s_indexed = true;
     s_files_root = game_files_root ? game_files_root : "";
     while (!s_files_root.empty() && s_files_root.back() == '/') s_files_root.pop_back();
-    if (count > 64 || (count && !paths)) { LOGE("ru_text rejected: invalid installed split path inventory"); return; }
-    bool found = false, rejected = false;
+    if (count > 64 || (count && !paths)) { LOGE("locale rejected: invalid installed split inventory"); return; }
+    std::array<bool, 2> found = s_component_valid, rejected{};
     for (size_t i = 0; i < count; ++i) {
-        if (!paths[i] || !*paths[i]) { rejected = true; continue; }
+        if (!s_russian) break;
+        if (!paths[i] || !*paths[i]) { rejected.fill(true); continue; }
         Zip zip;
-        if (!zip.Open(paths[i])) { LOGE("locale scan rejected malformed installed APK: %s", paths[i]); rejected = true; continue; }
+        if (!zip.Open(paths[i])) { rejected.fill(true); LOGE("locale rejected malformed APK"); continue; }
         const auto* manifest = zip.Find("AndroidManifest.xml");
         std::vector<uint8_t> xml;
-        bool text = false;
-        if (!manifest || !zip.ReadSmall(*manifest, xml) || !ManifestIdentity(xml, text)) {
-            LOGE("locale scan rejected binary manifest: %s", paths[i]); rejected = true; continue;
+        std::string split;
+        const bool identity = manifest && zip.ReadSmall(*manifest, xml) && ManifestIdentity(xml, split);
+        const size_t component = split == "ru_text" ? 0 : split == "ru_voice" ? 1 : 2;
+        if (!identity) {
+            if (component < 2) rejected[component] = true;
+            else rejected.fill(true);
+            LOGE("locale rejected binary manifest"); continue;
         }
-        if (!text) continue;
-        if (found) { LOGE("ru_text rejected: duplicate installed text split"); rejected = true; continue; }
-        found = true;
-        const auto* descriptor = zip.Find(kDescriptor);
-        if (!descriptor || !zip.Verify(*descriptor, kDescriptorBytes, kDescriptorSha256)) {
-            LOGE("ru_text rejected: descriptor schema/revision/identity or ZIP method mismatch"); rejected = true; continue;
+        if (component == 2) continue;
+        // Embedded text owns this component; an obsolete installed ru_text split
+        // must not override the base or invalidate its compatible font packages.
+        if (component == 0 && s_component_valid[0]) continue;
+        if (std::exchange(found[component], true)) { rejected[component] = true; continue; }
+        if (!IndexLocaleComponent(zip, component)) {
+            rejected[component] = true; LOGE("locale rejected incomplete payload"); continue;
         }
-        bool valid = true;
-        std::array<Bl2LocaleEntry, kFileCount> candidate{};
-        for (size_t f = 0; f < kFileCount; ++f) {
-            const auto& expected = kFiles[f];
-            const auto* entry = zip.Find(expected.asset);
-            if (!entry || !zip.Verify(*entry, expected.bytes, expected.sha256)) {
-                LOGE("ru_text rejected: incomplete/incompatible payload %s", expected.asset); valid = false; break;
-            }
-            if (entry->name.size() >= sizeof(candidate[f].name)) { valid = false; break; }
-            std::memcpy(candidate[f].name, entry->name.c_str(), entry->name.size()+1);
-            candidate[f].apk_fd = zip.fd;
-            candidate[f].data_offset = static_cast<off_t>(entry->offset);
-            candidate[f].file_size = static_cast<off_t>(entry->bytes);
-        }
-        if (!valid) { rejected = true; continue; }
-        s_entries = candidate;
-        s_apk_fd = std::exchange(zip.fd, -1);
-        LOGI("ru_text payload verified: split=%s descriptor=%s files=%zu no-extraction=1 fonts=GFx+native322/remap324 voice=English(US)",
-             paths[i], kDescriptorSha256, kFileCount);
+        LOGI("locale indexed: component=%s direct=1", split.c_str());
     }
-    if (rejected || !found || s_apk_fd < 0) {
-        if (s_apk_fd >= 0) close(std::exchange(s_apk_fd, -1));
-        s_entries = {};
-        LOGI("locale fallback: text=INT/en voice=English(US) reason=%s", rejected ? "optional split validation failed" : "ru_text absent");
-        return;
+    for (size_t component = 0; component < 2; ++component) {
+        s_component_valid[component] = found[component] && !rejected[component] && s_apk_fds[component] >= 0;
+        if (s_component_valid[component]) continue;
+        if (s_apk_fds[component] >= 0) close(std::exchange(s_apk_fds[component], -1));
+        const size_t first = component ? kTextFileCount : 0;
+        const size_t stop = first + (component ? kVoiceFileCount : kTextFileCount);
+        for (size_t f = first; f < stop; ++f) s_entries[f] = {};
     }
-    s_payload_valid = true;
+    s_payload_valid = s_cache_valid || s_component_valid[0] || s_component_valid[1];
+    LOGI("locale indexed: ru_text=%u ru_voice=%u engine=INT audio=English(US)",
+         unsigned(s_component_valid[0]), unsigned(s_component_valid[1]));
 }
 
 bool VerifyBl2LocaleGuest(const uint8_t* data, size_t bytes) {
@@ -471,6 +562,29 @@ bool InstallBl2LocaleOverlay(DynarmicHost& host) {
             LOGE("ru_text disabled: FOOB instruction preimage changed"); return false;
         }
     }
+#if defined(BL2_NATIVE_ARM32)
+    // Re-execute only the two position-independent entry instructions before
+    // resuming the original ARM function at its unchanged PC-relative loads.
+    const uint32_t original_code[] = {
+        kLookupPreimage[0], kLookupPreimage[1], 0xE51FF004, lookup + 8};
+    const uint32_t original = host.CreateCodeVeneer(original_code);
+    if (!original) return false;
+    const uint32_t thunk = host.GetThunkManager().RegisterThunk("bl2_locale_foob_lookup",
+        [original](Dynarmic::A32::Jit& jit, DynarmicHost& current) {
+            std::string path;
+            const bool overlaid = ReadGuestPath(current, jit.Regs()[0], path) &&
+                                  IsBl2LocalePath(path.c_str());
+            jit.Regs()[0] = overlaid ? 0 : current.RunGuestCallback(original, {jit.Regs()[0]});
+        });
+    if (!thunk) return false;
+    host.MemoryWrite32(lookup + 4, thunk);
+    host.MemoryWrite32(lookup, 0xE51FF004);
+    host.InvalidateGuestCode(lookup, 8);
+    if (host.MemoryRead32(lookup) != 0xE51FF004 || host.MemoryRead32(lookup + 4) != thunk) {
+        LOGE("ru_text disabled: native FOOB hook write verification failed"); return false;
+    }
+    [[maybe_unused]] const uint32_t veneer = original;
+#else
     // First two instructions are position independent. Keep the real function
     // at its original address from +8 onward (its literal/GOT loads are PC relative).
     const uint32_t veneer = host.GuestAlloc(40, 4);
@@ -496,28 +610,29 @@ bool InstallBl2LocaleOverlay(DynarmicHost& host) {
     if (host.MemoryRead32(lookup) != 0xE51FF004 || host.MemoryRead32(lookup+4) != veneer) {
         LOGE("ru_text disabled: FOOB hook write verification failed"); return false;
     }
+#endif
     s_active.store(true, std::memory_order_release);
-    LOGI("ru_text active: FOOB=%08X veneer=%08X paths=%zu text=ru engine=INT voice=English(US) font-policy=Android-derived-graft ETC2 native=322/remap324 Yo=203/235",
-         lookup, veneer, kBindingCount);
+    LOGI("locale active: FOOB=%08X veneer=%08X paths=%zu ru_text=%u ru_voice=%u engine=INT audio=English(US)",
+         lookup, veneer, kBindingCount, unsigned(s_component_valid[0]), unsigned(s_component_valid[1]));
     return true;
 }
 #endif
 
-// The verified optional pack replaces INT resources. Keep the stock INT lookup
-// path in both modes; removing/rejecting the split restores the original data.
+// Both languages use the stock INT and English(US) lookup paths. The selected
+// Russian overlays retain Android package IDs, fonts, bank IDs and stream cues.
 const char* Bl2LocaleLanguage() { return "en"; }
 Bl2LocaleEntry* FindBl2LocaleEntry(const char* path) {
     if (!s_active.load(std::memory_order_acquire)) return nullptr;
     const size_t file = FileForPath(path);
-    return file < kFileCount ? &s_entries[file] : nullptr;
+    return file < kFileCount && s_entries[file].name[0] ? &s_entries[file] : nullptr;
 }
 bool IsBl2LocalePath(const char* path) { return FindBl2LocaleEntry(path) != nullptr; }
 void NoteBl2LocaleOpen(const char* path, [[maybe_unused]] const char* operation) {
     if (!s_active.load(std::memory_order_acquire)) return;
     const size_t file = FileForPath(path);
-    if (file >= kFileCount) return;
+    if (file >= kFileCount || !s_entries[file].name[0]) return;
     const uint32_t count = s_opens[file].fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count <= 4) LOGI("ru_text opened: op=%s path=%s asset=%s bytes=%lld offset=%lld sha256=%s count=%u",
+    if (count <= 4) LOGI("APK overlay opened: op=%s path=%s asset=%s bytes=%lld offset=%lld expected_sha256=%s count=%u",
         operation, path, s_entries[file].name, static_cast<long long>(s_entries[file].file_size),
-        static_cast<long long>(s_entries[file].data_offset), kFiles[file].sha256, count);
+        static_cast<long long>(s_entries[file].data_offset), ExpectedFile(file).sha256, count);
 }

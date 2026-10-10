@@ -1,3 +1,4 @@
+#include "guest_software_write_watch.h"
 #include "elf_loader.h"
 #include "bridge_log.h"
 #include <fstream>
@@ -46,6 +47,17 @@ bool ElfLoader::LoadFromMemory(const uint8_t* data, size_t size) {
     if (!LoadSegments(data, size)) return false;
     if (!ParseDynamic(data, size)) return false;
     return true;
+}
+
+bool ElfLoader::IsCodeRange(uint32_t address, size_t size) const {
+    if (!size || address < m_load_base || size > uint64_t{UINT32_MAX} + 1 - address) return false;
+    const uint64_t start = static_cast<uint64_t>(address) - m_load_base;
+    const uint64_t end = start + size;
+    for (const auto& segment : m_segments) {
+        if ((segment.flags & PF_X) && start >= segment.vaddr &&
+            end <= static_cast<uint64_t>(segment.vaddr) + segment.memsz) return true;
+    }
+    return false;
 }
 
 bool ElfLoader::IsReadOnlyRange(uint32_t address, size_t size) const {
@@ -116,9 +128,12 @@ bool ElfLoader::LoadSegments(const uint8_t* data, size_t size) {
             uint8_t* dest = m_guest_mem + m_load_base + phdr.p_vaddr;
             if (phdr.p_filesz > 0 && phdr.p_offset + phdr.p_filesz <= size) {
                 memcpy(dest, data + phdr.p_offset, phdr.p_filesz);
+                NotifyGuestMemoryWritten(m_load_base + phdr.p_vaddr, phdr.p_filesz);
             }
             if (phdr.p_memsz > phdr.p_filesz) {
                 memset(dest + phdr.p_filesz, 0, phdr.p_memsz - phdr.p_filesz);
+                NotifyGuestMemoryWritten(m_load_base + phdr.p_vaddr + phdr.p_filesz,
+                                         phdr.p_memsz - phdr.p_filesz);
             }
         }
     }
@@ -275,6 +290,7 @@ bool ElfLoader::ProcessRelocations(const SymbolResolver& resolver) {
                 LOGE("Unsupported relocation type: %u", type);
                 return false;
         }
+        if (type != R_ARM_NONE) NotifyGuestMemoryWritten(m_load_base + rel.r_offset, 4);
         return true;
     };
 

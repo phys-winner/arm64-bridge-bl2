@@ -53,10 +53,15 @@ public final class LocalIdentity {
             throw new InvalidClassException("Legacy identity contains a proxy");
         }
     }
+    private void completeLocalSignIn() {
+        if (listener != null) listener.onSignInCompleted(null, null, id, name, age, new String[0], null);
+    }
+    /** Initialize the real local save/achievement owners before the engine's login baseline. */
+    public void prepareStartup() { completeLocalSignIn(); }
     public void signIn(boolean userInitiated, boolean ignoredConnect) {
         new Handler(Looper.getMainLooper()).post(new Runnable() {
             @Override public void run() {
-                if (listener != null) listener.onSignInCompleted(null, null, id, name, age, new String[0], null);
+                completeLocalSignIn();
             }
         });
     }

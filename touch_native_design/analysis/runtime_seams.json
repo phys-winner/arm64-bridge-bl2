@@ -1,0 +1,366 @@
+{
+  "guest_sha256": "A0B06EF59F4C89C0889654196951D2DEB966CFEAC7180699B5724F0E26938814",
+  "symbols": [
+    {
+      "symbol": "GEngine",
+      "name": "GEngine",
+      "rva": 50367776,
+      "size": 4,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "GGFxEngine",
+      "name": "GGFxEngine",
+      "rva": 50460736,
+      "size": 4,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "GWorld",
+      "name": "GWorld",
+      "rva": 50387264,
+      "size": 4,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "_ZN10FGFxEngine10CloseSceneEP9FGFxMoviej",
+      "name": "FGFxEngine::CloseScene(FGFxMovie*, unsigned int)",
+      "rva": 30217848,
+      "size": 568,
+      "file_offset": 30217848,
+      "sha256": "6B8751888E6D37FC5D68F6C3AF26F5770E9C0A5C8805039C26788D434DD47093",
+      "preimage16": "f0472de90080a0e1d80290e508d04de2"
+    },
+    {
+      "symbol": "_ZN10FGFxEngine10InputTouchEiRK9FIntPoint10ETouchTypej",
+      "name": "FGFxEngine::InputTouch(int, FIntPoint const&, ETouchType, unsigned int)",
+      "rva": 30197048,
+      "size": 548,
+      "file_offset": 30197048,
+      "sha256": "8F4E03EBD8B8161DF2A3E812BAD662F5605D93EADE13E25A1C055F6C886C6127",
+      "preimage16": "f0472de958d04de20270a0e10360a0e1"
+    },
+    {
+      "symbol": "_ZN10FGFxEngine10StartSceneEP9FGFxMovieP22UTextureRenderTarget2Djj",
+      "name": "FGFxEngine::StartScene(FGFxMovie*, UTextureRenderTarget2D*, unsigned int, unsigned int)",
+      "rva": 30246708,
+      "size": 936,
+      "file_offset": 30246708,
+      "sha256": "1688F97D6751CEA4315C388E27FF06C2D79B4FBEA20436E36196C77229911D74",
+      "preimage16": "f0472de9048b2ded0140a0e170839fe5"
+    },
+    {
+      "symbol": "_ZN10FGFxEngine23GetFocusedMovieForInputEi",
+      "name": "FGFxEngine::GetFocusedMovieForInput(int)",
+      "rva": 30144132,
+      "size": 300,
+      "file_offset": 30144132,
+      "sha256": "59C8503D99BC9521F0007D7924B5C30680BD599712470A5D6FAD414BA9EA045F",
+      "preimage16": "20319fe5f0412de90060a0e103309fe7"
+    },
+    {
+      "symbol": "_ZN10FGFxEngine31GetFocusedMovieFromControllerIDEi",
+      "name": "FGFxEngine::GetFocusedMovieFromControllerID(int)",
+      "rva": 30143768,
+      "size": 160,
+      "file_offset": 30143768,
+      "sha256": "E2024A1EFA74CDC5D0B2AF131749E866ADB4A98AAC3F68D2A24E022E0BAC62A5",
+      "preimage16": "94309fe530002de903309fe7003093e5"
+    },
+    {
+      "symbol": "_ZN10FGFxEngine8InputKeyEi5FName11EInputEventfj",
+      "name": "FGFxEngine::InputKey(int, FName, EInputEvent, float, unsigned int)",
+      "rva": 30196292,
+      "size": 756,
+      "file_offset": 30196292,
+      "sha256": "FA45EE51C0C7C6EE19EFD5D0AF7BE5BA176DBF073928FFF2D685FD081E18F345",
+      "preimage16": "f0432de90070a0e1c0929fe514d04de2"
+    },
+    {
+      "symbol": "_ZN11FKdViewport12ProcessInputEf",
+      "name": "FKdViewport::ProcessInput(float)",
+      "rva": 31598844,
+      "size": 5592,
+      "file_offset": 31598844,
+      "sha256": "524219C9024EBDE72F02B1B9B85C80D86E9CB18446954AEBD7406D34694C23AB",
+      "preimage16": "f04f2de9048b2ded0040a0e168539fe5"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput15UpdateAxisValueEPff",
+      "name": "UWillowPlayerInput::UpdateAxisValue(float*, float)",
+      "rva": 37041208,
+      "size": 64,
+      "file_offset": 37041208,
+      "sha256": "356DD7B8869BC5684BBE1DCAE97C6C35928E1C372E2171545D5B39CDA4456348",
+      "preimage16": "34309fe510402de90040a0e103309fe7"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput16GetTargetAxisPtrE14EAxisParameter",
+      "name": "UWillowPlayerInput::GetTargetAxisPtr(EAxisParameter)",
+      "rva": 37151248,
+      "size": 764,
+      "file_offset": 37151248,
+      "sha256": "1B3CF6FADF6D5DE3A5E9A4616CB1E52540670049DCEB8106A5F2D61C63F56185",
+      "preimage16": "70402de90030a0e398429fe518d04de2"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput17IsActionAvailableEP22UInputActionDefinition",
+      "name": "UWillowPlayerInput::IsActionAvailable(UInputActionDefinition*)",
+      "rva": 37054364,
+      "size": 228,
+      "file_offset": 37054364,
+      "sha256": "F3A26CA7130EE2B81430A77286A0C71637EA2F82446A4E6569314A4253E980A5",
+      "preimage16": "70002de9903290e5000053e30200001a"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput18PrivateStaticClassE",
+      "name": "UWillowPlayerInput::PrivateStaticClass",
+      "rva": 50775416,
+      "size": 4,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput19UpdateLatentButtonsEv",
+      "name": "UWillowPlayerInput::UpdateLatentButtons()",
+      "rva": 37149980,
+      "size": 296,
+      "file_offset": 37149980,
+      "sha256": "BE842A0F9D8E38554FD8DFDB872DDE66EE488BA36E5634454B476DA2E6CB685A",
+      "preimage16": "f8432de9028b2ded0040a0e10c319fe5"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput21ProcessDeviceLookAxesEfffj",
+      "name": "UWillowPlayerInput::ProcessDeviceLookAxes(float, float, float, unsigned int)",
+      "rva": 37148168,
+      "size": 756,
+      "file_offset": 37148168,
+      "sha256": "3582C30446FB55A4A7377C286018E0FBF1637E588858ACBFDBA70F976DF18FBD",
+      "preimage16": "f04f2de9068b2ded0040a0e1902a08ee"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput21SetActionAvailabilityEP22UInputActionDefinitionj",
+      "name": "UWillowPlayerInput::SetActionAvailability(UInputActionDefinition*, unsigned int)",
+      "rva": 37233528,
+      "size": 368,
+      "file_offset": 37233528,
+      "sha256": "4DD90852EBF59EE0848361AB9345BEE54C11447DAA4E4FB2A4AFEFA23A24CDBF",
+      "preimage16": "f0432de9004051e20cd04de20060a0e1"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput23UpdateInputActionStatesEj",
+      "name": "UWillowPlayerInput::UpdateInputActionStates(unsigned int)",
+      "rva": 37233896,
+      "size": 244,
+      "file_offset": 37233896,
+      "sha256": "C602EACBE9761AD198B35E81AD3AB807EABE83ABFF0E5DB3559D37B590D216AA",
+      "preimage16": "f0472de90050a0e1a83190e50170a0e1"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput24FireInputActionBehaviorsERK6TArrayIP22UInputActionDefinition21TAlignedHeapAllocatorILm8EEE17EInputActionEventjj",
+      "name": "UWillowPlayerInput::FireInputActionBehaviors(TArray<UInputActionDefinition*, TAlignedHeapAllocator<8ul>> const&, EInputActionEvent, unsigned int, unsigned int)",
+      "rva": 37148924,
+      "size": 692,
+      "file_offset": 37148924,
+      "sha256": "8BF50885A413E4F7FCF7FB792DD489A05FE25E52F6788DB62D3A24BAA993E899",
+      "preimage16": "f0472de90140a0e1041091e518d04de2"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput24GetInputActionDefinitionE5FName",
+      "name": "UWillowPlayerInput::GetInputActionDefinition(FName)",
+      "rva": 37224008,
+      "size": 176,
+      "file_offset": 37224008,
+      "sha256": "B8286E82DABCD88A36626F3A3CBB7B20BED7AB56805415DDBE0B454AFC19812D",
+      "preimage16": "9c309fe570402de918d04de208508de2"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInput9InputAxisEi5FNameffj",
+      "name": "UWillowPlayerInput::InputAxis(int, FName, float, float, unsigned int)",
+      "rva": 37053764,
+      "size": 600,
+      "file_offset": 37053764,
+      "sha256": "0CA64B6EEBDFA6C0B9E1B0FC9C75A18A18C6379C98A5F12B76DA6DF9A18AFF25",
+      "preimage16": "f0402de9028b2ded0040a0e140529fe5"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInputD0Ev",
+      "name": "UWillowPlayerInput::~UWillowPlayerInput()",
+      "rva": 37264408,
+      "size": 56,
+      "file_offset": 37264408,
+      "sha256": "A7CCFB8EBCE0476D5B354EBBCDA78904742E7BE1500835595B3A6C46ABFE5191",
+      "preimage16": "28309fe510402de90040a0e103309fe7"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInputD1Ev",
+      "name": "UWillowPlayerInput::~UWillowPlayerInput()",
+      "rva": 37263536,
+      "size": 872,
+      "file_offset": 37263536,
+      "sha256": "CD01094C67CEF423ACC2891004F45174F886FCBEB85125674440C420CC36C575",
+      "preimage16": "38339fe5f04f2de90040a0e130739fe5"
+    },
+    {
+      "symbol": "_ZN18UWillowPlayerInputD2Ev",
+      "name": "UWillowPlayerInput::~UWillowPlayerInput()",
+      "rva": 37263536,
+      "size": 872,
+      "file_offset": 37263536,
+      "sha256": "CD01094C67CEF423ACC2891004F45174F886FCBEB85125674440C420CC36C575",
+      "preimage16": "38339fe5f04f2de90040a0e130739fe5"
+    },
+    {
+      "symbol": "_ZN19UGameViewportClient14GetPlayerOwnerEi",
+      "name": "UGameViewportClient::GetPlayerOwner(int)",
+      "rva": 23098380,
+      "size": 64,
+      "file_offset": 23098380,
+      "sha256": "D657077E4D4A768B8B6BEDAD7EB715D74BFB82DED943E28A204F46347766B736",
+      "preimage16": "34309fe503309fe7000093e5000050e3"
+    },
+    {
+      "symbol": "_ZN19UInputSetDefinition18PrivateStaticClassE",
+      "name": "UInputSetDefinition::PrivateStaticClass",
+      "rva": 50762068,
+      "size": 4,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "_ZN22UInputActionDefinition18PrivateStaticClassE",
+      "name": "UInputActionDefinition::PrivateStaticClass",
+      "rva": 50762060,
+      "size": 4,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "_ZN23AWillowPlayerController21IsLoadingMoviePlayingEv",
+      "name": "AWillowPlayerController::IsLoadingMoviePlaying()",
+      "rva": 37119428,
+      "size": 64,
+      "file_offset": 37119428,
+      "sha256": "25720BCAE5A88F0219BB3A5E42149C96777EC8845D1969333169F39AF48BA5FF",
+      "preimage16": "08402de92c309fe503309fe7000093e5"
+    },
+    {
+      "symbol": "_ZN23AWillowPlayerController21UpdateInteractionIconE29FInteractionIconWithOverridesh",
+      "name": "AWillowPlayerController::UpdateInteractionIcon(FInteractionIconWithOverrides, unsigned char)",
+      "rva": 37103996,
+      "size": 292,
+      "file_offset": 37103996,
+      "sha256": "8208D387F37589706CD1BD7794921B47063F5880229198E31D4B110DBAEB7CDC",
+      "preimage16": "10d04de2f0412de928d04de25870dde5"
+    },
+    {
+      "symbol": "_ZN23AWillowPlayerController24SetGFxPauseMenuOpenStateEj",
+      "name": "AWillowPlayerController::SetGFxPauseMenuOpenState(unsigned int)",
+      "rva": 37134728,
+      "size": 36,
+      "file_offset": 37134728,
+      "sha256": "AFB837CFCC4B259CC8FE43C07E5BFE77C991262DAF9A990BCA385C77F296A837",
+      "preimage16": "18309fe503309fe7003093e5000053e3"
+    },
+    {
+      "symbol": "_ZN23AWillowPlayerController28TickInputContextChangeSentryEv",
+      "name": "AWillowPlayerController::TickInputContextChangeSentry()",
+      "rva": 37102164,
+      "size": 404,
+      "file_offset": 37102164,
+      "sha256": "92AB001354C1B322E243758379F37394237C802E298579889AEFF315411F0EFE",
+      "preimage16": "f8402de90040a0e1905190e5ec3d90e5"
+    },
+    {
+      "symbol": "_ZN23UInputContextDefinition18PrivateStaticClassE",
+      "name": "UInputContextDefinition::PrivateStaticClass",
+      "rva": 50762064,
+      "size": 4,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "_ZN25UWillowGameViewportClient8InputKeyEP9FViewporti5FName11EInputEventfj",
+      "name": "UWillowGameViewportClient::InputKey(FViewport*, int, FName, EInputEvent, float, unsigned int)",
+      "rva": 34886972,
+      "size": 596,
+      "file_offset": 34886972,
+      "sha256": "7BDBE7B15D2A149E93E42BFF2D88672E2A8258BD4FD57D3BB183DF8E55A23097",
+      "preimage16": "08d04de2f0472de910d04de208429fe5"
+    },
+    {
+      "symbol": "_ZN5FName5NamesE",
+      "name": "FName::Names",
+      "rva": 50004168,
+      "size": 12,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "_ZN7UObject11GObjObjectsE",
+      "name": "UObject::GObjObjects",
+      "rva": 50045544,
+      "size": 12,
+      "file_offset": null,
+      "sha256": null,
+      "preimage16": null
+    },
+    {
+      "symbol": "_ZN7UObject7IsValidEv",
+      "name": "UObject::IsValid()",
+      "rva": 16759672,
+      "size": 84,
+      "file_offset": 16759672,
+      "sha256": "886B6F44EE0F57AA810706F9618B2D8E0BEF82A2C201AD913D9DFF93134967AC",
+      "preimage16": "000050e31eff2f01203090e5000053e3"
+    },
+    {
+      "symbol": "_ZNK10FNameEntry13GetNameStringEv",
+      "name": "FNameEntry::GetNameString() const",
+      "rva": 16667448,
+      "size": 36,
+      "file_offset": 16667448,
+      "sha256": "44DA74EA3A0B1FF795E65A49FA1DA24B74E3AC8D7A193551413D0C1AB9AF9BD6",
+      "preimage16": "18309fe5081081e210402de90040a0e1"
+    },
+    {
+      "symbol": "_ZNK5FName8ToStringER7FString",
+      "name": "FName::ToString(FString&) const",
+      "rva": 16670564,
+      "size": 1228,
+      "file_offset": 16670564,
+      "sha256": "4429B111E6E8CB6CABBC945F99B5D7C8D900CB3FD5C4607AE8EBB27831E16DE2",
+      "preimage16": "a0349fe5f0412de90170a0e198649fe5"
+    },
+    {
+      "symbol": "_ZNK7UObject11GetPathNameEPKS_R7FString",
+      "name": "UObject::GetPathName(UObject const*, FString&) const",
+      "rva": 16760628,
+      "size": 364,
+      "file_offset": 16760628,
+      "sha256": "2C732FE1F8A1C60B7FF62905388AA4C6BF12A58D0D596DEADE7C194E779FFEC4",
+      "preimage16": "f0412de9000050e3010050112c519fe5"
+    },
+    {
+      "symbol": "_ZNK7UObject7GetNameEv",
+      "name": "UObject::GetName() const",
+      "rva": 16247048,
+      "size": 132,
+      "file_offset": 16247048,
+      "sha256": "52E71F422A189F522A100B53FC03D3680EA0E89F1C851441242282E72A675851",
+      "preimage16": "68309fe5000051e310402de90040a0e1"
+    }
+  ],
+  "unmatched_names": []
+}

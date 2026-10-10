@@ -3,11 +3,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 namespace bl2::touch {
 namespace {
 constexpr std::uint32_t kKnownCapabilities = GameplayInput | RelativeLook | DirectUi |
-                                             PhysicalOwnsInput | CanSkip | UiNavigation | UiTapTest;
+    PhysicalOwnsInput | CanSkip | UiNavigation | UiTapTest | UiWidgets | PauseBackdrop | DebugCanvas | MapGestures;
+// Appending gameplay LastWeapon/Chat actions must not change GFx transaction
+// cadence: an unfinished DOWN still carries into the next original UI frame.
+constexpr std::size_t kUiEdgesPerFrame = 25;
 bool sameSceneContext(const Context& a, const Context& b) {
     return a.mode == b.mode && a.capabilities == b.capabilities &&
            a.sceneIdentity == b.sceneIdentity;
@@ -17,11 +21,34 @@ float limitedLook(float pending, float next) {
                                          kMaxLookDegreesPerPacket),
                       -kMaxPendingLookDegrees, kMaxPendingLookDegrees);
 }
+bool validSurfaceRect(const SurfaceRect& r) {
+    return std::isfinite(r.left) && std::isfinite(r.top) &&
+        std::isfinite(r.right) && std::isfinite(r.bottom) &&
+        r.left >= 0 && r.top >= 0 && r.right <= 1 && r.bottom <= 1 &&
+        r.left < r.right && r.top < r.bottom;
+}
+std::uint64_t floatPair(float low, float high) {
+    static_assert(sizeof(float) == sizeof(std::uint32_t));
+    std::uint32_t a = 0, b = 0;
+    std::memcpy(&a, &low, sizeof(a));
+    std::memcpy(&b, &high, sizeof(b));
+    return a | (std::uint64_t{b} << 32);
+}
 } // namespace
 
-std::array<std::uint64_t, 8> Snapshot::wire() const {
+std::array<std::uint64_t, kSnapshotWords> Snapshot::wire() const {
     return {kProtocolVersion, epoch, static_cast<std::uint64_t>(context.mode),
-            context.capabilities, context.availableActions, frameSerial, 0, 0};
+            context.capabilities, context.availableActions, frameSerial,
+            context.knownActions, static_cast<std::uint64_t>(context.weaponCount),
+            static_cast<std::uint64_t>(context.grenadeCount), context.hudValidMask,
+            floatPair(context.mapRect.left, context.mapRect.top),
+            floatPair(context.mapRect.right, context.mapRect.bottom),
+            floatPair(context.ammoRect.left, context.ammoRect.top),
+            floatPair(context.ammoRect.right, context.ammoRect.bottom),
+            floatPair(context.objectiveRect.left, context.objectiveRect.top),
+            floatPair(context.objectiveRect.right, context.objectiveRect.bottom),
+            floatPair(context.useRect.left, context.useRect.top),
+            floatPair(context.useRect.right, context.useRect.bottom)};
 }
 
 std::uint64_t Mailbox::publishContext(Context context, bool forceNewScene) {
@@ -31,6 +58,28 @@ std::uint64_t Mailbox::publishContext(Context context, bool forceNewScene) {
     }
     context.capabilities &= kKnownCapabilities;
     context.availableActions &= kKnownActions;
+    context.knownActions &= kKnownActions;
+    if (context.weaponCount < -1 || context.weaponCount > 64) context.weaponCount = -1;
+    if (context.grenadeCount < -1 || context.grenadeCount > 65535) context.grenadeCount = -1;
+    context.hudValidMask &= HudMinimap | HudAmmo | HudObjectives | HudObjectivesEmpty | HudUse;
+    if ((context.hudValidMask & HudMinimap) == 0 || !validSurfaceRect(context.mapRect)) {
+        context.hudValidMask &= ~HudMinimap;
+        context.mapRect = {};
+    }
+    if ((context.hudValidMask & HudAmmo) == 0 || !validSurfaceRect(context.ammoRect)) {
+        context.hudValidMask &= ~HudAmmo;
+        context.ammoRect = {};
+    }
+    const auto objectives = context.hudValidMask & (HudObjectives | HudObjectivesEmpty);
+    if (objectives == (HudObjectives | HudObjectivesEmpty) ||
+        (objectives == HudObjectives && !validSurfaceRect(context.objectiveRect))) {
+        context.hudValidMask &= ~(HudObjectives | HudObjectivesEmpty);
+    }
+    if ((context.hudValidMask & HudObjectives) == 0) context.objectiveRect = {};
+    if ((context.hudValidMask & HudUse) == 0 || !validSurfaceRect(context.useRect)) {
+        context.hudValidMask &= ~HudUse;
+        context.useRect = {};
+    }
     if (!sameSceneContext(context, context_) || forceNewScene) {
         context_ = context;
         invalidateLocked(ContextChanged);
@@ -47,6 +96,10 @@ std::uint64_t Mailbox::publishContext(Context context, bool forceNewScene) {
                                                 guestActionEpochs_[i], ++sequence_});
             }
         }
+    } else {
+        // Counts, known-state and projected HUD bounds must remain live even
+        // when the action mask and the input lifetime are unchanged.
+        context_ = context;
     }
     return epoch_;
 }
@@ -159,7 +212,7 @@ bool Mailbox::uiPointer(std::uint64_t epoch, std::int32_t pointerId,
                         std::uint64_t nowMs) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (epoch != epoch_ || !armed_ || !inputAllowedLocked() ||
-        (context_.capabilities & (DirectUi | UiTapTest)) == 0) return false;
+        (context_.capabilities & (DirectUi | UiTapTest | UiWidgets)) == 0) return false;
     if (!std::isfinite(surfaceX) || !std::isfinite(surfaceY)) {
         invalidateLocked(InvalidNumeric);
         return false;
@@ -186,7 +239,7 @@ bool Mailbox::uiPointer(std::uint64_t epoch, std::int32_t pointerId,
         surfaceX = previous.x;
         surfaceY = previous.y;
     }
-    const PointerEvent event{pointerId, phase, surfaceX, surfaceY, epoch_, ++sequence_};
+    const PointerEvent event{pointerId, phase, surfaceX, surfaceY, epoch_, ++sequence_, nowMs};
     // Only consecutive MOVE events of the same pointer can be coalesced. DOWN,
     // UP and CANCEL are never overwritten or moved ahead of another event.
     if (phase == PointerPhase::Move && !pointers_.empty() &&
@@ -280,7 +333,7 @@ Frame Mailbox::consumeFrame(std::uint64_t engineTick, std::uint64_t nowMs) {
         // across ticks. Preserve the complete producer order: taking one edge
         // per action would turn A-down/A-up/B-down/B-up into overlapping DOWNs.
         // Stop at Frame capacity; all unselected edges remain in their rings.
-        while (frame.actionEdgeCount < frame.actionEdges.size()) {
+        while (frame.actionEdgeCount < std::min(frame.actionEdges.size(), kUiEdgesPerFrame)) {
             std::size_t next = kActionCount;
             for (std::size_t i = 0; i < kActionCount; ++i) {
                 const auto& queue = transitions_[i];

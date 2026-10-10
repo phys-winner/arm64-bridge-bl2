@@ -2,6 +2,7 @@
 #include "../../touch_native_design/arm64_bridge/bl2_touch_engine_adapter.h"
 #include "bl2_touch_ui_transactions.h"
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 class DynarmicHost;
@@ -22,6 +23,11 @@ public:
     void beginTouchFrame(const Frame& frame) override;
     void action(const ActionEdge& edge) override;
     void pointer(const PointerEvent& event) override;
+    // Widget screens give their passive footer first refusal, retaining list drags.
+    bool footerPointer(const PointerEvent&,bool allowCapture);
+    void setFooterActionHandler(std::function<bool(const ActionEdge&)>);
+    // Hover is original MouseEvent::MouseMove only; it never presses/activates.
+    void hover(const PointerEvent&);
     void movement(float, float) override {}
     void relativeLook(float, float) override {}
     void endTouchFrame(const Frame& frame) override;

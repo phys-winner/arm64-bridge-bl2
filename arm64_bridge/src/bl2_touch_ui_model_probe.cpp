@@ -11,9 +11,15 @@
 namespace {
 bool copyMemory(const void* context, std::uint32_t address, void* out, std::size_t bytes) {
     const auto& host = *static_cast<const DynarmicHost*>(context);
+#if defined(BL2_NATIVE_ARM32)
+    if (address < 0x10000 || address > host.GetGuestMemorySize() ||
+        bytes > host.GetGuestMemorySize() - address) return false;
+    std::memcpy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),bytes);
+#else
     if (address < 0x10000 || address > host.GetGuestMemorySize() ||
         bytes > host.GetGuestMemorySize() - address || !host.GetGuestMemoryBase()) return false;
     std::memcpy(out,host.GetGuestMemoryBase() + address,bytes);
+#endif
     return true;
 }
 struct Observer {

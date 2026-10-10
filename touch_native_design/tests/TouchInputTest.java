@@ -23,8 +23,510 @@ public final class TouchInputTest {
     private static void near(float actual,float expected,String message) {
         check(Math.abs(actual-expected)<.0002f,message+": "+actual+" != "+expected);
     }
-    private static Context play(long epoch) { return new Context(epoch,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,(1L<<25)-1,1); }
-    public static void main(String[] args) {
+    private static Context play(long epoch) { return new Context(epoch,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,(1L<<26)-1,1); }
+    private static void checkHudLayout(float width,float height,float density,float insetL,float insetT,
+            float insetR,float insetB,float requestedScale,boolean leftHanded) {
+        float left=insetL,top=insetT,right=width-insetR,bottom=height-insetB;
+        float scale=Math.min(requestedScale,Math.max(.75f,((bottom-top)/density-64)/260));
+        ArrayList<float[]> occupied=new ArrayList<>(),hud=new ArrayList<>();
+        TouchLayout.reserveGameplayHud(0,0,width,height,hud);
+        int[] actions={PAUSE,-2,FIRE,AIM,GRENADE,JUMP,RELOAD,USE};float[][] cluster=null;
+        for(int i=0;i<actions.length;++i) {
+            float[] anchor=TouchLayout.gameplayAnchor(actions[i]);
+            float size=TouchLayout.gameplaySize(actions[i],bottom-top,density,scale);
+            if(i==2) {
+                cluster=TouchLayout.gameplayCluster(left,top,right,bottom,density,scale,leftHanded,(1L<<26)-1,occupied,hud);
+                check(cluster!=null,"HUD layout must fit the four primary buttons as one cluster "+width+"x"+height+" scale="+scale+" left="+leftHanded);
+            }
+            float[] r=i>=2&&i<6?cluster[i-2]:TouchLayout.placeGameplay(actions[i],anchor[0],anchor[1],size,left,top,right,bottom,
+                    density,leftHanded,false,occupied,hud);
+            String description="HUD layout "+width+"x"+height+" scale="+requestedScale+" left="+leftHanded+" action="+i;
+            check(r!=null,description+" must retain every combat and utility button");
+            check(r[0]>=left && r[1]>=top && r[2]<=right && r[3]<=bottom,description+" stays in safe bounds");
+            check(r[2]-r[0]>=44*density-.01f && r[3]-r[1]>=44*density-.01f,description+" retains touch target size");
+            for(float[] prior:occupied) check(!TouchLayout.overlaps(r,prior,4*density),description+" avoids other controls");
+            for(float[] reserved:hud) check(!TouchLayout.overlaps(r,reserved,4*density),description+" leaves original HUD visible");
+            occupied.add(r);
+        }
+    }
+    private static void checkReferenceCluster() {
+        near(TouchLayout.gameplayHitSlop(USE,3),42,"Action gains 14dp of finger margin");
+        near(TouchLayout.gameplayHitSlop(JUMP,3),6,"neighbouring buttons retain their existing margin");
+        check(TouchLayout.circleContains(58,22,22,22,22,TouchLayout.gameplayHitSlop(USE,1)),
+                "Action accepts a tap 14dp outside its visible circle");
+        check(!TouchLayout.circleContains(58.1f,22,22,22,22,TouchLayout.gameplayHitSlop(USE,1)),
+                "expanded Action margin remains bounded");
+        check(TouchLayout.circleContains(45,22,22,22,22,2),"round button permits small finger slop outside its visible side");
+        check(!TouchLayout.circleContains(1,1,22,22,22,2),"transparent square corners cannot steal taps from the native ammo bar");
+        check(!TouchLayout.circleContains(46.1f,22,22,22,22,2),"circular finger slop remains bounded");
+        ArrayList<float[]> occupied=new ArrayList<>(),clear=new ArrayList<>();
+        long all=(1L<<26)-1;
+        float[][] original=TouchLayout.gameplayCluster(0,0,2780,1264,3,1,false,all,occupied,clear);
+        check(original!=null,"FPS reference cluster fits the current phone aspect");
+        int[] ids={FIRE,AIM,GRENADE,JUMP};
+        for(int i=0;i<4;++i) {
+            float[] anchor=TouchLayout.gameplayAnchor(ids[i]);
+            near((original[i][0]+original[i][2])/2,anchor[0]*2780,"reference horizontal anchor "+ids[i]);
+            near((original[i][1]+original[i][3])/2,anchor[1]*1264,"reference vertical anchor "+ids[i]);
+        }
+        clear.add(new float[]{2200,1130,2780,1264});
+        float[][] adjusted=TouchLayout.gameplayCluster(0,0,2780,1264,3,1,false,all,occupied,clear);
+        check(adjusted!=null,"native bottom ammo can be exposed by a common vertical correction");
+        float dy=adjusted[0][1]-original[0][1];check(dy<0,"ammo clearance moves the cluster upward");
+        for(int i=0;i<4;++i) {
+            near(adjusted[i][0],original[i][0],"HUD clearance never moves Jump alone sideways");
+            near(adjusted[i][1]-original[i][1],dy,"all four controls retain their relative heights");
+            check(!TouchLayout.overlaps(adjusted[i],clear.get(0),12),"all primary hit circles leave ammo exposed");
+        }
+        float[][] mirrored=TouchLayout.gameplayCluster(0,0,2780,1264,3,1,true,all,occupied,new ArrayList<float[]>());
+        for(int i=0;i<4;++i)near(mirrored[i][0],2780-original[i][2],"left handed controls mirror without mirroring the native HUD");
+        float[] anchor=TouchLayout.gameplayAnchor(PAUSE);
+        float[] pause=TouchLayout.placeGameplay(PAUSE,anchor[0],anchor[1],132,0,0,2780,1264,3,true,false,occupied,null);
+        check((pause[0]+pause[2])/2<2780*.08f,"Pause remains top left in left handed mode");
+        float[] custom=TouchLayout.placeGameplay(AIM,.12f,.28f,132,0,0,2780,1264,3,false,true,occupied,clear);
+        near((custom[0]+custom[2])/2,.12f*2780,"an explicit custom position can use the other side of the screen");
+    }
+    private static long packed(float first,float second) {
+        return (Float.floatToIntBits(first)&0xffffffffL)|((long)Float.floatToIntBits(second)<<32);
+    }
+    private static Context hud(long epoch,int weapons,long known,long actions) {
+        return new Context(epoch,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,actions,1,known,weapons,0,3,
+                new float[]{.75f,.05f,.96f,.3f},new float[]{.7f,.88f,.94f,.98f});
+    }
+    private static void checkObjectiveHud() {
+        long all=(1L<<26)-1;
+        long[] words={2,90,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,all,12,0,3,0,7,
+                packed(.75f,.05f),packed(.96f,.3f),packed(.7f,.88f),packed(.94f,.98f),
+                packed(.76f,.31f),packed(.97f,.34f)};
+        Context visible=Context.decode(words);
+        check(visible.hudMap() && visible.hudAmmo() && visible.hudObjectives() && visible.hudObjectivesKnown(),
+                "objective float pairs extend the same native snapshot without replacing map or ammo metadata");
+        near(visible.objectiveRect[0],.76f,"objective low-word left");near(visible.objectiveRect[3],.34f,"objective high-word bottom");
+        words[14]=packed(Float.NaN,.31f);
+        Context invalid=Context.decode(words);
+        check(!invalid.hudObjectivesKnown() && invalid.hudMap() && invalid.hudAmmo(),
+                "an invalid objective projection keeps both interactive HUD targets and the conservative quest fallback");
+        words[14]=packed(.76f,.31f);words[15]=packed(.74f,.34f);invalid=Context.decode(words);
+        check(!invalid.hudObjectivesKnown() && invalid.hudMap() && invalid.hudAmmo(),"inverted objective bounds cannot clear valid map and ammo");
+        words[9]=11;words[14]=Long.MAX_VALUE;words[15]=Long.MIN_VALUE;
+        Context empty=Context.decode(words);
+        check(empty.hudObjectivesKnown() && !empty.hudObjectives() && empty.hudMap() && empty.hudAmmo(),
+                "proven empty objectives ignore reserved-word bits and differ from a failed projection");
+        words[9]=15;words[14]=packed(.76f,.31f);words[15]=packed(.97f,.34f);
+        Context conflict=Context.decode(words);
+        check(!conflict.hudObjectivesKnown() && conflict.hudMap() && conflict.hudAmmo(),"conflicting visible and empty flags invalidate only objectives");
+        words[9]=3;words[14]=123456;words[15]=0;
+        check(!Context.decode(words).hudObjectivesKnown(),"old version2 telemetry tags never become fabricated objective geometry");
+
+        Context unarmed=new Context(90,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,all&~bit(FIRE)&~bit(AIM)&~bit(RELOAD),12,
+                bit(FIRE)|bit(AIM)|bit(RELOAD),0,0,9,visible.mapRect,new float[4]);
+        check(NativeTouchControls.confirmedUnarmed(unarmed),"native known Fire-unavailable plus count zero proves empty ammo occupancy");
+        Context special=new Context(90,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,all,12,0,0,0,9,visible.mapRect,new float[4]);
+        check(!NativeTouchControls.confirmedUnarmed(special),"an exceptional count-zero equipped state keeps usable routes and the ammo fallback");
+        check(!NativeTouchControls.confirmedUnarmed(hud(90,-1,bit(FIRE),all&~bit(FIRE))),"unknown inventory cannot masquerade as confirmed unarmed");
+
+        ArrayList<float[]> passive=new ArrayList<>();
+        TouchLayout.reserveSurfaceRect(new float[]{.76f,.31f,.97f,.32f},0,-140,2780,1124,passive);
+        near(passive.get(0)[3]-passive.get(0)[1],12.64f,"passive captions retain their actual height instead of a 44dp finger target");
+        near(passive.get(0)[1],.31f*1264-140,"passive HUD mapping preserves the full Surface origin relative to the overlay");
+        TouchLayout.reserveSurfaceRect(new float[]{.7f,.2f,.6f,.3f},0,0,2780,1264,passive);
+        check(passive.size()==1,"an inverted passive region never poisons placement");
+
+        // Current phone dimensions/density and measured minimap vicinity; the
+        // bottom ammo fixture exercises a valid region needing vertical clearance.
+        ArrayList<float[]> occupied=new ArrayList<>(),known=new ArrayList<>(),unknown=new ArrayList<>();
+        float[][] reference=TouchLayout.gameplayCluster(140,0,2780,1264,3.5f,1,false,all,occupied,new ArrayList<float[]>());
+        TouchLayout.reserveGameplayHud(0,0,2780,1264,known,true,true);
+        TouchLayout.reserveSurfaceRect(new float[]{2100/2780f,112/1264f,2370/2780f,345/1264f},0,0,2780,1264,known);
+        float[][] emptyCluster=TouchLayout.gameplayCluster(140,0,2780,1264,3.5f,1,false,all,occupied,known);
+        check(emptyCluster!=null,"known empty objectives and ammo retain the reference cluster at the right edge");
+        for(int i=0;i<4;++i) {near(emptyCluster[i][0],reference[i][0],"empty HUD keeps reference x "+i);near(emptyCluster[i][1],reference[i][1],"empty HUD keeps reference y "+i);}
+        TouchLayout.reserveSurfaceRect(new float[]{2100/2780f,380/1264f,2630/2780f,420/1264f},0,0,2780,1264,known);
+        TouchLayout.reserveSurfaceRect(new float[]{2200/2780f,1130/1264f,1,1},0,0,2780,1264,known);
+        float[][] actual=TouchLayout.gameplayCluster(140,0,2780,1264,3.5f,1,false,all,occupied,known);
+        check(actual!=null,"small valid quest bounds leave a real vertical corridor above bottom ammo");
+        float dy=actual[0][1]-reference[0][1];check(dy<0,"known ammo shifts the cluster upward");
+        for(int i=0;i<4;++i) {
+            near(actual[i][0],reference[i][0],"accurate occupancy keeps every reference horizontal relationship "+i);
+            near(actual[i][1]-reference[i][1],dy,"accurate occupancy translates all four controls by the same vertical amount "+i);
+            for(float[] region:known)check(!TouchLayout.overlaps(actual[i],region,14),"known passive and interactive HUD remain exposed");
+        }
+        TouchLayout.reserveGameplayHud(0,0,2780,1264,unknown,true,false);
+        TouchLayout.reserveSurfaceRect(new float[]{2200/2780f,1130/1264f,1,1},0,0,2780,1264,unknown);
+        float[][] fallback=TouchLayout.gameplayCluster(140,0,2780,1264,3.5f,1,false,all,occupied,unknown);
+        check(fallback!=null && fallback[0][0]<actual[0][0]-200,"unknown objectives preserve a conservative reserve rather than assuming an empty HUD");
+    }
+    private static void checkHudGestures() {
+        long actions=(1L<<26)-1,known=bit(RELOAD)|bit(LAST_WEAPON)|bit(GRENADE);
+        Context c=hud(70,3,known,actions);
+        long[] words={2,70,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,actions,9,known,3,0,3,
+                packed(.75f,.05f),packed(.96f,.3f),packed(.7f,.88f),packed(.94f,.98f),0,0};
+        Context decoded=Context.decode(words);
+        check(decoded.hudMap() && decoded.hudAmmo() && decoded.weaponCount==3 && decoded.grenadeCount==0,
+                "Version2 packed native Surface rects and actual counts decode independently of render scale");
+        near(decoded.mapRect[0],.75f,"packed low-word X");near(decoded.ammoRect[3],.98f,"packed high-word bottom");
+        long[] prompt=java.util.Arrays.copyOf(words,18);prompt[0]=3;prompt[6]|=bit(USE);prompt[9]|=16;
+        prompt[16]=packed(.38f,.49f);prompt[17]=packed(.65f,.55f);
+        Context promptContext=Context.decode(prompt);
+        check(promptContext.hudUse() && promptContext.hudMap() && promptContext.hudAmmo() && promptContext.known(USE),
+                "v3 appends true native interaction-hint geometry without moving map/ammo fields");
+        near(promptContext.useRect[1],.49f,"native Use hint is normalized to the full Surface");
+        prompt[16]=packed(Float.NaN,.49f);promptContext=Context.decode(prompt);
+        check(!promptContext.hudUse() && promptContext.hudMap() && promptContext.hudAmmo() && promptContext.allows(USE),
+                "bad prompt projection preserves independent native HUD and the usable Action fallback");
+        prompt[0]=2;
+        check(Context.decode(prompt).epoch==0,"an extended snapshot cannot masquerade as version2");
+        words[10]=packed(Float.NaN,.05f);decoded=Context.decode(words);
+        check(!decoded.hudMap() && decoded.hudAmmo(),"one invalid native rectangle leaves the other live and preserves fallback");
+        words[10]=packed(.75f,.05f);words[13]=packed(.69f,.98f);decoded=Context.decode(words);
+        check(decoded.hudMap() && !decoded.hudAmmo(),"inverted ammo rectangle cannot steal touch from fallback controls");
+        check(Context.decode(java.util.Arrays.copyOf(words,8)).epoch==0,"v2 truncated as old snapshot is rejected");
+        Context old=Context.decode(new long[]{1,71,GAMEPLAY,GAMEPLAY_INPUT,actions,1,0,0});
+        check(old.gameplay() && old.weaponCount==-1 && !old.hudAmmo() && !old.known(RELOAD),"v1 compatibility preserves unknown availability without inventing HUD geometry");
+        TouchInput.HudGesture gesture=new TouchInput.HudGesture();
+        gesture.down(7,TouchInput.HudGesture.MAP_ZONE,100,100,0,70,14);
+        check(gesture.up(7,100,100,80,c,true,14)==MAP,"native minimap tap opens the real map once");
+        gesture.down(8,TouchInput.HudGesture.MAP_ZONE,100,100,100,70,14);gesture.move(8,130,100);
+        check(gesture.up(8,100,100,180,c,true,14)==-1,"a minimap drag returning to start never becomes a tap");
+        gesture.down(9,TouchInput.HudGesture.MAP_ZONE,100,100,200,70,14);
+        check(gesture.up(9,100,100,280,hud(71,3,known,actions),true,14)==-1,"old epoch HUD release cannot activate in a new scene");
+        for(int direction:new int[]{-1,1}) {
+            gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,300,70,14);gesture.move(12,200+direction*100,100);
+            check(gesture.up(12,200+direction*100,100,400,c,true,14)==(direction>0?NEXT_WEAPON:PREV_WEAPON),
+                    "ammo horizontal swipe changes exactly one weapon with correct direction");
+        }
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,500,70,14);
+        check(gesture.up(12,205,200,600,c,true,14)==-1,"vertical ammo drag does not cycle weapons or reload");
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,700,70,14);
+        check(gesture.up(12,300,100,800,hud(70,-1,known,actions),true,14)==-1,"unknown weapon count cannot promise a switch gesture");
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,900,70,14);
+        check(gesture.up(12,200,100,950,c,true,14)==-1 && gesture.poll(1229,c)==-1,"reload waits for the double-tap decision");
+        gesture.down(91,TouchInput.HudGesture.AMMO_ZONE,201,101,1100,70,14);
+        check(gesture.up(91,201,101,1150,c,true,14)==LAST_WEAPON && gesture.poll(2000,c)==-1,
+                "double-tap selects original last-used action with three weapons and cancels pending reload");
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,2100,70,14);
+        gesture.up(12,200,100,2150,c,true,14);
+        check(gesture.poll(2430,c)==RELOAD && gesture.poll(2500,c)==-1,"single tap reloads once after the deadline");
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,2600,70,14);
+        check(gesture.up(12,200,100,2650,hud(70,1,known,actions),true,14)==RELOAD,"one weapon keeps useful immediate reload");
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,2700,70,14);
+        check(gesture.up(12,200,100,2750,hud(70,1,0,actions),true,14)==-1,"unknown reload need does not invent an ammo action");
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,2800,70,14);gesture.up(12,200,100,2850,c,true,14);gesture.cancel();
+        check(gesture.poll(3200,c)==-1,"lifecycle cancellation removes delayed reload");
+        gesture.down(12,TouchInput.HudGesture.MAP_ZONE,200,100,3300,70,14);gesture.down(55,TouchInput.HudGesture.AMMO_ZONE,200,100,3310,70,14);
+        check(gesture.up(12,200,100,3350,c,true,14)==-1 && gesture.up(55,200,100,3360,c,true,14)==-1,
+                "competing HUD fingers cancel both intentions without a weapon or map edge");
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,3400,70,14);gesture.up(12,200,100,3450,c,true,14);
+        check(gesture.poll(4000,hud(71,3,known,actions))==-1,"pending single tap cannot cross an epoch");
+        Context unavailable=hud(70,3,known,actions&~bit(RELOAD)&~bit(LAST_WEAPON));
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,4100,70,14);
+        check(gesture.up(12,200,100,4150,unavailable,true,14)==-1 && gesture.poll(4500,c)==-1,
+                "a known full/unreloadable magazine does not queue a later reload");
+        Context physical=new Context(70,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK|PHYSICAL_OWNS_INPUT,actions,1,known,3,0,3,c.mapRect,c.ammoRect);
+        gesture.down(12,TouchInput.HudGesture.MAP_ZONE,200,100,4600,70,14);
+        check(gesture.up(12,200,100,4650,physical,true,14)==-1,"a physical controller owner cannot receive a touch HUD edge");
+        Context fullMagazine=hud(70,3,known,actions&~bit(RELOAD));
+        gesture.down(12,TouchInput.HudGesture.AMMO_ZONE,200,100,4700,70,14);gesture.up(12,200,100,4750,fullMagazine,true,14);
+        check(gesture.poll(5100,c)==-1,"a full magazine tap cannot invent a delayed reload after another finger begins firing");
+        Context noMap=new Context(c.epoch,c.mode,c.capabilities,c.actions,c.frame,c.knownActions,c.weaponCount,c.grenadeCount,2,c.mapRect,c.ammoRect);
+        Context noAmmo=new Context(c.epoch,c.mode,c.capabilities,c.actions,c.frame,c.knownActions,c.weaponCount,c.grenadeCount,1,c.mapRect,c.ammoRect);
+        gesture.down(13,TouchInput.HudGesture.MAP_ZONE,100,100,5200,70,14);
+        check(gesture.up(13,100,100,5250,noMap,true,14)==-1,"a same-epoch vanished minimap cannot activate through its old captured hit box");
+        gesture.down(14,TouchInput.HudGesture.AMMO_ZONE,200,100,5300,70,14);
+        check(gesture.up(14,270,100,5350,noAmmo,true,14)==-1,"a same-epoch vanished ammo bar cannot switch weapons despite an available native route");
+        gesture.down(15,TouchInput.HudGesture.AMMO_ZONE,200,100,5400,70,14);gesture.up(15,200,100,5450,c,true,14);
+        check(gesture.poll(5500,noAmmo)==-1 && gesture.poll(5800,c)==-1,"ammo target loss before the tap timer expires discards reload rather than reviving it after HUD return");
+    }
+    private static void checkAutoRun() {
+        Sink manualSink=new Sink();TouchInput manual=new TouchInput(manualSink);
+        manual.configure(1,60,.22f,.55f,false);manual.setContext(play(79));
+        manual.down(1,TouchInput.MOVEMENT,-1,50,150);manual.move(1,50,54);
+        check(!manual.sprintLatched() && manualSink.last().held==bit(SPRINT) && manualSink.last().y==1,
+                "default-off latch still permits ordinary far-up held sprint");
+        manual.down(2,TouchInput.BUTTON,FIRE,500,300);
+        check(manualSink.last().held==bit(FIRE),"firing suppresses manual sprint without losing its movement owner");
+        manual.up(2,500,300);manual.up(1,50,54);manual.heartbeat();
+        check(!manual.sprintLatched() && manualSink.last().held==0 && manualSink.last().y==0,
+                "default-off latch never keeps movement or sprint after stick release");
+        manual.down(1,TouchInput.MOVEMENT,-1,50,150);manual.move(1,50,54);manual.stopRunning();
+        manual.up(1,50,54);
+        check(manualSink.last().held==0 && manualSink.last().y==0,"pause stops held sprint before its final pointer sample");
+        Sink sink=new Sink();TouchInput run=new TouchInput(sink);run.configure(1,60,.22f,.55f,false);run.autoSprint(true);run.setContext(play(80));
+        run.down(19,TouchInput.MOVEMENT,-1,50,150);run.move(19,50,90);
+        check(!run.sprintLatched() && sink.last().y==1 && (sink.last().held&bit(SPRINT))==0,"ordinary full forward is below the deliberate auto-run threshold");
+        run.move(19,100,50);check(!run.sprintLatched(),"a far diagonal cannot accidentally latch straight auto-run");
+        run.move(19,50,54);check(run.sprintLatched() && sink.last().held==bit(SPRINT),"far straight upward travel latches native sprint");
+        run.up(19,50,54);run.heartbeat();check(sink.last().x==0 && sink.last().y==1 && run.moving(),"auto-run survives stick release with visible stop target");
+        run.down(20,TouchInput.BUTTON,FIRE,500,300);run.move(20,510,300);
+        check(sink.last().held==bit(FIRE) && sink.last().y==1,"fire/look suppresses sprint while preserving latched forward movement");
+        int count=sink.packets.size();run.pulse(LAST_WEAPON);
+        check(sink.packets.get(count).held==(bit(FIRE)|bit(LAST_WEAPON)) && sink.last().held==bit(FIRE) && sink.last().y==1,
+                "HUD impulse preserves another finger's fire, look owner and auto-run axis");
+        run.down(21,TouchInput.MOVEMENT,-1,50,150);
+        check(!run.sprintLatched() && sink.last().y==0 && sink.last().held==bit(FIRE),"tap stick stops auto-run without releasing another fire owner");
+        run.up(20,510,300);run.move(21,50,54);run.move(21,50,140);run.up(21,50,140);
+        check(!run.sprintLatched() && sink.last().y==0,"pulling back into the stick center stops the latch");
+        run.down(21,TouchInput.MOVEMENT,-1,50,150);run.move(21,50,54);run.up(21,50,54);run.autoSprint(false);run.heartbeat();
+        check(sink.last().y==0 && sink.last().held==0,"disabling automatic sprint clears a released-stick latch");
+        run.autoSprint(true);run.down(21,TouchInput.MOVEMENT,-1,50,150);run.move(21,50,54);run.up(21,50,54);
+        run.setContext(new Context(81,MENU,UI_NAVIGATION,bit(BACK),2));
+        check(!run.sprintLatched() && sink.last().y==0,"pause context stops auto-run before menu input");
+        run.setContext(play(82));run.down(21,TouchInput.MOVEMENT,-1,50,150);run.move(21,50,54);run.stopRunning();
+        check(!run.sprintLatched() && sink.last().y==0,"Pause activation can stop the latch before the native menu snapshot arrives");
+        run.move(21,50,54);run.up(21,50,54);
+        check(!run.sprintLatched() && sink.last().y==0,"a stopped far-up owner cannot relatch on its final UP sample");
+        run.down(21,TouchInput.MOVEMENT,-1,50,150);run.move(21,50,54);run.stopRunning();run.move(21,50,140);run.move(21,50,54);
+        check(run.sprintLatched() && sink.last().y==1,"returning the stopped owner to neutral permits a deliberate new auto-run gesture");
+        run.up(21,50,54);run.cancel();run.setContext(play(83));
+        check(!run.sprintLatched() && sink.last().y==0 && sink.last().held==0,"focus/lifecycle cancellation never resumes automatic movement");
+        run.setContext(new Context(84,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,(1L<<26)-1,1));
+        run.down(21,TouchInput.MOVEMENT,-1,50,150);run.move(21,50,20);run.up(21,50,20);
+        check(!run.sprintLatched() && sink.last().y==0,"vehicle throttle never inherits on-foot auto-run");
+    }
+    private static void checkChatEntry() {
+        long oldActions=(1L<<26)-1;
+        long[] words={3,91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,oldActions,50,0,-1,-1,0,0,0,0,0,0,0,0,0};
+        Context old=Context.decode(words);
+        check(old.usable() && !old.allows(CHAT) && NativeTouchControls.radialActionCount(old,false)==8,
+                "an unchanged v3 native snapshot retains the original eight-sector menu");
+        words[4]|=bit(CHAT);
+        Context chat=Context.decode(words);
+        check(chat.usable() && chat.allows(CHAT) && NativeTouchControls.radialActionCount(chat,false)==9,
+                "the additive Say bit opens a ninth sector without changing v3 packet length or HUD metadata");
+        check(NativeTouchControls.radialActionCount(chat,true)==8,"legacy fallback cannot invent the original Say entry");
+        check(NativeTouchControls.radialActionCount(Context.unknown(),false)==8,"unknown native availability never exposes Chat");
+        Context physical=new Context(91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK|PHYSICAL_OWNS_INPUT,words[4],50);
+        check(NativeTouchControls.radialActionCount(physical,false)==8,"physical ownership cannot expose a usable Chat gesture");
+        Context menu=new Context(92,MENU,DIRECT_UI|UI_NAVIGATION,bit(BACK)|bit(CHAT),51);
+        check(NativeTouchControls.radialActionCount(menu,false)==8,"native menu actions do not become a gameplay Chat sector");
+        for(int sectors:new int[]{8,9}) {
+            for(int i=0;i<sectors;++i) {
+                double angle=i*Math.PI*2/sectors-Math.PI/2;
+                float x=220+(float)Math.cos(angle)*100,y=180+(float)Math.sin(angle)*100;
+                check(TouchLayout.radialSector(x,y,220,180,100,sectors)==i,"every radial sector matches its drawn control: "+sectors+"/"+i);
+                if(sectors==8) check(TouchLayout.radialSector(x,y,220,180,100)==i,"legacy radial API preserves eight-sector geometry");
+            }
+            check(TouchLayout.radialSector(220,180,220,180,100,sectors)==-1,"radial center cancels for "+sectors+" sectors");
+            check(TouchLayout.radialSector(220,350,220,180,100,sectors)==-1,"leaving the radial outer ring cancels for "+sectors+" sectors");
+        }
+        check(TouchLayout.radialSector(220,80,220,180,100,10)==-1,"unrecognized radial layouts fail closed");
+        check(TouchLayout.radialSector(220,80,220,180,Float.NaN,9)==-1,"invalid radius cannot dispatch an appended action");
+
+        Sink sink=new Sink();TouchInput input=new TouchInput(sink);input.configure(3,60,.22f,.55f,false);input.setContext(chat);
+        input.down(7,TouchInput.MOVEMENT,-1,100,500);input.move(7,100,320);
+        input.down(8,TouchInput.BUTTON,FIRE,1000,500);input.down(9,TouchInput.BUTTON,AIM,1100,500);
+        long existing=bit(FIRE)|bit(AIM);int count=sink.packets.size();input.pulse(CHAT);
+        check(sink.packets.size()==count+2 && sink.packets.get(count).held==(existing|bit(CHAT)) && sink.last().held==existing,
+                "Chat dispatches one original begin/end pair without releasing independent Fire or Aim");
+        near(sink.packets.get(count).y,1,"Chat pulse preserves the movement owner");
+        near(sink.last().yaw,0,"Chat entry never submits synthetic camera displacement");
+        input.down(10,TouchInput.BUTTON,CHAT,1200,500);
+        check(sink.last().held==(existing|bit(CHAT)),"appended action passes the real pointer-down bound");
+        count=sink.packets.size();input.pulse(CHAT);check(sink.packets.size()==count,"an already owned Chat action cannot retrigger");
+        input.setContext(old);
+        check(sink.last().held==existing && sink.last().y==1,"live Say revocation releases only Chat and retains other owners");
+        input.up(10,1200,500);check(sink.last().held==existing,"a revoked pointer-up cannot restore the old Chat hold");
+        count=sink.packets.size();input.pulse(CHAT);input.pulse(CHAT+1);
+        check(sink.packets.size()==count,"unavailable Say and the next unknown action cannot dispatch");
+        input.setContext(chat);input.down(11,TouchInput.BUTTON,CHAT,1200,500);
+        input.setContext(new Context(92,TEXT_INPUT,0,0,51));
+        check(sink.last().held==0 && sink.last().y==0,"original chat focus transition retires all gameplay touch owners");
+        count=sink.packets.size();input.pulse(CHAT);check(sink.packets.size()==count,"text input cannot reopen or send Chat");
+        input.setContext(physical);count=sink.packets.size();input.pulse(CHAT);input.down(12,TouchInput.BUTTON,CHAT,1200,500);
+        check(sink.packets.size()==count,"physical takeover rejects both Chat transport entry points");
+        input.cancel();count=sink.packets.size();input.pulse(CHAT);
+        check(sink.resets==1 && sink.packets.size()==count,"lifecycle cancellation requires a fresh native context before Chat");
+    }
+    public static void main(String[] args) throws ReflectiveOperationException {
+        checkChatEntry();
+        checkHudGestures();checkAutoRun();checkReferenceCluster();checkObjectiveHud();
+        TouchPreferences hints=new TouchPreferences();
+        check(!hints.mapTapHintSeen && !hints.weaponGestureHintSeen,"one-shot HUD hints begin unseen");
+        hints.markHintSeen(false);hints.save();hints.reload();
+        check(hints.mapTapHintSeen && !hints.weaponGestureHintSeen,"map hint acknowledgement persists without consuming the weapon hint");
+        hints.markHintSeen(true);hints.resetTouch();hints.reload();
+        check(hints.mapTapHintSeen && hints.weaponGestureHintSeen,"layout reset preserves both one-shot acknowledgements");
+        for(int kind=TouchPreferences.HINT_GAME_MORE;kind<=TouchPreferences.HINT_LAYOUT;++kind) {
+            check(!hints.hintSeen(kind),"new tutorial begins unseen independently: "+kind);
+            hints.markHintSeen(kind);hints.save();hints.reload();
+            check(hints.hintSeen(kind),"tutorial acknowledgement survives settings save and reload: "+kind);
+            if(kind<TouchPreferences.HINT_LAYOUT) check(!hints.hintSeen(kind+1),"showing one tutorial does not consume the next");
+        }
+        hints.resetTouch();hints.reload();
+        for(int kind=TouchPreferences.HINT_MAP;kind<=TouchPreferences.HINT_LAYOUT;++kind)
+            check(hints.hintSeen(kind),"Reset Controls retains every presented tutorial: "+kind);
+        Context mapMenu=new Context(1,MENU,DIRECT_UI|UI_NAVIGATION|MAP_GESTURES,bit(BACK),1);
+        check(NativeTouchControls.menuPointerAllowed(mapMenu,-1,0,false),"map first pointer is admitted");
+        check(NativeTouchControls.menuPointerAllowed(mapMenu,7,1,false),"map second native UI pointer reaches the real pinch handler");
+        check(!NativeTouchControls.menuPointerAllowed(mapMenu,7,1,true),"map pinch cannot press an overlay navigation button");
+        check(!NativeTouchControls.menuPointerAllowed(mapMenu,7,0,false),"overlay-owned first pointer cannot become a pinch");
+        check(!NativeTouchControls.menuPointerAllowed(mapMenu,7,2,false),"third map pointer cancels the sequence");
+        check(!NativeTouchControls.menuPointerAllowed(new Context(1,MENU,DIRECT_UI,bit(BACK),1),7,1,false),
+                "other native menus retain second-pointer cancellation");
+        for (int percent=50; percent<=150; percent+=10)
+            check(TouchPreferences.renderPercent(percent)==percent,"render scale preserves ten-percent steps");
+        check(TouchPreferences.renderPercent(54)==50 && TouchPreferences.renderPercent(55)==60,
+                "render scale rounds to nearest ten percent");
+        check(TouchPreferences.renderPercent(-1)==50 && TouchPreferences.renderPercent(999)==150,
+                "render scale bounds");
+        check(TouchPreferences.renderPercent(Float.NaN)==50 && TouchPreferences.renderPercent(Float.POSITIVE_INFINITY)==50,
+                "invalid render scale restores native default");
+        for(int percent=100;percent<=200;percent+=10)
+            check(TouchPreferences.uiPercent(percent)==percent,"interface scale preserves ten-percent steps");
+        check(TouchPreferences.uiPercent(125)==125 && TouchPreferences.uiPercent(124)==120 && TouchPreferences.uiPercent(126)==130,
+                "interface preserves its special default and rounds other values to the grid");
+        check(TouchPreferences.uiPercent(-1)==100 && TouchPreferences.uiPercent(999)==200,
+                "interface scale is bounded independently of render scale");
+        check(TouchPreferences.uiPercent(Float.NaN)==125 && TouchPreferences.uiPercent(Float.POSITIVE_INFINITY)==125,
+                "invalid interface scale restores the 125-percent default");
+        int[] settings={5,1,0,100,Float.floatToIntBits(.42f),Float.floatToIntBits(1),
+            Float.floatToIntBits(.22f),Float.floatToIntBits(.55f),0,0,0,0,1,1,
+            Float.floatToIntBits(1),Float.floatToIntBits(.4f),0,1,1,0,125,0,0};
+        settings=java.util.Arrays.copyOf(settings,37);
+        java.util.Arrays.fill(settings,24,35,-1);
+        check(TouchPreferences.validSettingsWire(settings),"native settings protocol admits bounded full vector");
+        int[] defaults = settings.clone();
+        settings[0]=1;
+        check(!TouchPreferences.validSettingsWire(settings),"legacy version cannot be accepted with a new-sized vector");
+        settings[0]=2;
+        check(!TouchPreferences.validSettingsWire(settings),"v2 cannot silently accept FPS fields");
+        settings[0]=3;
+        check(!TouchPreferences.validSettingsWire(settings),"v3 cannot silently accept graphics fields");
+        settings[0]=4;
+        check(!TouchPreferences.validSettingsWire(settings),"v4 cannot silently accept performance fields");
+        settings[0]=5;
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,35)),"old field count cannot be accepted as v5");
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,38)),"extra fields cannot be accepted as v5");
+        for(int fps:new int[]{0,30,60,90}) {
+            settings[22]=fps;
+            check(TouchPreferences.validSettingsWire(settings),"exact selectable FPS mode admitted: "+fps);
+        }
+        for(int fps:new int[]{-1,1,29,45,59,120,Float.floatToIntBits(60)}) {
+            settings[22]=fps;
+            check(!TouchPreferences.validSettingsWire(settings),"arbitrary FPS cap rejected: "+fps);
+        }
+        settings[22]=0;settings[21]=2;
+        check(!TouchPreferences.validSettingsWire(settings),"showFPS must be a boolean");settings[21]=0;
+        for(int invalidPercent:new int[]{0,99,126,199,201,Float.floatToIntBits(125)}) {
+            settings[20]=invalidPercent;
+            check(!TouchPreferences.validSettingsWire(settings),"malformed global UI percent rejected: "+invalidPercent);
+        }
+        settings[20]=125;
+        settings[6]=Float.floatToIntBits(Float.NaN);
+        check(!TouchPreferences.validSettingsWire(settings),"native settings reject nonfinite slider values");
+        settings[6]=Float.floatToIntBits(.22f);settings[11]=2;
+        check(!TouchPreferences.validSettingsWire(settings),"native settings reject malformed microphone flag");
+        settings[11]=0;settings[2]=16;
+        check(!TouchPreferences.validSettingsWire(settings),"native settings reject unknown commands");
+        settings[2]=8;
+        check(TouchPreferences.validSettingsWire(settings),"native debug preference explicitly edited flag admitted");
+        settings[2]=0;settings[19]=-1;
+        check(!TouchPreferences.validSettingsWire(settings),"native debug default must resolve to a boolean before persistence");
+        TouchPreferences preferences = new TouchPreferences();
+        check(preferences.uiPercent==125 && preferences.renderPercent==50 && !preferences.potatoGraphics,
+                "new graphics default is render50 and Potato OFF; UI remains125");
+        for (int value : preferences.advancedGraphics) check(value==-1,"absent graphics preference preserves original runtime default");
+        check(preferences.performance[0] && preferences.performance[1],"absent performance choices default ON");
+        for(int invalid:new int[]{-1,2,Float.floatToIntBits(1)}) {
+            settings[35]=invalid;check(!TouchPreferences.validSettingsWire(settings),"visibility optimization must be boolean");
+            settings[35]=0;settings[36]=invalid;check(!TouchPreferences.validSettingsWire(settings),"audio optimization must be boolean");
+            settings[36]=0;
+        }
+        settings[23]=2;check(!TouchPreferences.validSettingsWire(settings),"Potato must be boolean");settings[23]=0;
+        settings[24]=2;check(!TouchPreferences.validSettingsWire(settings),"graphics toggle must be boolean or original default");settings[24]=-1;
+        settings[34]=5;check(!TouchPreferences.validSettingsWire(settings),"anisotropy index bounded to proven choices");settings[34]=-1;
+        java.lang.reflect.Field storeField=TouchPreferences.class.getDeclaredField("store");
+        storeField.setAccessible(true);
+        java.util.Properties store=(java.util.Properties)storeField.get(preferences);
+        java.util.Properties hintStore=(java.util.Properties)storeField.get(hints);
+        java.io.ByteArrayOutputStream hintBytes=new java.io.ByteArrayOutputStream();
+        try { hintStore.store(hintBytes,"cold tutorial preference check"); }
+        catch(java.io.IOException error) { throw new AssertionError(error); }
+        TouchPreferences coldHints=new TouchPreferences();
+        java.util.Properties coldStore=(java.util.Properties)storeField.get(coldHints);
+        try { coldStore.load(new java.io.ByteArrayInputStream(hintBytes.toByteArray())); }
+        catch(java.io.IOException error) { throw new AssertionError(error); }
+        coldHints.reload();coldHints.leftHanded=true;coldHints.save();coldHints.reload();
+        for(int kind=TouchPreferences.HINT_MAP;kind<=TouchPreferences.HINT_LAYOUT;++kind)
+            check(coldHints.hintSeen(kind),"fresh preferences retain every acknowledged tutorial through an unrelated control edit: "+kind);
+        coldHints.markHintSeen(99);
+        check(!coldHints.hintSeen(99),"unknown tutorial IDs cannot create acknowledgements");
+        check(!preferences.autoSprint && !preferences.showFPS && preferences.fpsLimit==0,
+                "absent optional latch and FPS preferences use OFF/OFF/display");
+        store.setProperty("autoSprint","true");preferences.reload();
+        check(!preferences.autoSprint,"old materialized autoSprint default is not an opt-in to the new latch");
+        store.setProperty("autoRunLatch","true");preferences.reload();preferences.save();preferences.reload();
+        check(preferences.autoSprint,"explicit new latch opt-in survives ordinary settings save and restart");
+        preferences.resetTouch();preferences.reload();
+        check(!preferences.autoSprint,"Reset Controls restores optional latch OFF");
+        for(int fps:new int[]{0,30,60,90}) {
+            preferences.fpsLimit=fps;preferences.showFPS=fps!=0;preferences.save();preferences.reload();
+            check(preferences.fpsLimit==fps && preferences.showFPS==(fps!=0),"FPS mode and counter persist independently: "+fps);
+        }
+        for(String bad:new String[]{"29","45","120","NaN","Infinity","not a number"}) {
+            store.setProperty("fpsLimit",bad);preferences.reload();
+            check(preferences.fpsLimit==0,"bad persisted FPS limit restores display mode: "+bad);
+        }
+        String[] corruptUi={"99","126","201","NaN","Infinity","not a number"};
+        int[] normalizedUi={100,130,200,125,125,125};
+        for(int i=0;i<corruptUi.length;++i) {
+            store.setProperty("uiPercent",corruptUi[i]);preferences.reload();
+            check(preferences.uiPercent==normalizedUi[i],"loading malformed UI preference produces a bounded wire value");
+        }
+        preferences.renderPercent=90;preferences.uiPercent=126;preferences.save();preferences.reload();
+        check(preferences.uiPercent==130 && preferences.renderPercent==90,"saved UI percentage normalizes independently of rendering");
+        preferences.uiPercent=125;preferences.save();preferences.reload();
+        check(preferences.uiPercent==125 && "125".equals(store.getProperty("uiPercent")),"125-percent default survives save and reload exactly");
+        check(preferences.settingsWire(1).length==36 && preferences.settingsWire(1)[0]==5
+                && preferences.settingsWire(1)[19]==125,"new FPS fields leave the UI and Debug IDs unchanged");
+        int[] edited = defaults.clone();
+        edited[1]=2; edited[2]=8; edited[3]=110;
+        edited[4]=Float.floatToIntBits(.8f); edited[5]=Float.floatToIntBits(1.4f);
+        edited[6]=Float.floatToIntBits(.8f); edited[7]=Float.floatToIntBits(.8f);
+        edited[8]=1; edited[9]=1; edited[10]=0; edited[12]=0; edited[13]=0;
+        edited[14]=Float.floatToIntBits(3); edited[15]=Float.floatToIntBits(3);
+        edited[16]=1; edited[17]=0; edited[18]=0; edited[20]=190;
+        check(preferences.applySettingsWire(edited),"native control edits admitted before reset");
+        preferences.position(FIRE,.15f,.28f);
+        int[] editedAndReset=edited.clone();
+        editedAndReset[1]=3; editedAndReset[2]=2|8;
+        editedAndReset[3]=150; editedAndReset[11]=1; editedAndReset[19]=1; editedAndReset[20]=200;
+        editedAndReset[21]=1;editedAndReset[22]=60;
+        editedAndReset[23]=1;editedAndReset[24]=0;editedAndReset[34]=2;
+        editedAndReset[35]=0;editedAndReset[36]=1;
+        check(preferences.applySettingsWire(editedAndReset),"one poll admits both newer values and Reset");
+        int[] expected=defaults.clone(); expected[3]=150; expected[11]=1; expected[19]=1; expected[20]=200;
+        expected[21]=1;expected[22]=60;
+        expected[23]=1;expected[24]=0;expected[34]=2;
+        expected[35]=0;expected[36]=1;
+        int[] applied=preferences.settingsWire(3);
+        for(int i=3;i<expected.length;++i)
+            check(applied[i-1]==expected[i],"combined Reset restores control defaults and retains non-touch choices field "+(i-3));
+        near(preferences.x(FIRE,.82f),.82f,"Reset removes custom horizontal layout position");
+        near(preferences.y(FIRE,.75f),.75f,"Reset removes custom vertical layout position");
+        preferences.reload();
+        check(preferences.uiPercent==200 && preferences.renderPercent==150 && preferences.microphoneEnabled && preferences.debugMenuVisible
+                && preferences.showFPS && preferences.fpsLimit==60 && preferences.potatoGraphics
+                && preferences.advancedGraphics[0]==0 && preferences.advancedGraphics[10]==2,
+                "Reset persists global UI, graphics, microphone, explicit Debug and FPS while clearing combat preferences");
+        check(!preferences.performance[0] && preferences.performance[1],"performance OFF/ON choices persist across touch reset and reload");
+        int[] invalidReset=editedAndReset.clone(); invalidReset[6]=Float.floatToIntBits(Float.NaN);
+        preferences.position(FIRE,.2f,.3f);
+        check(!preferences.applySettingsWire(invalidReset),"malformed combined packet cannot reset preferences");
+        near(preferences.x(FIRE,.82f),.2f,"rejected Reset preserves existing layout");
+        TouchPreferences inheritedDebug=new TouchPreferences();
+        int[] inheritedReset=defaults.clone(); inheritedReset[2]=2; inheritedReset[19]=1;
+        check(inheritedDebug.applySettingsWire(inheritedReset),"Reset accepts the resolved build default");
+        check(inheritedDebug.debugMenuVisible && inheritedDebug.settingsWire(1)[18]==-1,
+                "Reset preserves resolved Debug without persisting an unedited build default");
+        check(!Context.unknown().legacyFallback(), "unknown context hides fallback");
+        check(!new Context(1,LOADING,0,0,1).legacyFallback(), "loading hides fallback");
+        check(!new Context(1,CINEMATIC,0,0,1).legacyFallback(), "cinematic without skip hides fallback");
+        check(new Context(1,FRONTEND,0,0,1).legacyFallback(), "press start keeps stock confirm");
+        check(new Context(1,MENU,0,0,1).legacyFallback(), "native canvas menu keeps fallback");
+        check(new Context(1,GAMEPLAY,0,0,1).legacyFallback(), "unsupported gameplay keeps stock input");
+        check(!play(1).legacyFallback(), "native gameplay owns input");
+        check(!new Context(1,MENU,PHYSICAL_OWNS_INPUT,0,1).legacyFallback(), "physical owner hides fallback");
         Sink sink=new Sink(); TouchInput input=new TouchInput(sink);
         input.configure(2,60,.22f,.5f,false); input.setContext(play(1));
         input.down(47,TouchInput.MOVEMENT,-1,0,0);
@@ -53,6 +555,10 @@ public final class TouchInputTest {
         input.move(3,120,120);
         near(sink.last().yaw,1.1f,"ADS gain applied once");
         near(sink.last().pitch,-1.1f,"pitch convention up-positive");
+        input.relativeLook(2,-4);
+        near(sink.last().yaw,1,"gyro shares ADS gain exactly once");
+        near(sink.last().pitch,-2,"gyro uses independent vertical sign");
+        check((sink.last().held&bit(AIM))!=0,"gyro preserves held aim owner");
         input.cancel();
         int count=sink.packets.size(); input.move(3,300,300); input.down(3,TouchInput.LOOK,-1,0,0);
         check(sink.resets==1 && sink.packets.size()==count,"lifecycle clears and rejects stale input");
@@ -61,6 +567,8 @@ public final class TouchInputTest {
         check(sink.last().x==0 && sink.last().yaw==0,"menu cannot move even with bad capability publication");
         input.down(4,TouchInput.BUTTON,BACK,0,0);
         check(sink.last().held==bit(BACK),"menu semantic action allowed");
+        count=sink.packets.size();input.relativeLook(10,10);
+        check(sink.packets.size()==count,"menu suppresses sensor look despite invalid relative capability");
         input.setContext(new Context(4,GAMEPLAY,GAMEPLAY_INPUT|PHYSICAL_OWNS_INPUT,(1L<<25)-1,3));
         count=sink.packets.size(); input.down(7,TouchInput.BUTTON,FIRE,0,0);
         check(sink.packets.size()==count,"physical takeover rejects touch");
@@ -79,6 +587,77 @@ public final class TouchInputTest {
         other.setContext(new Context(1,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,0,1));
         check(batched.last().y==1 && batched.last().held==0,"revoked action releases alone");
         ArrayList<float[]> rects=new ArrayList<>();
+        check(TouchLayout.radialSector(0,-100,0,0,100)==0,"top sector stable");
+        check(TouchLayout.radialSector(100,0,0,0,100)==2,"right sector stable");
+        check(TouchLayout.radialSector(0,0,0,0,100)==-1,"center cancels");
+        check(TouchLayout.radialSector(Float.NaN,0,0,0,100)==-1,"invalid radial coordinates cancel");
+        Sink sprintSink=new Sink();TouchInput sprint=new TouchInput(sprintSink);
+        sprint.autoSprint(true);sprint.configure(1,60,.22f,.5f,false);sprint.setContext(play(20));
+        sprint.down(33,TouchInput.MOVEMENT,-1,0,0);sprint.move(33,0,-60);
+        check((sprintSink.last().held&bit(SPRINT))==0,"ordinary full forward does not latch automatic running");
+        sprint.down(44,TouchInput.BUTTON,AIM,500,300);
+        check((sprintSink.last().held&bit(SPRINT))==0,"aim stops automatic sprint");
+        sprint.move(44,520,300);near(sprintSink.last().yaw,2.2f,"aim drag looks with ADS gain");
+        sprint.up(33,0,-60);check(sprintSink.last().x==0 && sprintSink.last().y==0,"movement owner release stops movement");
+        sprint.cancel();check(sprintSink.resets==1,"cancel releases aim and sprint");
+        Sink toggleSink=new Sink();TouchInput toggle=new TouchInput(toggleSink);
+        toggle.aimToggle(true);toggle.setContext(play(30));
+        toggle.down(6,TouchInput.BUTTON,AIM,100,100);
+        toggle.up(6,100,100);
+        check(toggleSink.last().held==bit(AIM),"tap ADS latches aim for two-thumb movement and fire");
+        toggle.down(42,TouchInput.BUTTON,FIRE,500,300);toggle.move(42,510,300);
+        check(toggleSink.last().held==(bit(AIM)|bit(FIRE)),"ADS latch permits simultaneous fire and drag-look");
+        toggle.down(6,TouchInput.BUTTON,AIM,100,100);toggle.down(7,TouchInput.BUTTON,AIM,100,100);
+        check(toggleSink.last().held==bit(FIRE),"second simultaneous ADS owner cannot retrigger toggle");
+        toggle.up(6,100,100);toggle.up(7,100,100);toggle.up(42,510,300);
+        check(toggleSink.last().held==0,"second ADS tap ends the latched aim");
+        toggle.down(6,TouchInput.BUTTON,AIM,100,100);toggle.up(6,100,100);
+        toggle.setContext(new Context(30,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,bit(FIRE),1));
+        check(toggleSink.last().held==0,"revoking Aim clears the latch alone");
+        toggle.setContext(play(31));toggle.down(6,TouchInput.BUTTON,AIM,100,100);toggle.up(6,100,100);
+        toggle.cancel();toggle.setContext(play(32));
+        check(toggleSink.last().held==0,"lifecycle cancellation never restores toggled ADS");
+        TouchGyro gyro=new TouchGyro();
+        long sample=1_000_000_000L;
+        gyro.orientation(1,0,0,0,sample,0,1,0,false);
+        near(gyro.delta[0],0,"first sensor sample establishes a neutral baseline");
+        float half=(float)Math.toRadians(5);
+        gyro.orientation((float)Math.cos(half),0,(float)Math.sin(half),0,sample+20_000_000,0,1,0,false);
+        near(gyro.delta[0],10,"ten degree physical yaw maps to ten semantic degrees");
+        near(gyro.delta[1],0,"pure yaw does not rotate pitch");
+        gyro.orientation(-(float)Math.cos(half),0,-(float)Math.sin(half),0,sample+40_000_000,0,1,0,false);
+        near(gyro.delta[0],0,"quaternion sign discontinuity cannot turn the camera");
+        gyro.reset();gyro.orientation(1,0,0,0,sample,0,1,0,false);
+        gyro.orientation((float)Math.cos(half),(float)Math.sin(half),0,0,sample+20_000_000,0,1,0,false);
+        near(gyro.delta[1],-10,"physical pitch uses up-positive semantic camera convention");
+        near(gyro.delta[0],0,"pure pitch does not rotate yaw");
+        gyro.orientation(1,0,0,0,sample+300_000_000,0,1,0,false);
+        near(gyro.delta[0],0,"sensor suspension discards accumulated physical rotation");
+        gyro.reset();
+        gyro.velocity(1,0,sample,1,1,0,false);
+        gyro.velocity(1,0,sample+20_000_000,1,1,0,false);
+        near(gyro.delta[0],-(float)Math.toDegrees(.02),"landscape gyro remaps device X to screen yaw");
+        near(gyro.delta[1],0,"landscape yaw has no pitch cross-axis");
+        gyro.velocity(1,0,sample+40_000_000,3,1,0,false);
+        near(gyro.delta[0],0,"display rotation rebaselines sensor");
+        gyro.velocity(1,0,sample+60_000_000,3,1,0,false);
+        near(gyro.delta[0],(float)Math.toDegrees(.02),"reverse landscape has the matching horizontal sign");
+        gyro.reset();gyro.velocity(.005f,0,sample,0,1,.4f,false);
+        gyro.velocity(.005f,0,sample+20_000_000,0,1,.4f,false);
+        near(gyro.delta[1],0,"stationary gyro noise stays inside velocity deadzone");
+        gyro.velocity(1,0,sample+40_000_000,0,1,0,true);
+        near(gyro.delta[1],(float)Math.toDegrees(.02),"gyro inversion changes only its own vertical direction");
+        gyro.velocity(Float.NaN,0,sample+60_000_000,0,1,0,false);
+        near(gyro.delta[1],0,"invalid sensor sample is neutral and resets tracking");
+        gyro.velocity(1,0,sample+80_000_000,0,1,0,false);
+        near(gyro.delta[1],0,"valid sample after sensor fault establishes a baseline");
+        float splitYaw=0;gyro.reset();gyro.velocity(0,1,sample,0,1,.4f,false);
+        for (int i=1; i<=5; ++i) {
+            gyro.velocity(0,1,sample+i*10_000_000L,0,1,.4f,false);splitYaw+=gyro.delta[0];
+        }
+        gyro.reset();gyro.velocity(0,1,sample,0,1,.4f,false);
+        gyro.velocity(0,1,sample+50_000_000L,0,1,.4f,false);
+        near(gyro.delta[0],splitYaw,"sensor batching and frame rate cannot change integrated aim distance");
         for(int i=0;i<14;i++) {
             float[] r=TouchLayout.place(550,150,48,210,64,600,270,4,4,rects);
             check(r!=null,"compact layout must place all actions");
@@ -86,6 +665,35 @@ public final class TouchInputTest {
             for(float[] prior:rects) check(!TouchLayout.overlaps(r,prior,4),"no overlapping touch targets");
             rects.add(r);
         }
-        System.out.println("TouchInputTest: pointer, lifecycle, look, admission and 14-target geometry checks passed");
+        for(float scale:new float[]{.85f,1,1.4f}) for(boolean leftHanded:new boolean[]{false,true}) {
+            checkHudLayout(2424,1080,2.625f,0,63,0,82,scale,leftHanded);
+            checkHudLayout(1920,1080,2.625f,0,63,0,82,scale,leftHanded);
+            checkHudLayout(1280,720,2,24,24,24,32,scale,leftHanded);
+            checkHudLayout(1024,768,2,0,24,0,32,scale,leftHanded);
+        }
+        ArrayList<float[]> hud=new ArrayList<>();
+        TouchLayout.reserveGameplayHud(0,0,2424,1080,hud);
+        float[] oldAim={2025,357,2151,483};
+        check(TouchLayout.overlaps(oldAim,hud.get(0),0),"regression fixture reproduces Aim covering the408 objective checkbox");
+        TouchPreferences custom=new TouchPreferences();
+        check(!NativeTouchControls.customPosition(custom,AIM),"default positions receive HUD reservations");
+        custom.position(AIM,2088f/2424,(420-63f)/(998-63));
+        check(NativeTouchControls.customPosition(custom,AIM),"explicitly saved former default remains a custom choice");
+        float[] chosen=TouchLayout.place(2088,420,126,0,0,2424,1080,10.5f,10.5f,new ArrayList<float[]>());
+        near(chosen[0],2025,"custom placement can retain its chosen HUD-overlapping position");
+        near(custom.x(AIM,0),2088f/2424,"layout placement does not rewrite saved coordinates");
+        custom.position(AIM,0,1);
+        check(NativeTouchControls.customPosition(custom,AIM),"saved edge coordinates are not mistaken for absent positions");
+        custom.position(PAUSE,.25f,.55f);custom.save();custom.reload();
+        float[] pause=TouchLayout.placeGameplay(PAUSE,custom.x(PAUSE,0),custom.y(PAUSE,0),88,
+                0,0,1200,800,2,true,true,new ArrayList<float[]>(),new ArrayList<float[]>());
+        check(pause!=null,"configured Pause remains a movable control");
+        near((pause[0]+pause[2])/2,300,"saved Pause follows its selected horizontal position without left-hand mirroring");
+        near((pause[1]+pause[3])/2,440,"saved Pause is not forced back to the default top strip");
+        ArrayList<float[]> offsetHud=new ArrayList<>();
+        TouchLayout.reserveGameplayHud(22,10,2446,1090,offsetHud);
+        for(int i=0;i<hud.size();++i) for(int axis=0;axis<4;++axis)
+            near(offsetHud.get(i)[axis],hud.get(i)[axis]+(axis%2==0?22:10),"HUD reservation follows Surface origin independently of safe insets");
+        System.out.println("TouchInputTest: HUD gestures, held action margins, pointer lifecycle, tutorials, settings v5, render50, graphics/performance persistence and reset passed");
     }
 }

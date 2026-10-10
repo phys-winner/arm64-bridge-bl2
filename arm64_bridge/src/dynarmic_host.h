@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(BL2_NATIVE_ARM32)
+#include "../../arm32_compat/src/native_host.h"
+#else
+
 #include <cstdint>
 #include <cstddef>
 #include <memory>
@@ -9,10 +13,16 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/A32/config.h>
 #include <dynarmic/interface/exclusive_monitor.h>
+#include "bl2_jit_warmup.h"
+#include "bl2_jit_learning.h"
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+#include "bl2_physx_cookie_watch.h"
+#endif
 
 class ElfLoader;
 class ThunkManager;
@@ -31,6 +41,24 @@ public:
     bool Initialize();
     bool LoadGame(const std::string& elf_path);
     bool LoadGameFromMemory(const uint8_t* data, size_t size);
+    // Install only after the JNI loader verified the pinned original guest.
+    bool InstallJitWarmupTable(std::span<const uint8_t> bytes);
+    // Learned warmup (bl2_jit_learning): blocks compiled by the warmed roles
+    // are persisted in `directory`; the next run precompiles them at entry
+    // (bounded) and in later idle callbacks. debug.bl2.jit_learn=0 disables.
+    void LoadLearnedJitProfile(const std::string& directory);
+    // Asks the background saver for a write now; never blocks the caller.
+    void RequestLearnedJitSave();
+    // From a host callback of `jit` on its own thread: spend up to budget_ns
+    // translating learned blocks of that core's role. No-op for other cores.
+    void WarmLearnedBlocksInCallback(Dynarmic::A32::Jit& jit, uint64_t budget_ns);
+    void RecordLearnedBlock(size_t role, uint64_t descriptor);
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    // JNI calls this only after the pinned original guest passed verification.
+    bool InstallPhysxCookieWatch(bool verified_original);
+    static Bl2PhysxCookieWatch::NativeToken BeginPhysxNativeWrite(uint32_t address, size_t bytes);
+    static void EndPhysxNativeWrite(const Bl2PhysxCookieWatch::NativeToken& token);
+#endif
 
     bool LoadLibraries(const std::string& fmodex_path, const std::string& fmodevent_path, const std::string& game_path);
     bool LoadLibrariesFromMemory(const uint8_t* fmodex_data, size_t fmodex_size,
@@ -46,6 +74,9 @@ public:
     // unlike RunFunction it must never silently defer the result.
     uint32_t RunGuestCallback(uint32_t target_pc, const std::vector<uint32_t>& args = {});
     uint64_t RunGuestCallback64(uint32_t target_pc, const std::vector<uint32_t>& args = {});
+    // Checked synchronous UI call at an owned JIT thunk boundary. Never defers
+    // a required result or replaces an interrupted architectural context.
+    bool CallGuest(uint32_t target_pc, const std::vector<uint32_t>& args, uint32_t& result);
     // Runs calls that were made from inside a thunk (i.e. from inside Jit::Run, where the JIT
     // is not re-entrant). Call once per frame from a point known to be outside the JIT.
     void DrainDeferred();
@@ -75,12 +106,38 @@ public:
     void GuestFree(uint32_t addr);
     // Payload size of a live GuestAlloc block, 0 if addr did not come from here.
     uint32_t GuestAllocSize(uint32_t addr);
+    // BL2 only: blocks above the largest size class come from their own range
+    // at the top of the guest space, [kLargeBase, kLargeLimit), whose free
+    // spans are address-ordered and coalesce like bionic's mmap-backed large
+    // allocations. The shared heap kept freed level-load buffers in exact-size
+    // and power-of-two lists: 533 MiB free yet no 55 MiB span, so a shader
+    // cache malloc returned NULL. File mappings then stop at kLargeBase.
+    // Returns false (and leaves the shared heap in charge) on a failed check.
+    bool EnableLargeBlockRegion();
+    // Anonymous RW guest heap (shared heap or large range, including guest
+    // stacks): never file-backed, safe for direct host access by fast paths.
+    static constexpr bool IsHeapRange(uint64_t address, uint64_t size) {
+        return (address >= kHeapBase && address + size <= kHeapLimit) ||
+               (address >= kLargeBase && address + size <= kLargeLimit);
+    }
+
     // Address space for whole-file mappings (the mmap thunk), deliberately outside the
     // malloc heap: one expansion file can be hundreds of megabytes and would otherwise eat
     // the arena permanently -- a 345 MB .obb mapped twice is how "GuestAlloc out of guest
     // heap" showed up right after loading started. Bump-only, never freed: these mappings
     // live for the process and the address is never reused.
     uint32_t GuestAllocMapping(size_t size, size_t alignment);
+
+    // Bottom of the guest space: exit traps and SVC trampolines. Native Android
+    // maps nothing there, so a store is a NULL-based write that native code
+    // faults on; here one silently rewrote the trampolines and exit traps (a
+    // shader-cache copy at 0x10000, game thread spinning). After Initialize the
+    // host pages are read-only: guest stores are dropped and reported (tag
+    // BL2LowGuard); the bridge writes its runtime trampolines through
+    // WriteLowGuardWord.
+    static constexpr uint32_t kLowGuardEnd = 0x00020000;
+    void WriteLowGuardWord(uint32_t vaddr, uint32_t value);
+    void ReportLowGuardWrite(uint32_t vaddr, size_t bytes);
 
     // Runaway-PC containment. The loaded modules and the trampoline page are
     // covered automatically; register anything else that legitimately holds guest
@@ -122,19 +179,33 @@ public:
     bool IsJitRunning() const;
 
 private:
+#if defined(HORN_PHYSX_COOKIE_TEST_ACCESS)
+    friend struct PhysxCookieIntegrationAccess;
+#endif
     struct ThreadContext {
         size_t slot = 0;
         size_t primary_processor_id = 0;
         size_t callback_processor_id = 0;
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+        // Declared before Jits: reverse destruction destroys them before their table.
+        std::unique_ptr<Bl2PhysxPageTable> physx_table;
+        Bl2PhysxCookieWatch physx_cookie;
+#endif
         std::unique_ptr<Dynarmic::A32::Jit> jit;
         std::unique_ptr<Dynarmic::A32::Jit> callback_jit;
+        std::unique_ptr<Dynarmic::A32::Jit> sync_jit;
         std::recursive_mutex mutex;
         bool is_running_jit = false;
         bool is_running_callback_jit = false;
+        bool is_running_sync_jit = false;
+        uint8_t warmed_roles = 0;
         uint32_t stack_base = 0;
         uint32_t primary_stack_capacity = 0;
         uint32_t stack_top = 0;
         uint32_t callback_stack_top = 0;
+        // Allocated once with sync_jit, retained for context reuse. All cores
+        // are destroyed before the host releases this guest arena.
+        uint32_t sync_stack_top = 0;
         std::vector<std::pair<uint32_t, std::vector<uint32_t>>> deferred;
     };
 
@@ -145,6 +216,21 @@ private:
     std::unique_ptr<ElfLoader> m_fmodevent_loader;
     std::unique_ptr<ElfLoader> m_elf_loader;
     std::unique_ptr<ThunkManager> m_thunk_manager;
+    Bl2JitWarmup m_jit_warmup;
+    // Leaked with the process: the background saver may outlive teardown.
+    bl2::jit::LearnedProfile* m_learned_jit = nullptr;
+    void WarmLearnedAtEntry(Dynarmic::A32::Jit& jit, size_t role);
+    uint32_t m_warm_native_render = 0;
+    uint32_t m_warm_thread_proc = 0;
+    uint32_t m_warm_render_vtable = 0;
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    bool m_physx_cookie_installed = false;
+    void PreparePhysxCookieCore(ThreadContext& context, uint32_t target_pc);
+    void RetirePhysxCookieCore(ThreadContext& context); // caller holds collection lock; owner idle
+    void PhysxCookieEntry(Dynarmic::A32::Jit& jit);
+    void PhysxCookieExit(Dynarmic::A32::Jit& jit);
+    void ReportPhysxCookie(Dynarmic::A32::Jit& jit);
+#endif
 
     static constexpr size_t kMaxThreadContexts = 64;
     static constexpr uint32_t kDefaultPrimaryStackSize = 2u * 1024u * 1024u;
@@ -155,15 +241,24 @@ private:
     std::vector<std::unique_ptr<ThreadContext>> m_contexts;
     std::vector<size_t> m_free_context_slots;
     std::recursive_mutex m_failed_context_mutex;
+    std::atomic<bool> m_low_guard_active{false};
+    std::mutex m_low_guard_mutex;
+    void ProtectLowGuard();
     std::atomic<bool> m_context_failure_logged{false};
 
     ThreadContext* GetOrCreateThreadContext(uint32_t requested_primary_stack_size = 0);
     static bool NormalizePrimaryStackSize(uint32_t requested, uint32_t& normalized);
     bool EnsureThreadStackCapacity(ThreadContext& context, uint32_t requested);
-    std::unique_ptr<Dynarmic::A32::Jit> CreateJit(size_t processor_id);
+    std::unique_ptr<Dynarmic::A32::Jit> CreateJit(size_t processor_id
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+        , Bl2PhysxPageTable* physx_table = nullptr
+#endif
+    );
+    void WarmupForEntry(ThreadContext& context, uint32_t target_pc,
+                        const std::vector<uint32_t>& args);
     uint64_t ExecuteFunction(Dynarmic::A32::Jit& jit, uint32_t target_pc,
                              const std::vector<uint32_t>& args, uint32_t stack_top,
-                             uint32_t stack_capacity);
+                             uint32_t stack_capacity, bool* returned = nullptr);
 
     std::vector<std::pair<uint32_t, uint32_t>> m_code_ranges;   // [base, end)
     std::mutex m_code_ranges_mutex;
@@ -181,6 +276,16 @@ private:
     // range could not represent both even in the 4 GiB fastmem reservation.
     static constexpr uint32_t kMapBase   = 0x80000000;
     static constexpr uint32_t kMapLimit  = 0xFFFF0000;
+    static constexpr uint32_t kLargeBase  = 0xC0000000;
+    static constexpr uint32_t kLargeLimit = 0xFFF00000;
+    static constexpr uint32_t kLargeGranule = 64u * 1024u;
+    std::atomic<bool> m_large_enabled{false};
+    std::mutex m_large_mutex;
+    std::map<uint32_t, uint32_t> m_large_free;  // base -> bytes, coalesced
+    uint32_t m_large_top = kLargeBase;          // Bump end of the large range.
+    uint32_t m_large_high = kLargeBase;         // Memory below may be dirty.
+    bool LargeAlloc(uint64_t need, uint32_t& base, uint32_t& capacity, bool& dirty);
+    void LargeFree(uint32_t base, uint32_t capacity);
     static constexpr int kMinClassShift = 5;                        // 32 B smallest block
     static constexpr uint32_t kMaxClassSize = 1u << 20;             // 1 MB largest class
     static constexpr int kNumSizeClasses = 20 - kMinClassShift + 1;
@@ -195,3 +300,4 @@ private:
     std::atomic<uint32_t> m_map_current{kMapBase};
 
 };
+#endif

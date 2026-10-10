@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 if ($LASTEXITCODE -ne 0) { throw 'Widget commands Android compilation failed' }
 $commandExecutable = Join-Path $buildRoot 'widget_commands_test.exe'
 $commandArgs = $widgetArgs | Where-Object { $_ -ne ('/Fe' + $widgetExecutable) -and $_ -ne (Join-Path $kitRoot 'tests\widget_gestures_test.cpp') }
+$commandArgs = @($commandArgs | ForEach-Object { if ($_ -eq '/std:c++17') { '/std:c++20' } else { $_ } })
 $linkAt = [Array]::IndexOf($commandArgs, '/link')
 $commandArgs = @(('/Fe' + $commandExecutable)) + @($commandArgs[0..($linkAt - 1)]) + @((Join-Path $sourceRoot 'bl2_touch_widget_commands.cpp'), (Join-Path $kitRoot 'tests\widget_commands_test.cpp')) + @($commandArgs[$linkAt..($commandArgs.Length - 1)])
 try {

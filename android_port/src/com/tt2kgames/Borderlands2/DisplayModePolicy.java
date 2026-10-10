@@ -19,6 +19,8 @@ public final class DisplayModePolicy implements DisplayManager.DisplayListener {
     private final int displayId;
     private boolean disposed;
     private float activeRefreshRate;
+    private boolean nativeFrameRateAvailable = true;
+    private static native boolean nativeRefreshRate(float refreshRate);
 
     private DisplayModePolicy(Activity owner, DisplayManager displayManager, int id) {
         activity = owner;
@@ -93,6 +95,14 @@ public final class DisplayModePolicy implements DisplayManager.DisplayListener {
         Display display = manager.getDisplay(displayId);
         if (display == null) return;
         Display.Mode mode = display.getMode();
+        if (activeRefreshRate != mode.getRefreshRate() && nativeFrameRateAvailable) {
+            try {
+                if (!nativeRefreshRate(mode.getRefreshRate())) Log.e(TAG,"Cannot update native frame limit");
+            } catch (UnsatisfiedLinkError error) {
+                // Older bridges manage their own frame limiter.
+                nativeFrameRateAvailable = false;
+            }
+        }
         activeRefreshRate = mode.getRefreshRate();
         Log.i(TAG, "active mode=" + mode.getModeId() + " " +
                 mode.getPhysicalWidth() + "x" + mode.getPhysicalHeight() +

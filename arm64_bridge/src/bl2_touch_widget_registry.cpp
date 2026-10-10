@@ -37,7 +37,7 @@ private:
 struct Reader {
     GfxSession& s;
     WidgetRegistry out;
-    bool stop(const char* reason) { out.reason = reason; return false; }
+    bool stop(const std::string& reason) { out.reason = reason; return false; }
     Value member(GfxHandle v, const char* n) { return {s,s.member(v,n)}; }
     bool number(GfxHandle v, const char* n, double& value) {
         auto x = member(v,n); return x && s.number(x,value);
@@ -48,7 +48,7 @@ struct Reader {
         value = static_cast<std::int32_t>(result); return true;
     }
     bool boolean(GfxHandle v, const char* n, bool& value) {
-        auto x = member(v,n); return x && s.boolean(x,value);
+        auto x = member(v,n); return x && s.boolean(x,value,std::strcmp(n,"disabled")==0);
     }
     bool string(GfxHandle v, const char* n, std::string& value) {
         auto x = member(v,n); return x && s.string(x,value);
@@ -89,12 +89,44 @@ struct Reader {
         Value ignored(s,s.invoke(object,"localToGlobal",{p}));
         return ignored && number(p,"x",point.x) && number(p,"y",point.y);
     }
+    void valueArea(GfxHandle inner, WidgetTarget& row) {
+        auto text=member(inner,"currentValue"), parent=member(text,"_parent");
+        double x=0,y=0,w=0,h=0,rotation=0,xscale=0,yscale=0;
+        if(!text || !same(parent,row.inner) || !visible(text) ||
+            !number(text,"_x",x) || !number(text,"_y",y) || !number(text,"_width",w) || !number(text,"_height",h) ||
+            !number(text,"_rotation",rotation) || !number(text,"_xscale",xscale) || !number(text,"_yscale",yscale) ||
+            w<=0 || h<=0 || rotation!=0 || xscale!=100 || yscale!=100) return;
+        WidgetPoint a,b,na,nb;
+        if(toGlobal(inner,x,y,a) && toGlobal(inner,x+w,y+h,b) &&
+            NormalizeWidgetPoint(out.frame,out.viewport,out.surfaceWidth,out.surfaceHeight,a,na) &&
+            NormalizeWidgetPoint(out.frame,out.viewport,out.surfaceWidth,out.surfaceHeight,b,nb))
+            row.valueBounds=intersect({na.x,na.y,nb.x,nb.y},row.bounds);
+    }
+    bool spinner(GfxHandle renderer, GfxHandle rowData, WidgetTarget& row) {
+        auto inner=member(renderer,"inner"), data=member(inner,"data"), parent=member(inner,"_parent");
+        auto choices=member(rowData,"spinnerChoices");
+        std::int32_t count=0,index=0;
+        if(!s.identity(inner,row.inner) || !same(data,row.data) || !same(parent,row.renderer) ||
+            !visibleTo(inner,row.renderer,6) || !s.identity(choices,row.choices) || s.type(choices)!=9 ||
+            !integer(choices,"length",count,1,128) || !integer(rowData,"currentValue",index,0,count-1))
+            return stop("spinner-binding-or-range");
+        for(std::int32_t i=0;i<count;++i) {
+            Value choice(s,s.element(choices,static_cast<std::uint32_t>(i)));
+            std::string label;
+            if(!choice || !s.string(choice,label)) return stop("spinner-choice-type");
+            row.choiceLabels.push_back(std::move(label));
+        }
+        row.minimum=0;row.maximum=count-1;row.increment=1;row.value=index;
+        valueArea(inner,row);
+        return true;
+    }
     bool slider(GfxHandle renderer, GfxHandle rowData, GfxHandle root, WidgetTarget& row) {
         auto inner = member(renderer,"inner");
         auto slider = member(inner,"slider");
         auto data = member(inner,"data");
         if (!s.identity(inner,row.inner) || !s.identity(slider,row.slider) || !same(data,row.data) ||
             !visibleTo(slider,row.renderer,6)) return stop("slider-identity-visibility");
+        valueArea(inner,row);
         bool disabled = false;
         if (!boolean(slider,"disabled",disabled)) return stop("slider-disabled-type");
         row.enabled = row.enabled && !disabled;
@@ -118,7 +150,11 @@ struct Reader {
         if (!toGlobal(slider,left,y,a) || !toGlobal(slider,width - right,y,b) ||
             !NormalizeWidgetPoint(out.frame,out.viewport,out.surfaceWidth,out.surfaceHeight,a,row.sliderStart) ||
             !NormalizeWidgetPoint(out.frame,out.viewport,out.surfaceWidth,out.surfaceHeight,b,row.sliderEnd)) return stop("slider-transform");
-        row.sliderBounds = intersect(row.sliderBounds,row.bounds);
+        // The real track axis still controls the value; the finger target uses
+        // the row height and a small horizontal margin, clipped to that row.
+        const double padding = .025 * std::min(out.surfaceWidth,out.surfaceHeight) / out.surfaceWidth;
+        row.sliderBounds = intersect({row.sliderBounds.left - padding,row.bounds.top,
+            row.sliderBounds.right + padding,row.bounds.bottom},row.bounds);
         double projected = 0;
         return ProjectWidgetSlider(row,row.sliderStart,out.surfaceWidth,out.surfaceHeight,projected) || stop("slider-degenerate-axis");
     }
@@ -143,14 +179,21 @@ struct Reader {
         if (!validRect(out.listBounds) || !visibleTo(list,out.root,10)) return stop("list-not-visible");
         bool disabled = false;
         std::int32_t rendererArrayCount = 0;
-        if (!boolean(list,"disabled",disabled) || disabled ||
-            !integer(data,"length",out.rowCount,1,128) || out.rowCount != static_cast<std::int32_t>(model.eventIds.size()) ||
-            !integer(list,"totalRenderers",out.totalRenderers,1,16) ||
-            !integer(renderers,"length",rendererArrayCount,1,16) || rendererArrayCount != out.totalRenderers ||
-            !integer(list,"scrollPosition",out.scrollPosition,0,std::max(0,out.rowCount - out.totalRenderers)))
-            return stop("list-shape-or-disabled");
+        if (!boolean(list,"disabled",disabled) || disabled) return stop("list-disabled");
+        if (!integer(data,"length",out.rowCount,1,128)) return stop("list-row-count-range");
+        if (out.rowCount != static_cast<std::int32_t>(model.eventIds.size()))
+            return stop("list-event-count-AS-" + std::to_string(out.rowCount) + "-model-" + std::to_string(model.eventIds.size()));
+        // Shipped CLIK draw derives this count from the current list height
+        // and row height. It is not limited to the original short menu's rows.
+        // Keep it bounded by the same finite limit as the data provider.
+        if (!integer(list,"totalRenderers",out.totalRenderers,1,128)) return stop("list-renderer-count-range");
+        if (!integer(renderers,"length",rendererArrayCount,1,128) || rendererArrayCount != out.totalRenderers)
+            return stop("list-renderer-array-count-" + std::to_string(rendererArrayCount) + "-total-" + std::to_string(out.totalRenderers));
+        if (!integer(list,"scrollPosition",out.scrollPosition,0,std::max(0,out.rowCount - out.totalRenderers)))
+            return stop("list-scroll-range");
         auto provider = member(list,"dataProvider");
         if (!same(provider,out.data)) return stop("uncommitted-data-provider");
+        if (!integer(list,"selectedIndex",out.selectedIndex,-1,out.rowCount - 1)) return stop("list-selection");
         for (std::int32_t i = 0; i < out.totalRenderers && i + out.scrollPosition < out.rowCount; ++i) {
             WidgetTarget row; row.index = i + out.scrollPosition; row.eventId = model.eventIds[row.index];
             Value renderer(s,s.element(renderers,static_cast<std::uint32_t>(i)));
@@ -161,18 +204,30 @@ struct Reader {
                 !same(rendererData,row.data) || !same(owner,out.list) ||
                 !integer(renderer,"index",actualIndex,0,127) || actualIndex != row.index) return stop("renderer-binding-pending");
             bool unselectable = true, rendererDisabled = true;
-            if (!boolean(item,"unselectable",unselectable) || !boolean(renderer,"disabled",rendererDisabled) ||
-                !string(item,"label",row.caption) || !string(item,"rendererType",row.rendererType)) return stop("row-data-fields");
+            auto selectable=member(item,"unselectable"), disabledValue=member(renderer,"disabled");
+            auto caption=member(item,"label"), rendererType=member(item,"rendererType");
+            if(!s.boolean(selectable,unselectable)) return stop("row-unselectable-type-"+std::to_string(s.type(selectable)));
+            // CLIK's disabled getter reads an initially undefined _disabled;
+            // ActionScript and the stock GetBool treat that value as false.
+            if(!s.boolean(disabledValue,rendererDisabled,true)) return stop("row-disabled-type-"+std::to_string(s.type(disabledValue)));
+            if(!s.string(caption,row.caption)) return stop("row-caption-type-"+std::to_string(s.type(caption)));
+            if(!s.string(rendererType,row.rendererType)) return stop("row-renderer-type-"+std::to_string(s.type(rendererType)));
             row.enabled = !unselectable && !rendererDisabled;
             row.visible = visibleTo(renderer,out.list,6);
             if (!bounds(renderer,root,row.stageBounds) || !normalized(row.stageBounds,row.bounds)) return stop("row-bounds");
+            WidgetPoint origin;
+            if(!toGlobal(renderer,0,0,origin) || !NormalizeWidgetPoint(out.frame,out.viewport,
+                out.surfaceWidth,out.surfaceHeight,origin,row.origin)) return stop("row-origin");
             row.bounds = intersect(row.bounds,out.listBounds);
             row.visible = row.visible && validRect(row.bounds);
             if (row.rendererType == "default") row.kind = WidgetKind::Button;
             else if (row.rendererType == "slider") {
                 row.kind = WidgetKind::Slider;
                 if (row.visible && !slider(renderer,item,root,row)) return false;
-            } else if (row.rendererType == "spinner") row.kind = WidgetKind::Spinner;
+            } else if (row.rendererType == "spinner") {
+                row.kind = WidgetKind::Spinner;
+                if(row.visible && !spinner(renderer,item,row)) return false;
+            }
             std::uint64_t id = kHashStart;
             hash(id,out.list); hash(id,out.data); hash(id,row.renderer); hash(id,row.data);
             hash(id,static_cast<std::uint32_t>(row.index)); hash(id,static_cast<std::uint32_t>(row.eventId));
@@ -187,13 +242,18 @@ struct Reader {
             !integer(list,"scrollPosition",scroll,0,128) || scroll != out.scrollPosition) return stop("content-changed-during-capture");
         out.route = kHashStart;
         hash(out.route,out.model); hash(out.route,out.list); hash(out.route,out.data); hash(out.route,out.root);
-        hash(out.route,out.frame); hash(out.route,out.listBounds);
+        // getBounds includes animated selection artwork. Geometry is used for
+        // the initial hit, while the movie/list/data identities own the gesture.
+        hash(out.route,out.frame);
         hash(out.route,out.surfaceWidth); hash(out.route,out.surfaceHeight);
         for (auto w : out.viewport.words) hash(out.route,w);
         out.content = out.route;
         for (const auto& row : out.rows) {
             hash(out.content,row.id); hash(out.content,row.caption); hash(out.content,row.enabled); hash(out.content,row.visible);
             hash(out.content,row.bounds); hash(out.content,row.slider); hash(out.content,row.sliderBounds);
+            hashDouble(out.content,row.origin.x);hashDouble(out.content,row.origin.y);
+            hash(out.content,row.valueBounds);hash(out.content,row.choices);
+            for(const auto& label:row.choiceLabels) hash(out.content,label);
             hashDouble(out.content,row.minimum); hashDouble(out.content,row.maximum); hashDouble(out.content,row.increment);
             hashDouble(out.content,row.sliderStart.x); hashDouble(out.content,row.sliderStart.y);
             hashDouble(out.content,row.sliderEnd.x); hashDouble(out.content,row.sliderEnd.y);
@@ -231,6 +291,7 @@ WidgetRegistry CaptureBl2Widgets(GfxSession& session, const UiModelSnapshot& mod
     Reader reader{session,{}};
     reader.out.surfaceWidth = width; reader.out.surfaceHeight = height;
     reader.build(model);
+    if(!session.good() && session.reason()) reader.out.reason=session.reason();
     return std::move(reader.out);
 }
 } // namespace bl2::touch

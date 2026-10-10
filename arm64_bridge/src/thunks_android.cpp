@@ -5,6 +5,7 @@
 #include "jni_fake_env.h"
 #include "perf_probe.h"
 #include "bl2_native_resolution.h"
+#include "bl2_hitch_report.h"
 
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
@@ -12,6 +13,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <unistd.h>
+#include <time.h>
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 #include <android/native_window.h>
@@ -19,6 +21,7 @@
 #include <android/configuration.h>
 #include <android/log.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -467,6 +470,8 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
         const std::string host_attributes_text = DescribeEglAttributes(host_attributes);
         EGLContext context = eglCreateContext(display, config, share, host_attributes);
         const EGLint error = eglGetError();
+        extern void Bl2ShaderWarmupContextCreated(EGLDisplay, EGLContext, EGLContext);
+        Bl2ShaderWarmupContextCreated(display, context, share);
         const uint32_t context_handle = contexts.Add(context);
         LOGI("eglCreateContext display=0x%08X/%p config=0x%08X/%p "
              "share=0x%08X/%p guest_attrs=0x%08X%s host_attrs=%s "
@@ -492,17 +497,40 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
         if (result) RefreshGlBindings();
         if (result && context != EGL_NO_CONTEXT) CheckBl2NativeResolutionLimits(host);
 
-        const char* version = result
+        if (result && context != EGL_NO_CONTEXT) {
+            static std::mutex identity_mutex;
+            static std::array<EGLContext, 4> reported_contexts{};
+            std::lock_guard lock(identity_mutex);
+            const auto found = std::find(reported_contexts.begin(), reported_contexts.end(), context);
+            const auto empty = std::find(reported_contexts.begin(), reported_contexts.end(), EGL_NO_CONTEXT);
+            if (found == reported_contexts.end() && empty != reported_contexts.end()) {
+                *empty = context;
+                // These are actual host GL calls after a successful binding,
+                // before the guest-facing NVIDIA/version facade is consulted.
+                const auto* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+                const auto* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+                const auto* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+                const auto* shading = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
+                __android_log_print(ANDROID_LOG_INFO, "BL2Arm64GL",
+                    "host display=%p context=%p guest_context=0x%08X vendor='%s' renderer='%s' version='%s' GLSL='%s' tid=%d",
+                    display, context, context_handle, vendor ? vendor : "(null)",
+                    renderer ? renderer : "(null)", version ? version : "(null)",
+                    shading ? shading : "(null)", gettid());
+            }
+        }
+#if HORN_ENABLE_LOGGING
+        const char* version = result && context != EGL_NO_CONTEXT
             ? reinterpret_cast<const char*>(glGetString(GL_VERSION)) : nullptr;
-        const char* shading_language = result
+        const char* shading_language = result && context != EGL_NO_CONTEXT
             ? reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION)) : nullptr;
         LOGI("eglMakeCurrent display=0x%08X/%p draw=0x%08X/%p "
              "read=0x%08X/%p context=0x%08X/%p result=%u error=0x%04X "
              "GL_VERSION='%s' GLSL='%s' tid=%d",
              display_handle, display, draw_handle, draw, read_handle, read,
              context_handle, context, result, error,
-             version ? version : "(unavailable)",
-             shading_language ? shading_language : "(unavailable)", gettid());
+              version ? version : "(unavailable)",
+              shading_language ? shading_language : "(unavailable)", gettid());
+#endif
         jit.Regs()[0] = result;
     });
     manager.RegisterThunkIfAbsent("eglSwapBuffers", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -510,15 +538,43 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
         const uint32_t surface_handle = jit.Regs()[1];
         EGLDisplay display = displays.Get(display_handle);
         EGLSurface surface = surfaces.Get(surface_handle);
+#if !defined(BL2_NATIVE_ARM32)
+        extern bool ApplyBl2FrameRateLimit(DynarmicHost&);
+        ApplyBl2FrameRateLimit(host);
+#endif
         AuditBl2NativeResolutionPresent(host);
         // Bl2FogAuditPresent();  // Pixel readback diagnosis paused.
         Bl2DirectoryCacheReportStartup();
-        const EGLBoolean result = eglSwapBuffers(display, surface);
+        EGLBoolean result;
+        {
+            HornPerfScope perf(HornPerfCategory::Swap);
+            result = eglSwapBuffers(display, surface);
+        }
         const EGLint error = eglGetError();
         if (result == EGL_TRUE) {
             HornPerfFrameBoundary();
             extern void GlStateProbePresent();
             GlStateProbePresent();
+            extern void RefreshSceneAuditMode();
+            RefreshSceneAuditMode();
+#if !defined(BL2_NATIVE_ARM32)
+            // Renderer idle slice for learned JIT warmup, only after a frame
+            // that left the thread mostly idle (frame-limited, not render-bound).
+            static thread_local uint64_t last_wall = 0, last_cpu = 0;
+            const auto clock_ns = [](clockid_t clock) {
+                timespec value{};
+                clock_gettime(clock, &value);
+                return static_cast<uint64_t>(value.tv_sec) * 1000000000ull +
+                       static_cast<uint64_t>(value.tv_nsec);
+            };
+            const uint64_t wall = clock_ns(CLOCK_MONOTONIC);
+            const uint64_t cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+            if (last_wall && wall > last_wall && (cpu - last_cpu) * 10 < (wall - last_wall) * 7)
+                host.WarmLearnedBlocksInCallback(jit, 1000000);
+            last_wall = clock_ns(CLOCK_MONOTONIC);
+            last_cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+            Bl2HitchFrame();
+#endif
         }
         static std::atomic<uint32_t> calls{0};
         const uint32_t index = calls.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -559,11 +615,23 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
         jit.Regs()[0] = ok;
     });
     manager.RegisterThunkIfAbsent("eglDestroyContext", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {
-        const EGLBoolean ok = eglDestroyContext(displays.Get(jit.Regs()[0]), contexts.Get(jit.Regs()[1]));
-        if (ok) contexts.Remove(jit.Regs()[1]); jit.Regs()[0] = ok;
+        const EGLContext context = contexts.Get(jit.Regs()[1]);
+        const EGLBoolean ok = eglDestroyContext(displays.Get(jit.Regs()[0]), context);
+        if (ok) {
+            extern void Bl2ShaderWarmupContextDestroyed(EGLContext);
+            Bl2ShaderWarmupContextDestroyed(context);
+            contexts.Remove(jit.Regs()[1]);
+        }
+        jit.Regs()[0] = ok;
     });
     manager.RegisterThunkIfAbsent("eglTerminate", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {
-        jit.Regs()[0] = eglTerminate(displays.Get(jit.Regs()[0]));
+        const EGLDisplay display = displays.Get(jit.Regs()[0]);
+        const EGLBoolean ok = eglTerminate(display);
+        if (ok) {
+            extern void Bl2ShaderWarmupDisplayTerminated(EGLDisplay);
+            Bl2ShaderWarmupDisplayTerminated(display);
+        }
+        jit.Regs()[0] = ok;
     });
     manager.RegisterThunkIfAbsent("eglWaitNative", [](Dynarmic::A32::Jit& jit, DynarmicHost&) { jit.Regs()[0] = eglWaitNative(jit.Regs()[0]); });
     manager.RegisterThunkIfAbsent("eglWaitGL", [](Dynarmic::A32::Jit& jit, DynarmicHost&) { jit.Regs()[0] = eglWaitGL(); });

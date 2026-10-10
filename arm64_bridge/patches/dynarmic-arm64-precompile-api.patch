@@ -1,0 +1,41 @@
+--- a/src/dynarmic/interface/A32/a32.h
++++ b/src/dynarmic/interface/A32/a32.h
+@@ -33,6 +33,10 @@
+      * Cannot be recursively called.
+      */
+     HaltReason Step();
++
++    // Compile one canonical descriptor without executing guest code (ARM64 backend).
++    // Caller must serialize against Run/Step and other compilation on this Jit.
++    bool Precompile(std::uint64_t raw_descriptor);
+ 
+     /**
+      * Clears the code cache of all compiled code.
+--- a/src/dynarmic/backend/arm64/a32_interface.cpp
++++ b/src/dynarmic/backend/arm64/a32_interface.cpp
+@@ -60,6 +60,14 @@
+         return hr;
+     }
+ 
++    bool Precompile(std::uint64_t raw_descriptor) {
++        if (jit_interface->is_executing) return false;
++        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
++        current_address_space.GetOrEmit(IR::LocationDescriptor{raw_descriptor});
++        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
++        return true;
++    }
++
+     void ClearCache() {
+         std::unique_lock lock{invalidation_mutex};
+         invalidate_entire_cache = true;
+@@ -176,6 +184,10 @@
+     return impl->Step();
+ }
+ 
++bool Jit::Precompile(std::uint64_t raw_descriptor) {
++    return impl->Precompile(raw_descriptor);
++}
++
+ void Jit::ClearCache() {
+     impl->ClearCache();
+ }

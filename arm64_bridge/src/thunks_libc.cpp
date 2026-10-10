@@ -1,3 +1,4 @@
+#include "guest_software_write_watch.h"
 #include "thunk_manager.h"
 #include "bridge_log.h"
 #include "bl2_locale.h"
@@ -15,6 +16,7 @@
 #include "zip_stored_entry_bounds.h"
 #include "arm32_network_abi.h"
 #include "guest_mapped_dirty_tracker.h"
+#include <android/log.h>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -479,7 +481,7 @@ extern "C" int IndexObbSplitApks(const char* const* paths, size_t count) {
             return -1;
         }
         const auto scan = ScanObbSplitFd(
-            fd, within_deadline, &verification_deadline);
+            fd, within_deadline, &verification_deadline, HasBl2RelocatedCache(), false);
         if (scan.status == ObbSplitScanStatus::Rejected ||
             scan.status == ObbSplitScanStatus::Cancelled) {
             LOGE("OBB split refused: '%s' reason=%s hashed=%llu", paths[i],
@@ -492,7 +494,7 @@ extern "C" int IndexObbSplitApks(const char* const* paths, size_t count) {
             close(fd);
             continue;
         }
-        LOGI("OBB split verified: '%s' %s size=%llu offset=%llu sha256=%s",
+        LOGI("OBB signed split metadata: '%s' %s size=%llu offset=%llu expected_sha256=%s",
              paths[i], scan.main ? "main" : "patch",
              static_cast<unsigned long long>(scan.obb_size),
              static_cast<unsigned long long>(scan.apk_data_offset),
@@ -803,6 +805,11 @@ static uint32_t GuestErrnoAddress(DynarmicHost& host) {
         else g_guest_errno_address = 0x300; // initialized fallback; allocation failure remains visible elsewhere
     }
     return g_guest_errno_address;
+}
+
+// memmove through a write alias must not compare two address spaces.
+static bool GuestRangesDisjoint(uint32_t first, uint32_t second, size_t length) {
+    return uint64_t{first} + length <= second || uint64_t{second} + length <= first;
 }
 
 static void SetGuestErrno(DynarmicHost& host, int value) {
@@ -1784,6 +1791,8 @@ void ThunkManager::RegisterLibcThunks() {
             ct[c + 1] = flags;
             up[c + 1] = static_cast<int16_t>(toupper(c));
         }
+        NotifyGuestMemoryWritten(ctype_table, 257);
+        NotifyGuestMemoryWritten(toupper_table, 257 * sizeof(int16_t));
     }
     RegisterSymbol("__dso_handle", dso_handle);
     RegisterSymbol("_ctype_", ctype_symbol);
@@ -1999,9 +2008,10 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t n = jit.Regs()[2];
         void* h_dst = GuestToHost(host.GetGuestMemoryBase(), dst);
         const void* h_src = GuestToHost(host.GetGuestMemoryBase(), src);
+        if (GuestLowGuardHit(dst, n)) { host.ReportLowGuardWrite(dst, n); h_dst = nullptr; }
         if (h_dst && h_src && n > 0) {
-            GuestMappedWriteGuard write(dst, n);
-            memmove(h_dst, h_src, n);
+            GuestMappedWriteGuard write(dst, n, GuestRangesDisjoint(dst, src, n));
+            memmove(write.Destination(h_dst), h_src, n);
         }
         jit.Regs()[0] = dst;
     });
@@ -2089,6 +2099,7 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t n = jit.Regs()[2];
         char* h_dst = reinterpret_cast<char*>(GuestToHost(host.GetGuestMemoryBase(), dst));
         const char* h_src = reinterpret_cast<const char*>(GuestToHost(host.GetGuestMemoryBase(), src));
+        if (GuestLowGuardHit(dst, n)) { host.ReportLowGuardWrite(dst, n); h_dst = nullptr; }
         if (h_dst && h_src && n > 0) strncpy(h_dst, h_src, n);
         jit.Regs()[0] = dst;
     });
@@ -2622,7 +2633,19 @@ void ThunkManager::RegisterLibcThunks() {
         jit.Regs()[0] = static_cast<uint32_t>(-1);
     });
     RegisterThunk("usleep", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        const int result = ::usleep(static_cast<useconds_t>(jit.Regs()[0]));
+        useconds_t remaining = static_cast<useconds_t>(jit.Regs()[0]);
+        // A frame-limit sleep is idle time: translate learned guest code of
+        // this thread's role for all but its last millisecond, then sleep on.
+        if (remaining >= 2000) {
+            timespec start{}, end{};
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            host.WarmLearnedBlocksInCallback(jit, (uint64_t{remaining} - 1000) * 1000);
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            const int64_t spent = (int64_t{end.tv_sec} - start.tv_sec) * 1000000 +
+                                  (end.tv_nsec - start.tv_nsec) / 1000;
+            remaining = spent >= remaining ? 0 : remaining - static_cast<useconds_t>(spent);
+        }
+        const int result = remaining ? ::usleep(remaining) : 0;
         if (result != 0) SetGuestErrno(host, errno);
         jit.Regs()[0] = static_cast<uint32_t>(result);
     });
@@ -3065,19 +3088,24 @@ void ThunkManager::RegisterLibcThunks() {
                 if (!attached) return;
 
                 uint32_t result = 0xFFFFFFFFu; // PTHREAD_CANCELED on an unexpected host failure
+                static std::atomic<unsigned> host_failure_reports{0};
                 try {
                     result = host_ptr->RunFunction(record->start, {record->arg});
                     if (g_thread_exit_requested) result = g_thread_exit_value;
                     const uint32_t render_entry =
                         host_ptr->FindSymbol("_Z21NativeCallback_RenderPv");
-                    if (render_entry && record->start == render_entry) {
+                    static std::atomic<unsigned> render_return_reports{0};
+                    if (render_entry && record->start == render_entry &&
+                        render_return_reports.fetch_add(1, std::memory_order_relaxed) < 8) {
                         const auto read_global = [&](const char* name) {
                             const uint32_t address = host_ptr->FindSymbol(name);
-                            return address ? host_ptr->MemoryRead32(address)
-                                           : 0xFFFFFFFFu;
+                            return address && static_cast<uint64_t>(address) + 4 <= host_ptr->GetGuestMemorySize()
+                                ? host_ptr->MemoryRead32(address) : 0xFFFFFFFFu;
                         };
-                        LOGI("render return globals phase=%u started=%u guarded=%u critical=%u "
-                             "request_exit=%u main_exit=%u force_stop=%u engine=0x%08X world=0x%08X",
+                        __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                             "render return id=%08X result=%08X pthread_exit=%d phase=%u started=%u guarded=%u critical=%u "
+                             "request_exit=%u main_exit=%u force_stop=%u paused=%u stopped=%u healthy=%u engine=0x%08X world=0x%08X",
+                             record->id, result, g_thread_exit_requested ? 1 : 0,
                              read_global("GPrimaryUE3StartupPhase"),
                              read_global("GIsStarted"),
                              read_global("GIsGuarded"),
@@ -3085,12 +3113,20 @@ void ThunkManager::RegisterLibcThunks() {
                              read_global("GIsRequestingExit"),
                              read_global("GMainThreadExit"),
                              read_global("GForceStopRendering"),
+                             read_global("GPausedMode"), read_global("GHasStoppedRendering"),
+                             read_global("GIsRenderingThreadHealthy"),
                              read_global("GEngine"), read_global("GWorld"));
                     }
                     RunGuestTlsDestructors(*host_ptr);
                 } catch (const std::exception& error) {
+                    if (host_failure_reports.fetch_add(1, std::memory_order_relaxed) < 8)
+                        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+                            "guest pthread host failure id=%08X start=%08X: %s", record->id, record->start, error.what());
                     LOGE("guest pthread 0x%08X failed in host: %s", record->id, error.what());
                 } catch (...) {
+                    if (host_failure_reports.fetch_add(1, std::memory_order_relaxed) < 8)
+                        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+                            "guest pthread unknown host failure id=%08X start=%08X", record->id, record->start);
                     LOGE("guest pthread 0x%08X failed with an unknown host exception", record->id);
                 }
                 LOGI("guest pthread complete id=0x%08X start=0x%08X result=0x%08X pthread_exit=%d",
@@ -4024,6 +4060,10 @@ void ThunkManager::RegisterLibcThunks() {
     RegisterThunk("strcpy", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         char* dest = reinterpret_cast<char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]));
         const char* src = reinterpret_cast<const char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]));
+        if (src && GuestLowGuardHit(jit.Regs()[0], strlen(src) + 1)) {
+            host.ReportLowGuardWrite(jit.Regs()[0], strlen(src) + 1);
+            dest = nullptr;
+        }
         if (dest && src) strcpy(dest, src);
     });
 
@@ -4197,9 +4237,10 @@ void ThunkManager::RegisterLibcThunks() {
         void* s = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]);
         int c = static_cast<int>(jit.Regs()[1]);
         size_t n = jit.Regs()[2];
+        if (GuestLowGuardHit(jit.Regs()[0], n)) { host.ReportLowGuardWrite(jit.Regs()[0], n); s = nullptr; }
         if (s) {
             GuestMappedWriteGuard write(jit.Regs()[0], n);
-            memset(s, c, n);
+            memset(write.Destination(s), c, n);
         }
     });
 
@@ -4207,9 +4248,10 @@ void ThunkManager::RegisterLibcThunks() {
         void* dest = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]);
         const void* src = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]);
         size_t n = jit.Regs()[2];
+        if (GuestLowGuardHit(jit.Regs()[0], n)) { host.ReportLowGuardWrite(jit.Regs()[0], n); dest = nullptr; }
         if (dest && src) {
             GuestMappedWriteGuard write(jit.Regs()[0], n);
-            memcpy(dest, src, n);
+            memcpy(write.Destination(dest), src, n);
         }
     });
 
@@ -4380,9 +4422,10 @@ void ThunkManager::RegisterLibcThunks() {
     auto aeabi_memclr_handler = [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         uint32_t dest = jit.Regs()[0];
         uint32_t n = jit.Regs()[1];
+        if (GuestLowGuardHit(dest, n)) { host.ReportLowGuardWrite(dest, n); dest = 0; }
         if (dest && n) {
             GuestMappedWriteGuard write(dest, n);
-            memset(GuestToHost(host.GetGuestMemoryBase(), dest), 0, n);
+            memset(write.Destination(GuestToHost(host.GetGuestMemoryBase(), dest)), 0, n);
         }
     };
     RegisterThunk("__aeabi_memclr", aeabi_memclr_handler);
@@ -4393,9 +4436,10 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t dest = jit.Regs()[0];
         uint32_t n = jit.Regs()[1];
         int c = static_cast<int>(jit.Regs()[2]);
+        if (GuestLowGuardHit(dest, n)) { host.ReportLowGuardWrite(dest, n); dest = 0; }
         if (dest && n) {
             GuestMappedWriteGuard write(dest, n);
-            memset(GuestToHost(host.GetGuestMemoryBase(), dest), c, n);
+            memset(write.Destination(GuestToHost(host.GetGuestMemoryBase(), dest)), c, n);
         }
     };
     RegisterThunk("__aeabi_memset", aeabi_memset_handler);
@@ -4406,9 +4450,10 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t dest = jit.Regs()[0];
         uint32_t src = jit.Regs()[1];
         uint32_t n = jit.Regs()[2];
+        if (GuestLowGuardHit(dest, n)) { host.ReportLowGuardWrite(dest, n); dest = 0; }
         if (dest && src && n) {
             GuestMappedWriteGuard write(dest, n);
-            memcpy(GuestToHost(host.GetGuestMemoryBase(), dest),
+            memcpy(write.Destination(GuestToHost(host.GetGuestMemoryBase(), dest)),
                    GuestToHost(host.GetGuestMemoryBase(), src), n);
         }
     };
@@ -4420,9 +4465,10 @@ void ThunkManager::RegisterLibcThunks() {
         uint32_t dest = jit.Regs()[0];
         uint32_t src = jit.Regs()[1];
         uint32_t n = jit.Regs()[2];
+        if (GuestLowGuardHit(dest, n)) { host.ReportLowGuardWrite(dest, n); dest = 0; }
         if (dest && src && n) {
-            GuestMappedWriteGuard write(dest, n);
-            memmove(GuestToHost(host.GetGuestMemoryBase(), dest),
+            GuestMappedWriteGuard write(dest, n, GuestRangesDisjoint(dest, src, n));
+            memmove(write.Destination(GuestToHost(host.GetGuestMemoryBase(), dest)),
                     GuestToHost(host.GetGuestMemoryBase(), src), n);
         }
     };
@@ -4823,16 +4869,36 @@ void ThunkManager::RegisterLibcThunks() {
                         "-nomovies -nostartupmovies\n";
                     static char kLowQualityFlags[] =
                         "-nomovies -nostartupmovies -SystemSettings=SystemSettingsMobile\n";
+                    // ParseParam recognizes a space after its final argument.
+                    static char kNoSoundFlags[] =
+                        "-nomovies -nostartupmovies -nosound \n";
+                    static char kLowQualityNoSoundFlags[] =
+                        "-nomovies -nostartupmovies -SystemSettings=SystemSettingsMobile -nosound \n";
+                    char no_sound[PROP_VALUE_MAX] = {};
+                    const bool no_sound_enabled =
+                        __system_property_get("debug.bl2.no_sound", no_sound) > 0 &&
+                        std::strcmp(no_sound, "1") == 0;
                     char low_quality[PROP_VALUE_MAX] = {};
                     const bool low_quality_enabled =
                         __system_property_get("debug.bl2.low_quality", low_quality) > 0 &&
                         low_quality[0] == '1' && low_quality[1] == '\0';
-                    char* flags = low_quality_enabled ? kLowQualityFlags
-                                                      : kDefaultMovieFlags;
-                    const size_t flags_size = low_quality_enabled
-                        ? sizeof(kLowQualityFlags) - 1
-                        : sizeof(kDefaultMovieFlags) - 1;
+                    char* flags = no_sound_enabled
+                        ? (low_quality_enabled ? kLowQualityNoSoundFlags : kNoSoundFlags)
+                        : (low_quality_enabled ? kLowQualityFlags : kDefaultMovieFlags);
+                    const size_t flags_size = no_sound_enabled
+                        ? (low_quality_enabled ? sizeof(kLowQualityNoSoundFlags) - 1
+                                               : sizeof(kNoSoundFlags) - 1)
+                        : (low_quality_enabled ? sizeof(kLowQualityFlags) - 1
+                                               : sizeof(kDefaultMovieFlags) - 1);
                     f = fmemopen(flags, flags_size, "r");
+                    if (f && no_sound_enabled) {
+                        static std::atomic<bool> logged{false};
+                        if (!logged.exchange(true, std::memory_order_relaxed)) {
+                            __android_log_print(ANDROID_LOG_INFO, "BL2_Parity",
+                                "ARM64 noSound command selected low_quality=%d",
+                                low_quality_enabled);
+                        }
+                    }
                     if (f) LOGI("fopen: default arm64 movie skip enabled; "
                                 "low_quality=%d", low_quality_enabled);
                 }
@@ -4915,6 +4981,10 @@ void ThunkManager::RegisterLibcThunks() {
         size_t size = jit.Regs()[1];
         size_t count = jit.Regs()[2];
         uint32_t handle = jit.Regs()[3];
+        if (GuestLowGuardHit(jit.Regs()[0], size * count)) {
+            host.ReportLowGuardWrite(jit.Regs()[0], size * count);
+            ptr = nullptr;
+        }
         HornPerfScope perf(HornPerfCategory::FileRead);
         std::lock_guard<std::mutex> lock(g_file_mutex);
         auto it = g_file_map.find(handle);
@@ -5831,6 +5901,15 @@ void ThunkManager::RegisterLibcThunks() {
              "guest execution halted", regs[15], regs[14], jit.Cpsr());
         static std::atomic<uint32_t> dumps{0};
         if (dumps.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+            "Stack guard snapshot PC=%08X LR=%08X SP=%08X CPSR=%08X "
+            "R0=%08X R1=%08X R2=%08X R3=%08X R4=%08X R5=%08X R6=%08X R7=%08X "
+            "R8=%08X R9=%08X R10=%08X R11=%08X R12=%08X",
+            regs[15], regs[14], regs[13], jit.Cpsr(), regs[0], regs[1], regs[2],
+            regs[3], regs[4], regs[5], regs[6], regs[7], regs[8], regs[9], regs[10],
+            regs[11], regs[12]);
+#endif
         for (size_t first = 0; first < 16; first += 4) {
             LOGE("Stack guard registers r%zu..r%zu={%08X,%08X,%08X,%08X}",
                  first, first + 3, regs[first], regs[first + 1],
@@ -5864,6 +5943,31 @@ void ThunkManager::RegisterLibcThunks() {
                  label, static_cast<unsigned long long>(address), bytes, got, error);
             return got == static_cast<ssize_t>(bytes);
         };
+#if defined(__ANDROID__)
+        uint32_t global_guard = 0;
+        const uint32_t guard_address = host.GetThunkManager().FindRegisteredSymbol("__stack_chk_guard");
+        const bool guard_read = guard_address &&
+            read_guest("global_guard", guard_address, &global_guard, sizeof(global_guard));
+        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+            "Stack guard global address=%08X read=%d value=%08X", guard_address,
+            guard_read ? 1 : 0, global_guard);
+        std::array<uint32_t, 80> stack{};
+        if (read_guest("stack", regs[13], stack.data(), sizeof(stack))) {
+            for (size_t first = 0; first < stack.size(); first += 16) {
+                char line[160] = {};
+                size_t used = 0;
+                for (size_t i = first; i < first + 16; ++i) {
+                    const int written = std::snprintf(line + used, sizeof(line) - used,
+                                                      " %08X", stack[i]);
+                    if (written < 0 || static_cast<size_t>(written) >= sizeof(line) - used) break;
+                    used += static_cast<size_t>(written);
+                }
+                __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+                    "Stack guard stack address=%08X words=%s",
+                    regs[13] + static_cast<uint32_t>(first * sizeof(uint32_t)), line);
+            }
+        }
+#endif
         if (regs[11] >= 0x88) {
             uint32_t frame[36] = {};
             const uint32_t address = regs[11] - 0x88;
@@ -5875,15 +5979,34 @@ void ThunkManager::RegisterLibcThunks() {
                 }
             }
         }
-        const auto& loader = host.GetElfLoader();
-        const uint32_t after_solver = loader.GetSymbolAddress("_ZN5Scene11afterSolverEv");
-        if (loader.GetImageSize() == 0x03089000 && after_solver >= 0x024E536C &&
-            regs[14] == after_solver + 0xCE0) {
-            const uint32_t base = after_solver - 0x024E536C;
-            const uint32_t computed_slot = regs[5] + regs[12];
+        const uint32_t after_solver = host.FindSymbol("_ZN5Scene11afterSolverEv");
+        const uint32_t generate_islands = host.FindSymbol("_ZN7PxScene15generateIslandsEb");
+#if defined(__ANDROID__)
+        if (after_solver >= 0x024E536C && host.GetElfLoader().GetImageSize() == 0x03089000) {
+            const uint32_t slot = after_solver - 0x024E536C + 0x02F366E8;
+            uint32_t pointer = 0, value = 0;
+            const bool slot_read = read_guest("bl2_guard_got", slot, &pointer, sizeof(pointer));
+            const bool value_read = slot_read && pointer &&
+                read_guest("bl2_guard_value", pointer, &value, sizeof(value));
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+                "Stack guard BL2 chain slot=%08X slot_read=%d pointer=%08X value_read=%d value=%08X",
+                slot, slot_read ? 1 : 0, pointer, value_read ? 1 : 0, value);
+        }
+#endif
+        const bool failed_after_solver = after_solver >= 0x024E536C &&
+            regs[14] == after_solver + 0xCE0;
+        const bool failed_generate_islands = generate_islands >= 0x02573280 &&
+            regs[14] == generate_islands + 0x5C0;
+        if ((failed_after_solver || failed_generate_islands) &&
+            host.GetElfLoader().GetImageSize() == 0x03089000) {
+            const uint32_t base = failed_after_solver
+                ? after_solver - 0x024E536C : generate_islands - 0x02573280;
+            const uint32_t computed_slot =
+                regs[failed_after_solver ? 5 : 0] + regs[12];
             const uint32_t expected_slot = base + 0x02F366E8;
-            LOGE("Stack guard BL2 afterSolver saved_compare=0x%08X "
+            LOGE("Stack guard BL2 %s saved_compare=0x%08X "
                  "computed_slot=0x%08X expected_slot=0x%08X",
+                 failed_after_solver ? "afterSolver" : "generateIslands",
                  regs[2], computed_slot, expected_slot);
             for (const uint32_t slot : {computed_slot, expected_slot}) {
                 uint32_t pointer = 0, value = 0;

@@ -2,6 +2,7 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace legacy_glsl {
 
@@ -12,6 +13,88 @@ inline bool IsIdentifier(char c) {
 
 inline bool IsSpace(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+// All 38,980 shipped normalized stages use this ten-location vec4 interface,
+// highp floats and the disabled UBO/multidraw path. SSO requires identical
+// declared interfaces, including unused outputs. Add only missing declarations
+// without changing the original shader body. Unrecognized sources use the
+// existing monolithic compiler instead; this is not a general GLSL parser.
+inline bool CompleteSsoInterface(std::string_view source, bool vertex,
+                                 std::string* result) {
+    if (!result || source.size() > 131072 ||
+        !source.starts_with("#version 320 es\n") ||
+        source.find('\0') != std::string_view::npos) return false;
+    constexpr unsigned locations[] = {0, 1, 2, 3, 4, 5, 6, 7, 12, 13};
+    constexpr unsigned required = 0x30ff;
+    unsigned declared = 0, conditional = 0;
+    unsigned versions = 0, precision = 0, ubo = 0, multidraw = 0;
+    bool perVertex = false;
+    size_t insertion = std::string_view::npos;
+    for (size_t begin = 0; begin < source.size();) {
+        size_t end = source.find('\n', begin);
+        if (end == std::string_view::npos) end = source.size();
+        auto line = source.substr(begin, end - begin);
+        while (!line.empty() && IsSpace(line.front())) line.remove_prefix(1);
+        while (!line.empty() && IsSpace(line.back())) line.remove_suffix(1);
+        if (line.starts_with("#version")) ++versions;
+        if (line.starts_with("#if")) ++conditional;
+        else if (line.starts_with("#endif")) {
+            if (!conditional) return false;
+            --conditional;
+        }
+        if (line.starts_with("precision ") && line.ends_with("float;")) {
+            if (line != "precision highp float;") return false;
+            ++precision;
+        }
+        if (line.starts_with("#define ENABLE_UNIFORM_BUFFER_OBJECTS")) {
+            if (line != "#define ENABLE_UNIFORM_BUFFER_OBJECTS 0" || conditional) return false;
+            ++ubo;
+        }
+        if (line.starts_with("#define ENABLE_MULTIDRAW_INDIRECT")) {
+            if (line != "#define ENABLE_MULTIDRAW_INDIRECT 0" || conditional) return false;
+            ++multidraw;
+        }
+        if (line == "out gl_PerVertex {") perVertex = true;
+        if (line.starts_with("layout(location=")) {
+            constexpr size_t prefix = sizeof("layout(location=") - 1;
+            size_t cursor = prefix;
+            unsigned location = 0;
+            if (cursor == line.size() || line[cursor] < '0' || line[cursor] > '9') return false;
+            while (cursor < line.size() && line[cursor] >= '0' && line[cursor] <= '9') {
+                location = location * 10 + static_cast<unsigned>(line[cursor++] - '0');
+                if (location > 31) return false;
+            }
+            if (line.substr(cursor, 2) != ") ") return false;
+            const auto declaration = line.substr(cursor + 2);
+            const auto direction = vertex ? std::string_view("out ") : std::string_view("in ");
+            if (declaration.starts_with(direction)) {
+                const unsigned bit = 1u << location;
+                const std::string expected = std::string(direction) + "vec4 UnTexcoord" +
+                                             std::to_string(location) + ";";
+                if (conditional || !(required & bit) || (declared & bit) || declaration != expected) return false;
+                declared |= bit;
+            } else if (!declaration.starts_with(vertex ? "in " : "out ")) return false;
+        } else if (line.starts_with("layout") && line.find("location") != std::string_view::npos) return false;
+        if (line.starts_with("void main(")) {
+            if (conditional || insertion != std::string_view::npos) return false;
+            insertion = begin;
+        }
+        begin = end == source.size() ? end : end + 1;
+    }
+    if (conditional || versions != 1 || precision != 1 || ubo != 1 || multidraw != 1 ||
+        (vertex && !perVertex) || insertion == std::string_view::npos) return false;
+    std::string padded(source.substr(0, insertion));
+    for (const unsigned location : locations) {
+        if (!(declared & (1u << location))) {
+            padded += "layout(location=" + std::to_string(location) + ") ";
+            padded += vertex ? "out" : "in";
+            padded += " vec4 UnTexcoord" + std::to_string(location) + ";\n";
+        }
+    }
+    padded.append(source.substr(insertion));
+    *result = std::move(padded);
+    return true;
 }
 
 // The desktop cache replicates a shadow lookup with textureProj(...).rrrr.

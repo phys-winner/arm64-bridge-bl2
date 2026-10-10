@@ -1,16 +1,33 @@
 #include "bl2_touch_input.h"
+#include "../../arm64_bridge/src/bl2_touch_settings.h"
 #include <jni.h>
 
 using bl2::touch::sharedMailbox;
 using bl2::touch::monotonicMilliseconds;
 
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeSettingsExchange(
+        JNIEnv* env, jclass, jintArray packet) {
+    constexpr jsize count = bl2::touch::kTouchSettingCount + 2;
+    if (!packet || env->GetArrayLength(packet) != count) return nullptr;
+    std::vector<std::uint32_t> host(count);
+    env->GetIntArrayRegion(packet, 0, count, reinterpret_cast<jint*>(host.data()));
+    if (env->ExceptionCheck()) return nullptr;
+    const auto response = bl2::touch::ExchangeBl2TouchSettings(host);
+    jintArray result = env->NewIntArray(static_cast<jsize>(response.size()));
+    if (result) env->SetIntArrayRegion(result, 0, static_cast<jsize>(response.size()),
+                                     reinterpret_cast<const jint*>(response.data()));
+    return result;
+}
+
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeSnapshot(JNIEnv* env, jclass) {
     const auto wire = sharedMailbox().snapshot().wire();
-    jlong values[8];
+    std::array<jlong, bl2::touch::kSnapshotWords> values{};
     for (std::size_t i = 0; i < wire.size(); ++i) values[i] = static_cast<jlong>(wire[i]);
-    jlongArray result = env->NewLongArray(8);
-    if (result != nullptr) env->SetLongArrayRegion(result, 0, 8, values);
+    const auto count = static_cast<jsize>(values.size());
+    jlongArray result = env->NewLongArray(count);
+    if (result != nullptr) env->SetLongArrayRegion(result, 0, count, values.data());
     return result;
 }
 

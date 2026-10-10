@@ -1,3 +1,6 @@
+#include <sys/system_properties.h>
+#include "guest_software_write_watch.h"
+#include "guest_software_write_watch_policy.h"
 #include "thunk_manager.h"
 #include "bridge_log.h"
 #include "dynarmic_host.h"
@@ -6,6 +9,15 @@
 #include "thunks_android.h"
 #include "thunks_tegra.h"
 #include "bl2_startup_profile.h"
+#if defined(BL2_NATIVE_ARM32)
+#include "../../arm32_compat/src/native_vfs.h"
+#include "../../arm32_compat/src/native_gl_inventory.h"
+#include "../../arm32_compat/src/native_vulkan_renderer.h"
+#include "../../arm32_compat/src/native_vulkan_thunks.h"
+#include <android/log.h>
+#include <cstring>
+extern "C" void NativeThunkEntry();
+#endif
 
 #define LOG_TAG "Arm32Bridge_Thunks"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
@@ -24,8 +36,18 @@ ThunkManager::ThunkManager(DynarmicHost& host) : m_host(host) {
     // small number of additional thunks.
     m_id_to_handler.reserve(2048);
     m_id_to_name.reserve(2048);
+    m_id_writes_observed.reserve(2048);
     m_id_to_handler.emplace_back();
     m_id_to_name.emplace_back();
+    m_id_writes_observed.push_back(0);
+#if defined(__ANDROID__) && defined(__aarch64__)
+    if (CurrentGuestSoftwareWriteWatch()) {
+        char value[PROP_VALUE_MAX] = {};
+        m_write_watch_diagnostics =
+            __system_property_get("debug.horn.software_watch_diagnostics", value) > 0 &&
+            value[0] == '1';
+    }
+#endif
 }
 
 ThunkManager::~ThunkManager() = default;
@@ -35,12 +57,40 @@ ThunkManager::~ThunkManager() = default;
 void RegisterGles2CoreThunks(ThunkManager& manager);
 
 bool ThunkManager::RegisterAllThunks() {
+#if defined(BL2_NATIVE_ARM32)
+    char backend[PROP_VALUE_MAX] = {};
+    __system_property_get("debug.bl2.backend", backend);
+    if (std::strcmp(backend, "vulkan") == 0) {
+        std::string error;
+        auto pack = NativeOpenVulkanShaderPack(error);
+        std::vector<std::uint8_t> seedBytes;
+        bl2vk::seed::Request seed;
+        const bool required = NativeVulkanSeedRequired();
+        const bool seedReady = !required || NativeReadVulkanMandatorySeed(seedBytes, seed, error);
+        if (!pack || !seedReady || !bl2vk::Initialize(std::move(pack), NativeShaderCacheRoot().c_str(), required ? &seed : nullptr)) {
+            if (error.empty()) error = bl2vk::LastFailure();
+            bl2vk::Shutdown();
+            __android_log_print(ANDROID_LOG_ERROR, "BL2Vulkan", "Initial Vulkan setup failed: %s; selecting GLES before guest resource creation", error.c_str());
+        }
+    }
+    if (bl2vk::IsInitialized()) {
+        RegisterNativeVulkanThunks(*this, m_host);
+        __android_log_print(ANDROID_LOG_INFO, "BL2Vulkan", "Backend selected: direct Vulkan (native ARM32)");
+    } else {
+#endif
     RegisterGLThunks();
     RegisterGles2CoreThunks(*this);
     RegisterAndroidThunks(*this, m_host);
+#if defined(BL2_NATIVE_ARM32)
+    }
+#endif
     RegisterUnavailableTegraThunks(*this);
+#if defined(BL2_NATIVE_ARM32)
+    RegisterNativeVfsThunks(*this);
+#else
     RegisterOpenSLESThunks(*this, m_host);
     RegisterLibcThunks();
+#endif
     // The guest-visible JNIEnv/JavaVM tables live in FakeJniEnv; jni_bridge.cpp
     // calls FakeJniEnv::Instance().Init(host) once the host JavaVM is known.
     if (m_registration_failed) {
@@ -286,8 +336,15 @@ uint32_t ThunkManager::RegisterThunk(const std::string& name, ThunkHandler handl
     }
 
     uint32_t thunk_id = static_cast<uint32_t>(m_id_to_handler.size());
-    uint32_t thunk_addr = m_next_thunk_addr;
-    m_next_thunk_addr += kThunkStride; // 2 instructions per trampoline
+#if defined(BL2_NATIVE_ARM32)
+    const std::array<uint32_t,5> native_veneer = {
+        0xE52DC008, 0xE59FC000, 0xE59FF000, thunk_id,
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&NativeThunkEntry))
+    };
+    const uint32_t thunk_addr = m_host.CreateCodeVeneer(native_veneer);
+    if (!thunk_addr) { m_registration_failed = true; return 0; }
+#else
+    const uint32_t thunk_addr = m_next_thunk_addr.load(std::memory_order_relaxed);
 
     // Write ARM32 trampoline instructions into guest memory:
     // 0: SVC #thunk_id (0xEF000000 | thunk_id)
@@ -295,15 +352,24 @@ uint32_t ThunkManager::RegisterThunk(const std::string& name, ThunkHandler handl
     uint32_t svc_instr = 0xEF000000 | (thunk_id & 0x00FFFFFF);
     uint32_t bx_lr_instr = 0xE12FFF1E;
 
-    m_host.MemoryWrite32(thunk_addr, svc_instr);
-    m_host.MemoryWrite32(thunk_addr + 4, bx_lr_instr);
+    // The trampoline pages are read-only to the guest after Initialize.
+    m_host.WriteLowGuardWord(thunk_addr, svc_instr);
+    m_host.WriteLowGuardWord(thunk_addr + 4, bx_lr_instr);
     // Trampolines are also created at runtime (dlsym, OpenSL ES vtables), so the JIT may
     // already hold a translation of this address range.
     m_host.InvalidateGuestCode(thunk_addr, 8);
+    // 2 instructions per trampoline; publish only after both are written.
+    m_next_thunk_addr.store(thunk_addr + kThunkStride, std::memory_order_release);
+#endif
 
     m_symbol_to_address[name] = thunk_addr;
     m_id_to_handler.push_back(std::move(handler));
     m_id_to_name.push_back(name);
+#if defined(BL2_NATIVE_ARM32)
+    m_id_writes_observed.push_back(0);
+#else
+    m_id_writes_observed.push_back(GuestNativeWritesObserved(name));
+#endif
     return thunk_addr;
 }
 
@@ -342,12 +408,31 @@ uint32_t ThunkManager::GetOrCreateThunkAddress(const std::string& name) {
 
 void ThunkManager::DispatchThunk(uint32_t thunk_id, Dynarmic::A32::Jit& jit) {
     if (thunk_id < m_id_to_handler.size() && m_id_to_handler[thunk_id]) {
+#if defined(BL2_NATIVE_ARM32)
+        NativeGlInventory(thunk_id, m_id_to_name[thunk_id].c_str(), jit.Regs().data());
+#endif
+#if !defined(BL2_NATIVE_ARM32)
         Bl2StartupThunkScope startup_scope(thunk_id,
                                            m_id_to_name[thunk_id].c_str(), jit);
+        if (m_write_watch_diagnostics && !m_id_writes_observed[thunk_id] &&
+            thunk_id < m_unknown_first_seen.size() &&
+            !m_unknown_first_seen[thunk_id].load(std::memory_order_relaxed) &&
+            !m_unknown_first_seen[thunk_id].exchange(1, std::memory_order_relaxed)) {
+            const uint32_t log = m_unknown_seen_logs.fetch_add(1, std::memory_order_relaxed);
+            if (log < 64) {
+                LOGI("Software write watch UNKNOWN #%u id=%u name=%s",
+                     log + 1, thunk_id, m_id_to_name[thunk_id].c_str());
+            } else if (log == 64) {
+                LOGI("Software write watch UNKNOWN: first-seen limit64 reached");
+            }
+        }
+        GuestUnclassifiedWriteScope write_scope(m_id_writes_observed[thunk_id]);
+#endif
         m_id_to_handler[thunk_id](jit, m_host);
     } else {
         const char* name = thunk_id < m_id_to_name.size()
             ? m_id_to_name[thunk_id].c_str() : "unknown";
+        (void)name; // Logging can be compiled out in the native quiet profile.
         LOGE("[THUNK] Unknown thunk ID: %u (%s) at PC: 0x%08X", thunk_id, name, jit.Regs()[15]);
         jit.Regs()[0] = 0;
     }
@@ -360,11 +445,16 @@ bool ThunkManager::DispatchNamedThunk(const std::string& name, Dynarmic::A32::Ji
         return false;
     }
     uint32_t instruction = m_host.MemoryRead32(symbol->second);
+#if defined(BL2_NATIVE_ARM32)
+    if (instruction != 0xE52DC008) return false;
+    DispatchThunk(m_host.MemoryRead32(symbol->second+12),jit);
+#else
     if ((instruction & 0xFF000000u) != 0xEF000000u) {
         LOGE("FATAL: symbol '%s' is not an SVC thunk (addr=0x%08X insn=0x%08X)",
              name.c_str(), symbol->second, instruction);
         return false;
     }
     DispatchThunk(instruction & 0x00FFFFFFu, jit);
+#endif
     return true;
 }

@@ -1,12 +1,21 @@
 #include <jni.h>
+#include <android/log.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <climits>
+#include <condition_variable>
+#include <deque>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <cerrno>
 #include <unistd.h>
 #include <fcntl.h>
@@ -24,13 +33,25 @@
 #include "thunks_opensles.h"
 #include "thunks_tegra.h"
 #include "bl2_native_resolution.h"
+#include "bl2_graphics_settings.h"
+#include "bl2_fresh_buffer_names.h"
 #include "bl2_pause_debug_menu.h"
 #include "bl2_vertex_element_fastpath.h"
 #include "bl2_convex_fastpath.h"
+#include "bl2_limiter_peak_fastpath.h"
+#include "bl2_program_locals_fastpath.h"
+#include "bl2_perf_hint.h"
+#include "bl2_hitch_report.h"
+#include "bl2_performance_settings.h"
+#include "bl2_audio_decode_fastpath.h"
+#include "bl2_guest_integrity.h"
 #include "bl2_touch_runtime.h"
 #include "bl2_io_failure_probe.h"
 #include "bl2_touch_physical.h"
 #include "bl2_locale.h"
+#include "bl2_shader_stage_cache.h"
+#include "bl2_touch_settings.h"
+#include "engine_hooks.h"
 #include "obb_pair_selection.h"
 
 #define LOG_TAG "Arm32Bridge_JNI"
@@ -161,45 +182,6 @@ constexpr uint32_t kPlatformSelectorExpected[] = {
     0xE59F4064,  // ldr r4,[pc,#0x64]
 };
 
-// FSystemSettings owns FSystemSettingsData at +4. These offsets were recovered
-// from FSystemSettingsData::LoadFromIni in the shipped ARM32 ELF and are guarded
-// below by validating every current value before changing it. Texture LOD data
-// starts at FSystemSettingsData+164 and is deliberately left untouched.
-constexpr uint32_t kSystemSettingsDataOffset = 4;
-enum TegraGraphicsFeature : uint32_t {
-    kStaticDecals         = 1u << 0,
-    kMobileBumpOffset     = 1u << 1,
-    kMobileEnvMapping     = 1u << 2,
-    kMobileFog            = 1u << 3,
-    kMobileNormalMapping  = 1u << 4,
-    kMobileRimLighting    = 1u << 5,
-    kMobileSpecular       = 1u << 6,
-    kMobileVertexMovement = 1u << 7,
-    kDetailModeHigh       = 1u << 8,
-};
-constexpr uint32_t kAllTegraGraphicsFeatures =
-    kStaticDecals | kMobileBumpOffset | kMobileEnvMapping | kMobileFog |
-    kMobileNormalMapping | kMobileRimLighting | kMobileSpecular |
-    kMobileVertexMovement | kDetailModeHigh;
-
-struct SystemSettingOverride {
-    const char* name;
-    uint32_t data_offset;
-    uint32_t feature;
-    uint32_t enabled_value;
-};
-
-constexpr SystemSettingOverride kTegraGraphicsOverrides[] = {
-    {"StaticDecals",          20,   kStaticDecals,         1},
-    {"MobileBumpOffset",      1068, kMobileBumpOffset,     1},
-    {"MobileEnvMapping",      1076, kMobileEnvMapping,     1},
-    {"MobileFog",             1056, kMobileFog,            1},
-    {"MobileNormalMapping",   1072, kMobileNormalMapping,  1},
-    {"MobileRimLighting",     1080, kMobileRimLighting,    1},
-    {"MobileSpecular",        1064, kMobileSpecular,       1},
-    {"MobileVertexMovement",  1092, kMobileVertexMovement, 1},
-    {"DetailMode",            0,    kDetailModeHigh,       2},
-};
 
 }  // namespace cfg
 
@@ -210,7 +192,16 @@ std::string g_saved_apk_path;
 // Inventory only until IndexApk can validate and select a whole main+patch pair.
 std::vector<std::string> g_saved_split_apk_paths;
 std::string g_saved_files_dir;
+// Persisted GL binaries use internal app storage, independently of save paths.
+std::string g_bl2_shader_cache_dir;
 static bool g_split_source_dirs_captured = false;
+static bool g_shader_cache_dir_capture_attempted = false;
+static bool g_shader_assets_capture_attempted = false;
+static AAssetManager* g_shader_assets = nullptr;
+// AAssetManager_fromJava remains valid while its Java manager is retained.
+static jobject g_shader_assets_owner = nullptr;
+static jclass g_shader_progress_class = nullptr;
+static jmethodID g_shader_progress_method = nullptr;
 static uint32_t g_language_ext_result = 0;
 
 static std::recursive_mutex g_load_mutex;
@@ -227,7 +218,14 @@ enum class GuestLoadState {
 // DynarmicHost at the same host address could make FakeJniEnv::Init mistake its
 // stale guest tables for current ones.
 static GuestLoadState g_guest_load_state = GuestLoadState::Cold;
-static bool g_tegra4_profile_selected = false;
+// Display callbacks can arrive before the guest has reached B_Init.
+// The host mutex protects the verified guest patch and its published literal.
+// Never hold the load mutex while waiting for a running guest's host mutex:
+// synchronous guest-to-Java callbacks can re-enter EnsureGameLoaded.
+static std::atomic<float> g_pending_display_refresh_rate{0.0f};
+static std::atomic<bool> g_bl2_tick_patch_ready{false};
+static uint32_t g_bl2_tick_limit_bits = 0;
+static std::atomic<bool> g_local_identity_prepared{false};
 
 // Guest pthreads are represented by detached host threads and may still be in
 // Dynarmic when the shared library's C++ globals are torn down. Android reclaims
@@ -438,7 +436,7 @@ static bool MmapGuestFromApk(const std::string& apk_path,
             view.data = static_cast<const uint8_t*>(mapped) + delta;
             view.size = uncompressed_size;
             view.entry_name = name;
-            LOGI("Mapped guest ELF from APK: %s (%u bytes)",
+            LOGI("Mapped stored APK entry: %s (%u bytes)",
                  name.c_str(), uncompressed_size);
             return true;
         }
@@ -447,6 +445,28 @@ static bool MmapGuestFromApk(const std::string& apk_path,
     close(fd);
     LOGE("MmapGuestFromApk: guest ELF candidates not found in %s", apk_path.c_str());
     return false;
+}
+
+std::vector<uint8_t> LoadBl2ShaderWarmupTable() {
+    GuestMmapView view;
+    if (!MmapGuestFromApk(g_saved_apk_path,
+                         {"assets/bl2_shader_warmup.bin"}, view)) return {};
+    std::vector<uint8_t> bytes;
+    if (view.size <= 8u * 1024u * 1024u) {
+        bytes.assign(view.data, view.data + view.size);
+    }
+    CloseGuestMmap(view);
+    return bytes;
+}
+
+static std::vector<uint8_t> LoadBl2JitWarmupTable() {
+    GuestMmapView view;
+    if (!MmapGuestFromApk(g_saved_apk_path, {"assets/bl2_jit_warmup.bin"}, view)) return {};
+    std::vector<uint8_t> bytes;
+    if (view.size <= Bl2JitWarmup::kMaxBytes)
+        bytes.assign(view.data, view.data + view.size);
+    CloseGuestMmap(view);
+    return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,13 +1085,11 @@ static bool InstallTegra4GraphicsSelectionPatch() {
     }
     ElfLoader& loader = g_host->GetElfLoader();
     if (loader.GetImageSize() != cfg::kGuestImageSize) {
-        g_tegra4_profile_selected = false;
         LOGI("Skipping inherited Horn Tegra 4 profile patch for this guest: "
              "image size 0x%08X (Horn signature expects 0x%08X)",
              loader.GetImageSize(), cfg::kGuestImageSize);
         return true;
     }
-    g_tegra4_profile_selected = patch_settings;
 
     const uint32_t settings_selector = Sym(cfg::kMobileSystemSettingsSelector);
     const uint32_t platform_selector = Sym(cfg::kGameGetCurrentPlatform);
@@ -1190,77 +1208,6 @@ static bool InstallTegra4GraphicsSelectionPatch() {
     LOGI("Graphics selection active: mode=%s profile=%s platform=%s",
          selection_mode, patch_settings ? cfg::kTegra4ProfileName : "device-default",
          patch_platform ? "Tegra4" : "device-default");
-    return true;
-}
-
-static uint32_t GetTegraGraphicsFeatureMask() {
-    char value[PROP_VALUE_MAX] = {};
-    if (__system_property_get("debug.horn.tegra_feature_mask", value) <= 0 ||
-        value[0] == '\0') {
-        return cfg::kAllTegraGraphicsFeatures;
-    }
-
-    char* end = nullptr;
-    const unsigned long parsed = std::strtoul(value, &end, 0);
-    if (end == value || *end != '\0' ||
-        (parsed & ~static_cast<unsigned long>(cfg::kAllTegraGraphicsFeatures)) != 0) {
-        LOGE("Ignoring invalid debug.horn.tegra_feature_mask='%s'; using 0x%03X",
-             value, cfg::kAllTegraGraphicsFeatures);
-        return cfg::kAllTegraGraphicsFeatures;
-    }
-    return static_cast<uint32_t>(parsed);
-}
-
-static bool ApplyTegraGraphicsFeatureMask() {
-    if (!g_tegra4_profile_selected) return true;
-
-    const uint32_t system_settings = Sym(cfg::kSystemSettingsGlobal);
-    if (!system_settings) return false;
-    const uint32_t data = system_settings + cfg::kSystemSettingsDataOffset;
-    const uint32_t mask = GetTegraGraphicsFeatureMask();
-
-    uint32_t before[std::size(cfg::kTegraGraphicsOverrides)] = {};
-    for (size_t i = 0; i < std::size(cfg::kTegraGraphicsOverrides); ++i) {
-        const auto& setting = cfg::kTegraGraphicsOverrides[i];
-        before[i] = g_host->MemoryRead32(data + setting.data_offset);
-        const bool valid = setting.feature == cfg::kDetailModeHigh
-            ? before[i] <= setting.enabled_value
-            : before[i] <= 1;
-        if (!valid) {
-            LOGE("Tegra graphics override refused: %s at 0x%08X has 0x%08X",
-                 setting.name, data + setting.data_offset, before[i]);
-            return false;
-        }
-    }
-
-    for (const auto& setting : cfg::kTegraGraphicsOverrides) {
-        const uint32_t desired = (mask & setting.feature)
-            ? setting.enabled_value : 0;
-        g_host->MemoryWrite32(data + setting.data_offset, desired);
-    }
-
-    for (const auto& setting : cfg::kTegraGraphicsOverrides) {
-        const uint32_t desired = (mask & setting.feature)
-            ? setting.enabled_value : 0;
-        if (g_host->MemoryRead32(data + setting.data_offset) != desired) {
-            LOGE("Tegra graphics override verification failed for %s at 0x%08X",
-                 setting.name, data + setting.data_offset);
-            return false;
-        }
-    }
-
-    LOGI("Tegra graphics feature mask 0x%03X applied: "
-         "decals=%u bump=%u env=%u fog=%u normal=%u rim=%u specular=%u vertex=%u detail=%u",
-         mask,
-         !!(mask & cfg::kStaticDecals),
-         !!(mask & cfg::kMobileBumpOffset),
-         !!(mask & cfg::kMobileEnvMapping),
-         !!(mask & cfg::kMobileFog),
-         !!(mask & cfg::kMobileNormalMapping),
-         !!(mask & cfg::kMobileRimLighting),
-         !!(mask & cfg::kMobileSpecular),
-         !!(mask & cfg::kMobileVertexMovement),
-         (mask & cfg::kDetailModeHigh) ? 2u : 0u);
     return true;
 }
 
@@ -1424,7 +1371,8 @@ static jobject CurrentApplication(JNIEnv* env) {
 
 static void CaptureHostPaths(JNIEnv* env, jobject candidate_context) {
     if (!env || (!g_saved_apk_path.empty() && !g_saved_files_dir.empty() &&
-                 g_split_source_dirs_captured)) return;
+                 g_split_source_dirs_captured && g_shader_cache_dir_capture_attempted &&
+                 g_shader_assets_capture_attempted)) return;
 
     jobject context = candidate_context;
     bool owns_context = false;
@@ -1448,6 +1396,20 @@ static void CaptureHostPaths(JNIEnv* env, jobject candidate_context) {
         if (owns_context) env->DeleteLocalRef(context);
         return;
     }
+
+    // Resolve the selected app language before any signed base/split indexing.
+    // The stock LanguageSet callback keeps INT/en for the mapped resource ABI.
+    jclass storage_class = env->FindClass("com/tt2kgames/Borderlands2/GameStorage");
+    jmethodID app_language = storage_class ? env->GetStaticMethodID(storage_class,
+        "appLanguage", "(Landroid/content/Context;)Ljava/lang/String;") : nullptr;
+    jstring language = app_language ? static_cast<jstring>(
+        env->CallStaticObjectMethod(storage_class, app_language, context)) : nullptr;
+    std::string selected_language = "en";
+    if (!env->ExceptionCheck()) CopyJavaString(env, language, selected_language);
+    else ClearPathLookupException(env, "appLanguage");
+    SetBl2LocaleLanguage(selected_language.c_str());
+    if (language) env->DeleteLocalRef(language);
+    if (storage_class) env->DeleteLocalRef(storage_class);
 
     if (g_saved_apk_path.empty() || !g_split_source_dirs_captured) {
         jmethodID get_application_info = env->GetMethodID(
@@ -1541,13 +1503,14 @@ static void CaptureHostPaths(JNIEnv* env, jobject candidate_context) {
         }
     }
 
-    // If app-specific external storage is temporarily unavailable, keep the
-    // legacy root accessible. The Java migration logs this as an open gate.
-    if (g_saved_files_dir.empty() && !env->ExceptionCheck()) {
-        jmethodID get_files_dir = env->GetMethodID(
-            context_class, "getFilesDir", "()Ljava/io/File;");
-        if (get_files_dir) {
-            jobject files_dir = env->CallObjectMethod(context, get_files_dir);
+    // Keep disposable binaries outside the legacy player files scanned by
+    // GameStorage. Internal files still provide the existing save fallback.
+    const auto capture_directory = [&](const char* method, std::string& destination) {
+        if (env->ExceptionCheck()) return;
+        jmethodID get_directory = env->GetMethodID(
+            context_class, method, "()Ljava/io/File;");
+        if (get_directory) {
+            jobject files_dir = env->CallObjectMethod(context, get_directory);
             if (files_dir && !env->ExceptionCheck()) {
                 jclass file_class = env->GetObjectClass(files_dir);
                 jmethodID absolute_path = file_class
@@ -1556,12 +1519,38 @@ static void CaptureHostPaths(JNIEnv* env, jobject candidate_context) {
                 jstring path = absolute_path
                     ? static_cast<jstring>(env->CallObjectMethod(files_dir, absolute_path))
                     : nullptr;
-                if (!env->ExceptionCheck()) CopyJavaString(env, path, g_saved_files_dir);
+                if (!env->ExceptionCheck()) CopyJavaString(env, path, destination);
                 if (path) env->DeleteLocalRef(path);
                 if (file_class) env->DeleteLocalRef(file_class);
             }
             if (files_dir) env->DeleteLocalRef(files_dir);
         }
+        if (env->ExceptionCheck()) ClearPathLookupException(env, method);
+    };
+    if (g_saved_files_dir.empty()) capture_directory("getFilesDir", g_saved_files_dir);
+    if (!g_shader_cache_dir_capture_attempted)
+        capture_directory("getCacheDir", g_bl2_shader_cache_dir);
+    // Cache storage is optional; a failed capture must not add JNI work to
+    // every later guest entry. An empty directory retains source-only warmup.
+    g_shader_cache_dir_capture_attempted = true;
+
+    if (!g_shader_assets_capture_attempted && !env->ExceptionCheck()) {
+        const jmethodID get_assets = env->GetMethodID(
+            context_class, "getAssets", "()Landroid/content/res/AssetManager;");
+        jobject assets = get_assets ? env->CallObjectMethod(context, get_assets) : nullptr;
+        if (assets && !env->ExceptionCheck()) {
+            jobject retained = env->NewGlobalRef(assets);
+            AAssetManager* manager = retained ? AAssetManager_fromJava(env, retained) : nullptr;
+            if (manager && !env->ExceptionCheck()) {
+                g_shader_assets_owner = retained;
+                g_shader_assets = manager;
+            } else if (retained) env->DeleteGlobalRef(retained);
+        }
+        if (assets) env->DeleteLocalRef(assets);
+        if (env->ExceptionCheck()) ClearPathLookupException(env, "getAssets");
+        // Cache preparation is optional; missing assets retain genuine lazy
+        // monolithic compilation without repeated Context work on guest entry.
+        g_shader_assets_capture_attempted = true;
     }
 
     if (env->ExceptionCheck()) {
@@ -1584,6 +1573,50 @@ static bool IsSupportedGuestJniVersion(jint version) {
            version == JNI_VERSION_1_4 || version == JNI_VERSION_1_6;
 }
 
+static void ShaderPreparationProgress(uint32_t completed, uint32_t total) {
+    if (!g_jvm || !g_shader_progress_class || !g_shader_progress_method || total > 1000000) return;
+    JNIEnv* env = nullptr;
+    const bool attach = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED;
+    if (attach && g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+    if (!env) return;
+    if (!env->ExceptionCheck()) {
+        // LaunchControls posts to the UI Handler; it never waits for the
+        // renderer or calls the guest while the shader mutex is held.
+        env->CallStaticVoidMethod(g_shader_progress_class, g_shader_progress_method,
+                                  jint(std::min(completed, total)), jint(total));
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            LOGE("Shader preparation progress failed");
+        }
+    }
+    if (attach) g_jvm->DetachCurrentThread();
+}
+
+bool PrepareBl2ShaderStageCache(Bl2ShaderStageCache& cache) {
+    if (!g_shader_assets) return false;
+    std::unique_ptr<AAsset, decltype(&AAsset_close)> asset(
+        AAssetManager_open(g_shader_assets, "bl2_shader_stages.bin", AASSET_MODE_STREAMING), AAsset_close);
+    if (!asset) return false;
+    const auto length = AAsset_getLength64(asset.get());
+    if (length <= 0 || length > 256LL * 1024 * 1024) return false;
+    const Bl2ShaderStageCache::Reader reader{
+        asset.get(), static_cast<uint64_t>(length),
+        [](void* opaque, uint8_t* bytes, size_t wanted) -> size_t {
+            const int read = AAsset_read(static_cast<AAsset*>(opaque), bytes,
+                                        std::min<size_t>(wanted, INT_MAX));
+            return read > 0 ? static_cast<size_t>(read) : 0;
+        },
+        [](void* opaque) { return AAsset_seek64(static_cast<AAsset*>(opaque), 0, SEEK_SET) == 0; }
+    };
+    const bool prepared = cache.PrepareStream(reader, g_bl2_shader_cache_dir,
+        [](void*, uint32_t completed, uint32_t total) {
+            ShaderPreparationProgress(completed, total);
+        });
+    ShaderPreparationProgress(0, 0);
+    return prepared;
+}
+
 static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
     ElfLoader& loader = g_host->GetElfLoader();
     if (loader.GetImageSize() != 0x03089000) return true;
@@ -1595,12 +1628,15 @@ static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
         return false;
     }
 
+    const uint32_t requested = bl2::touch::Bl2FrameRateLimit();
+    if (requested != 0 && requested != 30 && requested != 60 && requested != 90) return false;
     char diagnostic[PROP_VALUE_MAX] = {};
     const bool uncapped_diagnostic =
+        requested == 0 &&
         __system_property_get("debug.bl2.fps_limit", diagnostic) > 0 &&
         std::strcmp(diagnostic, "900") == 0;
-    const float limit = uncapped_diagnostic
-        ? cfg::kBl2DiagnosticFpsLimit : display_refresh_rate;
+    const float limit = requested ? static_cast<float>(requested) :
+        uncapped_diagnostic ? cfg::kBl2DiagnosticFpsLimit : display_refresh_rate;
     uint32_t limit_bits = 0;
     std::memcpy(&limit_bits, &limit, sizeof(limit_bits));
     const uint32_t address = Sym(cfg::kBl2GameGetMaxTickRate);
@@ -1612,11 +1648,11 @@ static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
         cfg::kBl2MaxTickRateLoad, cfg::kBl2MaxTickRateReturn, limit_bits,
     };
     bool original = true;
-    bool active = true;
+    bool active = g_bl2_tick_limit_bits != 0;
     for (size_t i = 0; i < std::size(replacement); ++i) {
         const uint32_t word = g_host->MemoryRead32(address + i * 4);
         original &= word == cfg::kBl2MaxTickRateExpected[i];
-        active &= word == replacement[i];
+        active &= word == (i == 2 ? g_bl2_tick_limit_bits : replacement[i]);
     }
     if (!original && !active) {
         LOGE("BL2 max tick patch refused: guest prologue mismatch");
@@ -1628,6 +1664,9 @@ static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
         g_host->MemoryWrite32(address + 4, replacement[1]);
         g_host->MemoryWrite32(address, replacement[0]);
         g_host->InvalidateGuestCode(address, sizeof(replacement));
+    } else if (g_bl2_tick_limit_bits != limit_bits) {
+        g_host->MemoryWrite32(address + 8, replacement[2]);
+        g_host->InvalidateGuestCode(address, sizeof(replacement));
     }
     for (size_t i = 0; i < std::size(replacement); ++i) {
         if (g_host->MemoryRead32(address + i * 4) != replacement[i]) {
@@ -1635,9 +1674,51 @@ static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
             return false;
         }
     }
-    LOGI("BL2 max tick patch active: display=%.3f Hz limit=%.3f FPS diagnostic=%d",
-         display_refresh_rate, limit, uncapped_diagnostic);
+    if (original || g_bl2_tick_limit_bits != limit_bits) {
+        __android_log_print(ANDROID_LOG_INFO, "BL2_Parity",
+            "ARM64 guest max tick limit %.3f FPS display=%.3f Hz requested=%u diagnostic=%d",
+            limit, display_refresh_rate, requested, uncapped_diagnostic);
+    }
+    g_bl2_tick_limit_bits = limit_bits;
     return true;
+}
+
+bool ApplyBl2FrameRateLimit(DynarmicHost& host) {
+    if (!g_bl2_tick_patch_ready.load(std::memory_order_acquire)) return true;
+    if (g_host.get() != &host) return false;
+    // A ready host is pinned for process lifetime. The present boundary already
+    // runs on its guest core; only this recursive host lock is needed here.
+    std::lock_guard<std::recursive_mutex> host_lock(host.GetMutex());
+    const bool applied = InstallBl2MaxTickRatePatch(
+        g_pending_display_refresh_rate.load(std::memory_order_acquire));
+    if (applied && g_bl2_tick_limit_bits) {
+        float limit = 0.0f;
+        std::memcpy(&limit, &g_bl2_tick_limit_bits, sizeof(limit));
+        Bl2PerfHintFrame(limit);
+        Bl2HitchSetFrameLimit(limit);
+    }
+    return applied;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_tt2kgames_Borderlands2_DisplayModePolicy_nativeRefreshRate(
+    JNIEnv*, jclass, jfloat refresh_rate) {
+    if (!std::isfinite(refresh_rate) || refresh_rate <= 0.0f ||
+        refresh_rate > cfg::kMaximumSaneDisplayRate) return JNI_FALSE;
+    DynarmicHost* host = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> load_lock(g_load_mutex);
+        if (g_guest_load_state == GuestLoadState::Fatal) return JNI_FALSE;
+        g_pending_display_refresh_rate.store(refresh_rate, std::memory_order_release);
+        if (!g_bl2_tick_patch_ready.load(std::memory_order_acquire)) return JNI_TRUE;
+        if (g_guest_load_state != GuestLoadState::Ready || !g_host) return JNI_FALSE;
+        // A Ready host is pinned for the process lifetime; it cannot be reset.
+        host = g_host.get();
+    }
+    std::lock_guard<std::recursive_mutex> host_lock(host->GetMutex());
+    return InstallBl2MaxTickRatePatch(
+        g_pending_display_refresh_rate.load(std::memory_order_acquire))
+        ? JNI_TRUE : JNI_FALSE;
 }
 
 static bool InstallOfflineDlcEnumerationPatch(DynarmicHost& host) {
@@ -1739,6 +1820,78 @@ static bool InstallBl2AstcBlockBytes(DynarmicHost& host) {
     return true;
 }
 
+// The local profile must exist before GameViewport saves its initial login
+// state. A late first sign-in marks that baseline dirty and WillowPlayerController
+// treats ordinary local initialization as a loss of online login.
+static bool InstallBl2LocalSessionPatch(DynarmicHost& host) {
+    auto& loader = host.GetElfLoader();
+    const auto base = loader.GetBaseAddress();
+    const auto sign_in = loader.GetSymbolAddress("_ZN26UOnlineSubsystemSteamworks13SignInLocallyEv");
+    const auto signed_in = loader.GetSymbolAddress("_Z23AndroidSteam_IsSignedInv");
+    const auto connected = loader.GetSymbolAddress("_Z24AndroidSteam_IsConnectedv");
+    if (loader.GetImageSize() != 0x03089000 ||
+        loader.GetSymbolAddress("_ZN26UOnlineSubsystemSteamworks4InitEv") != base + 0x01F5AEE4 ||
+        loader.GetSymbolAddress("_ZN26UOnlineSubsystemSteamworks26OnSteamServersDisconnectedEP26SteamServersDisconnected_t") != base + 0x01F55990 ||
+        sign_in != base + 0x01F55934 || signed_in != base + 0x01F529AC || connected != base + 0x01F52948)
+        return false;
+    constexpr std::pair<uint32_t,uint32_t> preimage[] = {
+        {0x01F5B4E4,0xE59440F0}, {0x01F5B4E8,0xE59D0040},
+        {0x01F5B4EC,0xE2944000}, {0x01F5B4F0,0x13A04001},
+        {0x01F5B500,0xE1A00004}, {0x01F5B504,0xE28DD084}, {0x01F5B508,0xE8BD8FF0},
+        {0x01F55A94,0xE2509000}, {0x01F55A98,0x1A000039},
+        {0x01F55A9C,0xE5D83111}, {0x01F55AA0,0xE3530000}, {0x01F55AA4,0x0A000038},
+        {0x01F55AA8,0xE5941064}, {0x01F55B84,0xE28DD040}, {0x01F55B88,0xE8BD87F0},
+        {0x01F55B8C,0xE1A00008}, {0x01F55B90,0xEBFFFF67},
+    };
+    for (const auto& [rva, word] : preimage)
+        if (!loader.IsReadOnlyRange(base + rva,4) || host.MemoryRead32(base + rva) != word) return false;
+    const auto initialize = host.GetThunkManager().RegisterThunk("bl2_initialize_local_session",
+        [sign_in,signed_in,connected](Dynarmic::A32::Jit& jit, DynarmicHost& current) {
+            const auto owner = jit.Regs()[4];
+            if (!g_local_identity_prepared.load(std::memory_order_acquire) || owner < 0x10000 ||
+                uint64_t{owner} + 0x4D8 > current.GetGuestMemorySize() ||
+                current.MemoryRead8(owner + 0x111) != 0 ||
+                !current.RunFunction(signed_in,{}) || current.RunFunction(connected,{})) return;
+            current.RunFunction(sign_in,{owner});
+            __android_log_print(ANDROID_LOG_INFO,"Arm32Bridge_LocalSession",
+                "Local session baseline initialized before viewport: status=%u remote=0",
+                unsigned(current.MemoryRead8(owner + 0x111)));
+        });
+    if (!initialize) return false;
+    const auto svc = host.MemoryRead32(initialize);
+    if ((svc & 0xFF000000u) != 0xEF000000u) return false;
+    const uint32_t init_words[] = {svc,0xE59440F0,0xE59D0040,0xE51FF004,base + 0x01F5B4EC};
+    // BLoggedOn was already false here. Preserve initial 0->local login and
+    // genuine 2->1 disconnects; an existing local 1 has no login status change.
+    const uint32_t disconnect_words[] = {
+        0xE5D83111,0xE3530001,0x059FF00C,0xE3530000,0x059FF008,0xE51FF004,
+        base + 0x01F55AA8,base + 0x01F55B84,base + 0x01F55B8C};
+#if defined(BL2_NATIVE_ARM32)
+    const auto init_veneer = host.CreateCodeVeneer(init_words);
+    const auto disconnect_veneer = host.CreateCodeVeneer(disconnect_words);
+#else
+    const auto allocate = [&host](const uint32_t* words, size_t count) {
+        const auto address = host.GuestAlloc(static_cast<uint32_t>(count * 4),4);
+        if (address) {
+            for (size_t i = 0; i < count; ++i) host.MemoryWrite32(address + uint32_t(i * 4),words[i]);
+            host.AddExecutableRange(address,static_cast<uint32_t>(count * 4));
+            host.InvalidateGuestCode(address,static_cast<uint32_t>(count * 4));
+        }
+        return address;
+    };
+    const auto init_veneer = allocate(init_words,std::size(init_words));
+    const auto disconnect_veneer = allocate(disconnect_words,std::size(disconnect_words));
+#endif
+    if (!init_veneer || !disconnect_veneer) return false;
+    for (const auto& [site,veneer] : {std::pair{base + 0x01F5B4E4,init_veneer},
+                                   std::pair{base + 0x01F55A9C,disconnect_veneer}}) {
+        host.MemoryWrite32(site,0xE51FF004); host.MemoryWrite32(site + 4,veneer);
+        host.InvalidateGuestCode(site,8);
+        if (host.MemoryRead32(site) != 0xE51FF004 || host.MemoryRead32(site + 4) != veneer) return false;
+    }
+    return true;
+}
+
 static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
     std::lock_guard<std::recursive_mutex> load_lock(g_load_mutex);
     CaptureHostPaths(env, context);
@@ -1777,6 +1930,7 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
             g_guest_load_state = GuestLoadState::Fatal;
             return false;
         }
+        IndexBl2CacheBase(g_saved_apk_path.c_str());
         if (g_split_source_dirs_captured) {
             std::vector<const char*> split_paths;
             split_paths.reserve(g_saved_split_apk_paths.size());
@@ -1784,8 +1938,9 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
                 split_paths.push_back(path.c_str());
             }
             if (IndexObbSplitApks(split_paths.data(), split_paths.size()) != 0) {
-                // A corrupt/incomplete embedded set must not shadow the
-                // existing external path. External validation remains a gate.
+                // An incompatible/incomplete embedded set must not shadow the
+                // existing external path. Downloader checks its names/sizes;
+                // the original guest parses FOOB without a full-content hash.
                 LOGE("No usable embedded OBB pair; retaining external OBB fallback");
             }
             IndexBl2LocaleSplits(split_paths.data(), split_paths.size(), g_saved_files_dir.c_str());
@@ -1816,7 +1971,13 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
         return false;
     }
 
-    if (!InstallBl2AstcBlockBytes(*g_host) || !InstallBl2NativeResolutionPatch(*g_host)) {
+    if (!InstallBl2AstcBlockBytes(*g_host) || !InstallBl2NativeResolutionPatch(*g_host) ||
+        !InstallBl2FreshPersistentBufferNames(*g_host)) {
+        g_host.reset();
+        g_guest_load_state = GuestLoadState::Fatal;
+        return false;
+    }
+    if (!InstallBl2LocalSessionPatch(*g_host)) {
         g_host.reset();
         g_guest_load_state = GuestLoadState::Fatal;
         return false;
@@ -1848,11 +2009,20 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
         g_guest_load_state = GuestLoadState::Fatal;
         return false;
     }
-    if (!InstallBorderlandsNvsiLifecycle(*g_host)) {
+    if (!InstallBl2GraphicsSettings(*g_host)) {
+        LOGE("BL2 original graphics settings hooks failed");
+        g_host.reset();g_guest_load_state = GuestLoadState::Fatal;return false;
+    }
+    if (!InstallBorderlandsNvsiLifecycle(*g_host) ||
+        !InstallBl2RenderWithoutNvsi(*g_host)) {
         g_host.reset();
         g_guest_load_state = GuestLoadState::Fatal;
         return false;
     }
+    // Large guest blocks get their own coalescing range (dynarmic_host.h);
+    // before the fast paths, so their heap checks see the final layout.
+    if (!g_host->EnableLargeBlockRegion())
+        LOGE("Large guest block range unavailable; shared heap only");
     // This optimization is deliberately optional: exact symbol/table
     // signatures and a differential run against the unmodified guest must all
     // pass before its entry point is redirected.
@@ -1860,9 +2030,32 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
     if (!InstallBl2VertexElementFastpath(*g_host)) {
         LOGE("Optional BL2 vertex fast path unavailable; retaining guest path");
     }
-    if (!InstallBl2ConvexFastpath(*g_host)) {
+    if (!InstallBl2ConvexFastpath(*g_host,kBl2PerformanceDefaults&7)) {
         LOGE("Optional BL2 convex fast path unavailable; retaining guest path");
     }
+    if (!InstallBl2LimiterPeakFastpath(*g_host,(kBl2PerformanceDefaults&32)!=0)) {
+        LOGE("Optional BL2 limiter peak fast path unavailable; retaining guest path");
+    }
+    if (!InstallBl2ProgramLocalsFastpath(*g_host,(kBl2PerformanceDefaults&16)!=0)) {
+        LOGE("Optional BL2 program locals fast path unavailable; retaining guest path");
+    }
+    if (!InstallBl2SetupVertexArraysFastpath(*g_host,(kBl2PerformanceDefaults&8)!=0)) {
+        LOGE("Optional BL2 setup arrays fast path unavailable; retaining guest path");
+    }
+    if (!InstallBl2AudioDecodeFastpaths(*g_host,(kBl2PerformanceDefaults>>6)&3)) {
+        LOGE("Optional BL2 audio decode fast path unavailable; retaining guest path");
+    }
+    // Last: snapshots RELRO after every bridge patch (bl2_guest_integrity.h).
+    StartBl2GuestIntegrityWatch(*g_host);
+    // The original ELF passed VerifyBl2NativeResolutionInput before loading;
+    // all code patches are now installed, before Native_Render starts its loop.
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    g_host->InstallPhysxCookieWatch(true);
+#endif
+    if (!g_host->InstallJitWarmupTable(LoadBl2JitWarmupTable()))
+        LOGI("JIT warmup unavailable; retaining ordinary compilation");
+    else
+        g_host->LoadLearnedJitProfile(g_saved_files_dir);
     // Resolve this before FakeJniEnv is bound to the host. A missing symbol is
     // permanent for the loaded payload, but it must not leave FakeJniEnv holding
     // guest addresses from a host that is then destroyed.
@@ -2126,6 +2319,47 @@ static jstring B_GetGraphicsPath(JNIEnv* env, jobject self) {
 
 static float QueryDisplayRefreshRate(JNIEnv* env, jobject activity);
 
+static bool PrepareBl2LocalIdentity(JNIEnv* env, jobject self) {
+    // prepareStartup uses the existing callback to initialize actual local save
+    // and achievement managers. Its existing worker delivers the accurate
+    // disconnected JNI identity. No cloud sync work exists in LocalSaveGame.
+    jclass activity = env->GetObjectClass(self);
+    jfieldID identity_field = activity ? env->GetFieldID(activity,"mLocalIdentity",
+        "Lcom/tt2kgames/Borderlands2/LocalIdentity;") : nullptr;
+    jfieldID worker_field = identity_field ? env->GetFieldID(activity,"mLocalSignInThread",
+        "Ljava/lang/Thread;") : nullptr;
+    jobject identity = worker_field ? env->GetObjectField(self,identity_field) : nullptr;
+    jclass identity_class = identity ? env->GetObjectClass(identity) : nullptr;
+    jmethodID prepare = identity_class ? env->GetMethodID(identity_class,"prepareStartup","()V") : nullptr;
+    if (prepare && !env->ExceptionCheck()) env->CallVoidMethod(identity,prepare);
+    jobject worker = prepare && !env->ExceptionCheck() ? env->GetObjectField(self,worker_field) : nullptr;
+    jclass worker_class = worker ? env->GetObjectClass(worker) : nullptr;
+    jmethodID join = worker_class ? env->GetMethodID(worker_class,"join","(J)V") : nullptr;
+    jmethodID alive = join ? env->GetMethodID(worker_class,"isAlive","()Z") : nullptr;
+    if (alive && !env->ExceptionCheck()) env->CallVoidMethod(worker,join,jlong{1000});
+    const bool completed = alive && !env->ExceptionCheck() && !env->CallBooleanMethod(worker,alive);
+    if (worker_class) env->DeleteLocalRef(worker_class);
+    if (worker) env->DeleteLocalRef(worker);
+    if (identity_class) env->DeleteLocalRef(identity_class);
+    if (identity) env->DeleteLocalRef(identity);
+    if (activity) env->DeleteLocalRef(activity);
+    if (!completed || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        __android_log_print(ANDROID_LOG_ERROR,"Arm32Bridge_LocalSession","Local identity preparation failed");
+        return false;
+    }
+    const auto tick = GuestSymbol("_Z23AndroidSteam_TickSignInv");
+    const auto signed_in = GuestSymbol("_Z23AndroidSteam_IsSignedInv");
+    const auto connected = GuestSymbol("_Z24AndroidSteam_IsConnectedv");
+    if (!tick || !signed_in || !connected) return false;
+    g_host->RunFunction(tick,{});
+    const bool ready = g_host->RunFunction(signed_in,{}) && !g_host->RunFunction(connected,{});
+    g_local_identity_prepared.store(ready,std::memory_order_release);
+    if (ready) __android_log_print(ANDROID_LOG_INFO,"Arm32Bridge_LocalSession",
+        "Real local save/achievement owners prepared before engine initialization; remote=0");
+    return ready;
+}
+
 static jboolean B_Init(JNIEnv* env, jobject self, jint width, jint height,
                        jfloat scale, jboolean use_surface,
                        jobject surface, jboolean fullscreen,
@@ -2134,12 +2368,27 @@ static jboolean B_Init(JNIEnv* env, jobject self, jint width, jint height,
     // BL2 initializes before SurfaceCreated, normally with 0x0. The generic
     // object in this entry is its AssetManager; validate the real Surface only
     // in B_PostInitUpdate, which subsequently selects the render dimensions.
-    const float display_refresh_rate = QueryDisplayRefreshRate(env, self);
-    LOGI("BL2 Display.getRefreshRate=%.3f Hz", display_refresh_rate);
     if (!PrepareGuestCall(env, self)) return JNI_FALSE;
+    if (!PrepareBl2LocalIdentity(env,self)) return JNI_FALSE;
     {
+        // Query after guest loading: a pending startup rate may already be stale.
+        float pending = g_pending_display_refresh_rate.load(std::memory_order_acquire);
+        const float display_refresh_rate = QueryDisplayRefreshRate(env, self);
+        if (std::isfinite(display_refresh_rate) && display_refresh_rate > 0.0f &&
+            display_refresh_rate <= cfg::kMaximumSaneDisplayRate) {
+            // Preserve a newer display callback that arrived during the query.
+            g_pending_display_refresh_rate.compare_exchange_strong(
+                pending, display_refresh_rate, std::memory_order_acq_rel);
+        }
         std::lock_guard<std::recursive_mutex> host_lock(g_host->GetMutex());
-        if (!InstallBl2MaxTickRatePatch(display_refresh_rate)) return JNI_FALSE;
+        // Init and the installed DisplayListener run on the UI thread.
+        // Early callbacks retain their rate until this guest patch is ready.
+        g_bl2_tick_patch_ready.store(true, std::memory_order_release);
+        if (!InstallBl2MaxTickRatePatch(
+                g_pending_display_refresh_rate.load(std::memory_order_acquire))) {
+            g_bl2_tick_patch_ready.store(false, std::memory_order_release);
+            return JNI_FALSE;
+        }
     }
     ThunkManager::s_screenWidth = static_cast<uint32_t>(width);
     ThunkManager::s_screenHeight = static_cast<uint32_t>(height);
@@ -2163,13 +2412,114 @@ static jboolean B_InputEvent(JNIEnv* env, jobject self, jint a, jint b,
          JLongLow(timestamp), JLongHigh(timestamp)}) ? JNI_TRUE : JNI_FALSE;
 }
 
+// The guest InterruptionChanged spins in usleep(100 ms), without a timeout,
+// until the game thread acknowledges the pause or resume at the top of its
+// frame (GHasStoppedRendering). A frame can itself wait for the UI thread (a
+// Java callback) or for audio progress: Wwise sync bank work needs the OpenSL
+// buffer callbacks that PauseAudioPlayback suppresses. Spinning on the UI
+// thread with audio already paused deadlocked a focus loss mid-frame (ANR:
+// FocusEvent not consumed). One worker keeps the guest calls in order, audio
+// pauses only after the guest parked, and the UI thread waits a bounded time.
+namespace lifecycle {
+
+constexpr const char* kSymbol = "_Z34NativeCallback_InterruptionChangedP7_JNIEnvP8_jobjecth";
+constexpr auto kUiWait = std::chrono::milliseconds(2000);  // ANR fires at 5 s.
+
+std::mutex g_mutex;
+std::condition_variable g_cv;
+std::deque<std::pair<uint64_t, bool>> g_queue;
+jobject g_receiver = nullptr;  // Global ref to the latest activity.
+uint64_t g_next = 0, g_done = 0;
+uint32_t g_result = 1;
+bool g_started = false, g_failed = false;
+
+// Pause/resume pairs the guest call with the audio pump in a deadlock-free order.
+uint32_t Run(JNIEnv* env, jobject receiver, bool interrupted) {
+    if (!interrupted) ResumeAudioPlayback();
+    const uint32_t result = RunGuest32(env, receiver, kSymbol,
+                                       {static_cast<uint32_t>(interrupted)});
+    if (interrupted) PauseAudioPlayback();
+    return result;
+}
+
+void Worker() {
+    pthread_setname_np(pthread_self(), "BL2Lifecycle");
+    JNIEnv* env = nullptr;
+    if (!g_jvm || g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
+        __android_log_print(ANDROID_LOG_ERROR, "BL2Lifecycle", "worker could not attach to the VM");
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_failed = true;  // The UI thread drains the queue itself.
+        g_cv.notify_all();
+        return;
+    }
+    std::unique_lock<std::mutex> lock(g_mutex);
+    for (;;) {
+        g_cv.wait(lock, [] { return !g_queue.empty(); });
+        const auto [serial, interrupted] = g_queue.front();
+        g_queue.pop_front();
+        jobject receiver = g_receiver ? env->NewLocalRef(g_receiver) : nullptr;
+        lock.unlock();
+        const uint32_t result = Run(env, receiver, interrupted);
+        if (receiver) env->DeleteLocalRef(receiver);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        lock.lock();
+        g_done = serial;
+        g_result = result;
+        g_cv.notify_all();
+    }
+}
+
+}  // namespace lifecycle
+
 static jboolean B_InterruptionChanged(JNIEnv* env, jobject self,
                                       jboolean interrupted) {
-    if (interrupted) PauseAudioPlayback();
-    else ResumeAudioPlayback();
-    return RunGuest32(env, self,
-        "_Z34NativeCallback_InterruptionChangedP7_JNIEnvP8_jobjecth",
-        {static_cast<uint32_t>(interrupted)}) ? JNI_TRUE : JNI_FALSE;
+    bool ready = false;
+    {
+        std::lock_guard<std::recursive_mutex> load_lock(g_load_mutex);
+        ready = g_guest_load_state == GuestLoadState::Ready && g_host;
+    }
+    std::unique_lock<std::mutex> lock(lifecycle::g_mutex);
+    if (ready && !lifecycle::g_started && !lifecycle::g_failed) {
+        try {
+            std::thread(lifecycle::Worker).detach();
+            lifecycle::g_started = true;
+        } catch (...) {
+            lifecycle::g_failed = true;
+        }
+    }
+    if (!ready || lifecycle::g_failed) {
+        // Requests left by a worker that never attached run first, in order.
+        std::deque<std::pair<uint64_t, bool>> pending;
+        pending.swap(lifecycle::g_queue);
+        lock.unlock();
+        uint32_t result = 1;
+        for (const auto& request : pending) result = lifecycle::Run(env, self, request.second);
+        result = lifecycle::Run(env, self, interrupted != JNI_FALSE);
+        return result ? JNI_TRUE : JNI_FALSE;
+    }
+    jobject receiver = self ? env->NewGlobalRef(self) : nullptr;
+    if (lifecycle::g_receiver) env->DeleteGlobalRef(lifecycle::g_receiver);
+    lifecycle::g_receiver = receiver;
+    const uint64_t serial = ++lifecycle::g_next;
+    lifecycle::g_queue.emplace_back(serial, interrupted != JNI_FALSE);
+    lifecycle::g_cv.notify_all();
+    lifecycle::g_cv.wait_for(lock, lifecycle::kUiWait,
+        [serial] { return lifecycle::g_done >= serial || lifecycle::g_failed; });
+    if (lifecycle::g_done >= serial)
+        return lifecycle::g_done == serial && !lifecycle::g_result ? JNI_FALSE : JNI_TRUE;
+    if (lifecycle::g_failed) {
+        std::deque<std::pair<uint64_t, bool>> pending;
+        pending.swap(lifecycle::g_queue);
+        lock.unlock();
+        uint32_t result = 1;
+        for (const auto& request : pending) result = lifecycle::Run(env, self, request.second);
+        return result ? JNI_TRUE : JNI_FALSE;
+    }
+    // The guest returns 1 on both paths; JNI_FALSE would make Java kill the process.
+    __android_log_print(ANDROID_LOG_WARN, "BL2Lifecycle",
+        "interrupted=%d still waiting for the game thread after %lld ms; UI continues",
+        interrupted ? 1 : 0, static_cast<long long>(lifecycle::kUiWait.count()));
+    return JNI_TRUE;
 }
 
 static jboolean B_KeyEvent(JNIEnv* env, jobject self, jint a, jint b, jint c,
@@ -2325,9 +2675,12 @@ static jint B_NvsiUnlock(JNIEnv* env, jobject self) {
 }
 
 static jboolean B_OnPause(JNIEnv* env, jobject self) {
-    return RunGuest32(env, self,
+    const jboolean result = RunGuest32(env, self,
         "_Z22NativeCallback_onPauseP7_JNIEnvP8_jobject")
         ? JNI_TRUE : JNI_FALSE;
+    // The process may be killed while paused: keep this run's learned blocks.
+    if (g_host) g_host->RequestLearnedJitSave();
+    return result;
 }
 
 static jboolean B_OnResume(JNIEnv* env, jobject self) {
@@ -2474,10 +2827,6 @@ static jboolean H_Initialize(JNIEnv* env, jobject self, jint width, jint height,
         "_Z25NativeCallback_InitializeP7_JNIEnvP8_jobjectiifhS2_h",
         {static_cast<uint32_t>(width), static_cast<uint32_t>(height),
          FloatBits(scale), static_cast<uint32_t>(use_zip)}) ? JNI_TRUE : JNI_FALSE;
-    if (result == JNI_TRUE && !ApplyTegraGraphicsFeatureMask()) {
-        LOGE("NativeCallback_Initialize: Tegra graphics feature override failed");
-        return JNI_FALSE;
-    }
     LOGI("NativeCallback_Initialize end result=%d", static_cast<int>(result));
     return result;
 }
@@ -2839,7 +3188,23 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
-    LOGI("JNI_OnLoad: ARM64 host for Borderlands 2 ARM32 guest");
+    __android_log_print(ANDROID_LOG_INFO, "BL2_Parity",
+        "backend=arm64-dynarmic guest=armeabi-v7a JNI_OnLoad");
+
+    jclass controls = FindRequiredClass(env, "com/tt2kgames/Borderlands2/LaunchControls");
+    if (!controls) return JNI_ERR;
+    g_shader_progress_method = env->GetStaticMethodID(controls, "showShaderPreparation", "(II)V");
+    if (g_shader_progress_method && !env->ExceptionCheck())
+        g_shader_progress_class = static_cast<jclass>(env->NewGlobalRef(controls));
+    env->DeleteLocalRef(controls);
+    if (!g_shader_progress_class || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        LOGE("Required shader preparation progress method unavailable");
+        return JNI_ERR;
+    }
 
     // Capture paths before any native can be invoked. CurrentApplication is the
     // fallback because JNI_OnLoad has no Activity receiver.

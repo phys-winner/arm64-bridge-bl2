@@ -6,6 +6,9 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
+#if defined(BL2_NATIVE_ARM32)
+bool Bl2NativeSha256Transform(uint32_t* state, const uint8_t* block, const uint32_t* rounds);
+#endif
 
 // Small streaming SHA-256 for direct OBB integrity checks. It keeps at most
 // one 64-byte block, so a whole-container split never needs to be extracted.
@@ -107,6 +110,10 @@ private:
             0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208,
             0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
         };
+#if defined(BL2_NATIVE_ARM32)
+        if (!std::is_constant_evaluated() &&
+            Bl2NativeSha256Transform(state_.data(), block_.data(), rounds.data())) return;
+#endif
         std::array<uint32_t, 64> words{};
         for (size_t i = 0; i < 16; ++i) {
             const size_t at = i * 4;

@@ -10,7 +10,7 @@ $relativePackage = 'com\tt2kgames\Borderlands2'
 $portNames = @('LaunchControls','GameStorage','DisplayModePolicy','Downloader',
     'LocalPlatform','LocalIdentity','LocalSaveGame','LocalAchievements')
 $source = @($portNames | ForEach-Object { Join-Path $root "android_port\src\$relativePackage\$_.java" })
-$touchNames = @('NativeTouchControls','TouchBridge','TouchContract','TouchInput','TouchLayout','TouchPreferences','TouchSources')
+$touchNames = @('NativeTouchControls','TouchBridge','TouchContract','TouchInput','TouchLayout','TouchPreferences','TouchSources','TouchGyro')
 foreach ($name in $touchNames) {
     $source += Join-Path $root "android_port\src\$relativePackage\touch\$name.java"
 }
@@ -41,13 +41,13 @@ try {
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $root "app\smali\$relativePackage\$($file.Name)") -Force
     }
     $touchGenerated = @(Get-ChildItem -LiteralPath (Join-Path $temporary "smali\$relativePackage\touch") -File)
-    if (!$touchGenerated -or ($touchGenerated | Where-Object { $_.Name -notmatch '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources)(?:\$[^\\]+)?\.smali$' })) {
+    if (!$touchGenerated -or ($touchGenerated | Where-Object { $_.Name -notmatch '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources|TouchGyro)(?:\$[^\\]+)?\.smali$' })) {
         throw 'Unexpected generated touch class ownership'
     }
     $touchDestination = Join-Path $root "app\smali\$relativePackage\touch"
     [IO.Directory]::CreateDirectory($touchDestination) | Out-Null
     foreach ($old in Get-ChildItem -LiteralPath $touchDestination -File) {
-        if ($old.Name -match '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources)(?:\$[^\\]+)?\.smali$' -and
+        if ($old.Name -match '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources|TouchGyro)(?:\$[^\\]+)?\.smali$' -and
             $old.Name -notin $touchGenerated.Name) { Remove-Item -LiteralPath $old.FullName }
     }
     foreach ($file in $touchGenerated) {

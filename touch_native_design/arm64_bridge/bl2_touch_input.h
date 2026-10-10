@@ -7,8 +7,9 @@
 
 namespace bl2::touch {
 
-constexpr std::uint64_t kProtocolVersion = 1;
-constexpr std::size_t kActionCount = 25;
+constexpr std::uint64_t kProtocolVersion = 3;
+constexpr std::size_t kSnapshotWords = 18;
+constexpr std::size_t kActionCount = 27;
 constexpr std::size_t kTransitionsPerAction = 16;
 constexpr std::size_t kMaxPointers = 10;
 constexpr std::size_t kPointerQueueCapacity = 64;
@@ -23,12 +24,15 @@ enum class Mode : std::uint32_t {
 };
 enum Capability : std::uint32_t {
     GameplayInput = 1u << 0, RelativeLook = 1u << 1, DirectUi = 1u << 2,
-    PhysicalOwnsInput = 1u << 3, CanSkip = 1u << 4, UiNavigation = 1u << 5, UiTapTest = 1u << 6
+    PhysicalOwnsInput = 1u << 3, CanSkip = 1u << 4, UiNavigation = 1u << 5, UiTapTest = 1u << 6,
+    UiWidgets = 1u << 7, PauseBackdrop = 1u << 8, DebugCanvas = 1u << 9,
+    MapGestures = 1u << 10
 };
 enum class Action : std::uint8_t {
     Fire = 0, Aim, Jump, Crouch, Reload, Use, Melee, Grenade, Skill, Sprint,
     NextWeapon, PreviousWeapon, Inventory, Map, Pause, Back, Confirm, Skip,
-    VehicleBrake, VehicleBoost, VehicleHorn, UiUp, UiDown, UiLeft, UiRight
+    VehicleBrake, VehicleBoost, VehicleHorn, UiUp, UiDown, UiLeft, UiRight,
+    LastWeapon, Chat
 };
 constexpr std::uint64_t actionBit(Action action) {
     return std::uint64_t{1} << static_cast<unsigned>(action);
@@ -40,6 +44,13 @@ enum ResetReason : std::uint32_t {
     InvalidNumeric = 1u << 4, InvalidPointer = 1u << 5
 };
 
+enum HudRegion : std::uint32_t {
+    HudMinimap = 1u << 0, HudAmmo = 1u << 1,
+    HudObjectives = 1u << 2, HudObjectivesEmpty = 1u << 3,
+    HudUse = 1u << 4
+};
+struct SurfaceRect { float left = 0, top = 0, right = 0, bottom = 0; };
+
 struct Context {
     Mode mode = Mode::Unknown;
     std::uint32_t capabilities = 0;
@@ -47,13 +58,21 @@ struct Context {
     // Engine-owned lifetime token; change when the scene/controller object is
     // replaced, even if mode, address and capabilities happen to be identical.
     std::uint64_t sceneIdentity = 0;
+    // Unknown availability is distinct from a proven unavailable action. These
+    // observations change every frame without invalidating pointer ownership.
+    std::uint64_t knownActions = 0;
+    std::int32_t weaponCount = -1, grenadeCount = -1;
+    std::uint32_t hudValidMask = 0;
+    // Objective flags are mutually exclusive. Empty means a successful native
+    // visibility query, not a failed projection or a missing movie.
+    SurfaceRect mapRect{}, ammoRect{}, objectiveRect{}, useRect{};
 };
 
 struct Snapshot {
     std::uint64_t epoch = 1;
     Context context{};
     std::uint64_t frameSerial = 0;
-    std::array<std::uint64_t, 8> wire() const;
+    std::array<std::uint64_t, kSnapshotWords> wire() const;
 };
 
 struct ActionEdge {
@@ -71,6 +90,7 @@ struct PointerEvent {
     float surfaceY = 0;
     std::uint64_t sourceEpoch = 0;
     std::uint64_t sequence = 0;
+    std::uint64_t timestampMs = 0;
 };
 
 struct Frame {

@@ -1,3 +1,4 @@
+#include "guest_software_write_watch.h"
 #include "horn_fastpaths.h"
 
 #include "bridge_log.h"
@@ -136,6 +137,8 @@ bool DifferentialProgramKeySelfTest(DynarmicHost& host,
         std::array<uint8_t, kProgramKeyBytes> expected{};
         PackProgramKeyData(data, expected.data());
         std::memset(output, 0xA5, kProgramKeyBytes);
+        NotifyGuestMemoryWritten(data_address, 0x200);
+        NotifyGuestMemoryWritten(output_address, kProgramKeyBytes);
         host.RunFunction(guest_function, {data_address, output_address});
         if (std::memcmp(output, expected.data(), expected.size()) != 0) {
             LOGE("Program-key fast-path differential test %u failed", test);

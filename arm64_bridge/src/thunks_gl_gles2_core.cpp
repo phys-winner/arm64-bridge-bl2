@@ -1,6 +1,8 @@
+#include "guest_software_write_watch.h"
 #include "thunk_manager.h"
 #include "dynarmic_host.h"
 #include "thunk_types.h"
+#include "gl_storage_call_diagnostic.h"
 
 #include <GLES3/gl32.h>
 #include <GLES2/gl2ext.h>
@@ -8,6 +10,9 @@
 #include <android/log.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#if defined(BL2_NATIVE_ARM32)
+#include <time.h>
+#endif
 
 #include <array>
 #include <algorithm>
@@ -31,12 +36,18 @@
 #include "guest_mapped_dirty_tracker.h"
 #include "gl_blit_compat.h"
 #include "scene_upper_readback.h"
+#include "bl2_hitch_report.h"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
 #define LOGE(...) HORN_LOGE(LOG_TAG, __VA_ARGS__)
 
 bool HasGlES3();
+void RefreshGlBindings();
 GLenum TranslateLegacyGlExternalFormat(GLenum format);
 bool CopyGlBufferShadow(GLuint buffer, size_t offset, size_t size, void* output);
+#if defined(BL2_NATIVE_ARM32)
+bool CopyGlBufferShadowSnapshot(GLuint buffer, size_t offset, size_t size, void* output);
+bool SceneAuditEnabled();
+#endif
 void TrackGlBufferBinding(GLenum target, GLuint buffer);
 void UpdateGlBufferShadow(GLuint buffer, size_t offset, size_t size,
                           const void* data);
@@ -45,6 +56,8 @@ size_t SyncChangedGlBufferMapping(GLuint buffer, size_t offset, size_t size,
                                   bool force_full);
 bool RefreshLegacyProgramStateForDraw();
 bool CurrentLegacyPipelineIsGfxText();
+bool GfxAttributesMayBeMisaligned();
+void NoteGfxAttributesAligned();
 bool CurrentLegacyPipelineIsPostprocessBlend();
 void SceneAuditLogFinalQuadDraw(const char* operation, GLint first,
                                 GLsizei count, GLsizei instances);
@@ -68,13 +81,31 @@ void InvalidateLegacyTextureCacheAcrossContexts();
 
 namespace {
 
+bool GlMapAuditEnabled() {
+    static const bool enabled = [] {
+        char value[PROP_VALUE_MAX] = {};
+        return __system_property_get("debug.bl2.gl_map_audit", value) > 0 &&
+               strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 std::mutex s_desktop_occlusion_queries_mutex;
 std::unordered_set<GLuint> s_desktop_occlusion_queries;
 
 // The desktop guest expects a sample count, while GLES exposes a boolean.
-// Compare bounded positive counts in one running process: UINT_MAX might
-// overflow or overdrive a consumer that uses the count for coverage.
+// Compare bounded positive counts in one running process. UINT_MAX is the
+// original RHI's unavailable-result sentinel, so a ready result must avoid it.
 int OcclusionProbeMode() {
+#if defined(BL2_NATIVE_ARM32)
+    static const int mode = [] {
+        char value[PROP_VALUE_MAX] = {};
+        __system_property_get("debug.horn.occlusion_probe", value);
+        return strcmp(value, "log") == 0 ? 1 : strcmp(value, "visible") == 0 ? 2 :
+               strcmp(value, "count65535") == 0 ? 3 : strcmp(value, "count262144") == 0 ? 4 :
+               strcmp(value, "count1048576") == 0 ? 5 : 0;
+    }();
+#else
     static thread_local uint32_t calls = 0;
     static thread_local int mode = 0;
     if ((++calls & 31u) == 1u) {
@@ -87,10 +118,11 @@ int OcclusionProbeMode() {
                          strcmp(value, "count1048576") == 0 ? 5 : 0;
         if (next != mode) {
             mode = next;
-            LOGI("Occlusion probe mode=%d (0=normal,1=log,2=all-visible,"
+            LOGI("Occlusion probe mode=%d (0=normal,1=log,2=log,"
                  "3=count65535,4=count262144,5=count1048576)", mode);
         }
     }
+#endif
     return mode;
 }
 
@@ -671,6 +703,9 @@ struct GuestMappedBuffer {
     GLintptr offset = 0;
     bool synchronized = false;
     bool tracked = false;
+#if defined(BL2_NATIVE_ARM32)
+    bool native_direct = false;
+#endif
 };
 
 // OpenGL tracks mappings per buffer object, not per binding target. Unity commonly
@@ -679,11 +714,26 @@ struct GuestMappedBuffer {
 // and retain identity when a context migrates to another host thread.
 std::mutex s_mapping_mutex;
 std::unordered_map<void*, GuestMappedBuffer> s_guest_mapped_buffers;
+// Set after a draw-time pass in which every persistent write mapping was
+// tracked and synchronized; any change of the mapping set clears it. With no
+// new dirty epoch such a pass has nothing to copy (s_mapping_mutex).
+bool s_mapping_set_steady = false;
 
 GuestMappedDirtyTracker& MappedDirtyTracker() {
     // A process-lifetime instance leaves no dangling signal-handler storage.
     static auto* tracker = new GuestMappedDirtyTracker;
     return *tracker;
+}
+
+// Default on. debug.bl2.mapped_alias=0 before launch restores the previous
+// locked/mprotect native-write path for same-APK comparison.
+bool MappedAliasEnabled() {
+    static const bool enabled = [] {
+        char value[PROP_VALUE_MAX] = {};
+        return !(__system_property_get("debug.bl2.mapped_alias", value) > 0 &&
+                 value[0] == '0');
+    }();
+    return enabled;
 }
 
 bool DirtySyncRequested() {
@@ -698,6 +748,29 @@ bool DirtySyncRequested() {
     }();
     return requested;
 }
+
+#if defined(BL2_NATIVE_ARM32)
+bool NativeDirectCoherentAccess(GLbitfield access) {
+    constexpr GLbitfield required = GL_MAP_WRITE_BIT | 0x0040 | 0x0080;
+    // READ cannot be combined with INVALIDATE or UNSYNCHRONIZED. Retain the
+    // staging path for all modes beyond the verified pure coherent mapping.
+    return (access & required) == required &&
+        (access & ~(required | GL_MAP_READ_BIT)) == 0;
+}
+bool NativeMapProfileEnabled() {
+    static const bool enabled = [] {
+        char value[PROP_VALUE_MAX]{};
+        return __system_property_get("debug.bl2.native_map_profile", value) > 0 &&
+            std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+uint64_t NativeMapClock(clockid_t clock) {
+    timespec now{};
+    return clock_gettime(clock, &now) == 0
+        ? uint64_t(now.tv_sec) * 1000000000ULL + uint64_t(now.tv_nsec) : 0;
+}
+#endif
 
 constexpr std::optional<uint64_t> PixelUnpackBytes(uint32_t w, uint32_t h, uint32_t d,
                                                   uint32_t bpp, std::array<int, 6> u,
@@ -765,6 +838,42 @@ uint32_t AllocateGuestGlSyncHandleLocked() {
 
 }  // namespace
 
+#if defined(BL2_NATIVE_ARM32)
+bool NativeDirectGlMappingsRequested() {
+    static const bool requested = [] {
+        char value[PROP_VALUE_MAX]{};
+        // Set 0 before process launch to measure the old staging path in the
+        // same APK. An unset property selects native coherent mapping.
+        return !(__system_property_get("debug.bl2.native_mapped", value) > 0 &&
+                 std::strcmp(value, "0") == 0);
+    }();
+    return requested;
+}
+
+bool CopyNativeGlMappedBuffer(GLuint buffer, size_t offset, size_t size, void* output) {
+    if (size > SIZE_MAX - offset) return false;
+    std::lock_guard lock(s_mapping_mutex);
+    for (const auto& [pointer, mapping] : s_guest_mapped_buffers) {
+        if (!mapping.native_direct || mapping.buffer != buffer) continue;
+        const size_t map_begin = static_cast<size_t>(mapping.offset);
+        const size_t map_end = map_begin + mapping.length;
+        const size_t request_end = offset + size;
+        if (offset > map_end || request_end < map_begin) continue;
+        if ((offset < map_begin || request_end > map_end) &&
+            !CopyGlBufferShadowSnapshot(buffer, offset, size, output)) return false;
+        const size_t begin = std::max(offset, map_begin);
+        const size_t end = std::min(request_end, map_end);
+        // Internal storage/map flags include READ: CPU consumers of the shadow
+        // read the live driver mapping only for the range they actually need.
+        if (end > begin)
+            std::memcpy(static_cast<uint8_t*>(output) + begin - offset,
+                        static_cast<const uint8_t*>(pointer) + begin - map_begin, end - begin);
+        return true;
+    }
+    return false;
+}
+#endif
+
 void SceneAuditLogFramebufferPixels(const char* label, uint32_t index,
                                     GLint x0, GLint y0, GLint x1, GLint y1) {
     LogFramebufferPixels(label, index, x0, y0, x1, y1);
@@ -775,14 +884,66 @@ static_assert(sizeof(GLenum) == 4);
 static_assert(std::is_pointer_v<GLsync>);
 static_assert(sizeof(GLsync) == sizeof(void*));
 
+GuestUnclassifiedWriteScope::GuestUnclassifiedWriteScope(bool writes_observed) {
+    if (!writes_observed) watch_ = CurrentGuestSoftwareWriteWatch();
+    if (watch_) watch_->BeginUnknown();
+}
+
+GuestUnclassifiedWriteScope::~GuestUnclassifiedWriteScope() {
+    if (!watch_) return;
+    std::lock_guard mapping_lock(s_mapping_mutex);
+    constexpr GLbitfield kMapPersistentBit = 0x0040;
+    for (const auto& [native_pointer, mapping] : s_guest_mapped_buffers) {
+        (void)native_pointer;
+        if ((mapping.access & GL_MAP_WRITE_BIT) &&
+            (mapping.access & kMapPersistentBit)) {
+            watch_->MarkRange(mapping.guest_address, mapping.length);
+        }
+    }
+    // Publication strictly precedes the transition back to the precise path.
+    watch_->EndUnknown();
+}
+
+static void UntrackGuestMappedWriteWatch(uint32_t address, size_t length) {
+    if (auto* watch = CurrentGuestSoftwareWriteWatch()) watch->Untrack(address, length);
+    else MappedDirtyTracker().Untrack(address, length);
+}
+
 GuestMappedWriteGuard::GuestMappedWriteGuard(uint32_t guest_address,
-                                             size_t length)
-    : lock_(s_mapping_mutex) {
+                                             size_t length, bool alias_allowed)
+    : lock_(s_mapping_mutex, std::defer_lock), address_(guest_address), length_(length) {
+    software_ = CurrentGuestSoftwareWriteWatch() != nullptr;
+#if !defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    // Almost every guest memcpy/memset targets unwatched memory. Skipping the
+    // process-wide mapping mutex there keeps game/audio threads from waiting
+    // on the render thread's draw-time synchronization.
+    if (!software_ && MappedAliasEnabled() &&
+        !MappedDirtyTracker().MayContainTracked(guest_address, length)) return;
+#endif
+    lock_.lock();
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    cookie_token_ = DynarmicHost::BeginPhysxNativeWrite(guest_address, length);
+#endif
+    if (software_) return;
+#if !defined(BL2_NATIVE_ARM32)
+    // Dynamic vertex/index fills: write the shared alias and keep the guest
+    // view read-only, instead of an RW mprotect now and an RO one per draw.
+    if (alias_allowed &&
+        (alias_ = MappedDirtyTracker().AliasFor(guest_address, length))) return;
+#else
+    (void)alias_allowed;
+#endif
     dirty_ = MappedDirtyTracker().PrepareNativeWrite(guest_address, length);
 }
 
 GuestMappedWriteGuard::~GuestMappedWriteGuard() {
-    if (dirty_) MappedDirtyTracker().CompleteNativeWrite();
+    if (!lock_.owns_lock()) return;
+    if (software_) NotifyGuestMemoryWritten(address_, length_);
+    else if (alias_) MappedDirtyTracker().CompleteAliasWrite(address_, length_);
+    else if (dirty_) MappedDirtyTracker().CompleteNativeWrite();
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    DynarmicHost::EndPhysxNativeWrite(cookie_token_);
+#endif
 }
 
 void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
@@ -790,10 +951,20 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
     constexpr GLbitfield kMapCoherentBit = 0x0080;
     const EGLContext context = eglGetCurrentContext();
     if (context == EGL_NO_CONTEXT) return;
+#if defined(BL2_NATIVE_ARM32)
+    const bool profile = NativeMapProfileEnabled();
+    const uint64_t wall_start = profile ? NativeMapClock(CLOCK_MONOTONIC) : 0;
+    const uint64_t cpu_start = profile ? NativeMapClock(CLOCK_THREAD_CPUTIME_ID) : 0;
+    size_t direct_bytes = 0;
+    size_t direct_count = 0;
+#endif
 
     std::lock_guard mapping_lock(s_mapping_mutex);
+    auto* software = CurrentGuestSoftwareWriteWatch();
+    const bool force_full_scan = software &&
+        (!DirtySyncRequested() || software->UnknownActive());
     GuestMappedDirtyTracker* tracker = nullptr;
-    if (DirtySyncRequested() &&
+    if (!software && DirtySyncRequested() &&
         MappedDirtyTracker().Initialize(host.GetGuestMemoryBase(),
                                         host.GetGuestMemorySize())) {
         tracker = &MappedDirtyTracker();
@@ -806,27 +977,39 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
     size_t copied_bytes = 0;
     const uint32_t dirty_epoch = tracker ? tracker->DirtyEpoch() : 0;
     const bool scan_dirty_pages = tracker && tracker->NeedsDirtyScan(dirty_epoch);
-    if (scan_dirty_pages) {
-        // Snapshot the dirty-page set, then re-protect it before reading any
-        // page. A simultaneous writer either finishes before our comparison
-        // or faults again and remains dirty for the next draw. Do this for all
-        // mappings together: two guest mappings may share one 16 KiB page.
+    if (tracker && !scan_dirty_pages && s_mapping_set_steady) return;
+    bool steady = tracker != nullptr;
+    if (software || scan_dirty_pages) {
+        // Snapshot all dirty pages before comparisons. The legacy path rearms
+        // RO; the software path consumes flags before copying so a later
+        // completed write leaves its flag set for the next draw. Two mappings
+        // sharing a page must use the same snapshot.
         for (const auto& [native_pointer, mapping] : s_guest_mapped_buffers) {
             (void)native_pointer;
             if (!mapping.tracked || !(mapping.access & GL_MAP_WRITE_BIT) ||
                 !(mapping.access & kMapPersistentBit)) continue;
-            const size_t first_page = mapping.guest_address / tracker->PageSize();
+            const size_t page_size = software ? software->PageSize() : tracker->PageSize();
+            const size_t first_page = mapping.guest_address / page_size;
             const size_t past_last_page =
                 (static_cast<uint64_t>(mapping.guest_address) +
-                 mapping.length - 1) / tracker->PageSize() + 1;
+                 mapping.length - 1) / page_size + 1;
             for (size_t page = first_page; page < past_last_page; ++page) {
-                if (tracker->IsDirty(page)) dirty_pages.push_back(page);
+                if (software ? software->ConsumeDirty(page) : tracker->IsDirty(page)) {
+                    dirty_pages.push_back(page);
+                }
             }
         }
-        tracker->Rearm(dirty_pages);
-        // Keep the epoch captured before the scan. A fault or failed re-arm
-        // during it bumps the counter and forces another scan next draw.
-        tracker->MarkDirtyScanComplete(dirty_epoch);
+        if (tracker) {
+            tracker->Rearm(dirty_pages);
+            // Retain legacy epoch semantics in the default RO path.
+            tracker->MarkDirtyScanComplete(dirty_epoch);
+        } else {
+            // Shared pages have ONE consumed snapshot for every mapped segment.
+            // Consumption precedes all comparisons/copies; never clear after.
+            std::sort(dirty_pages.begin(), dirty_pages.end());
+            dirty_pages.erase(std::unique(dirty_pages.begin(), dirty_pages.end()),
+                              dirty_pages.end());
+        }
     }
     const size_t dirty_page_count = dirty_pages.size();
     for (auto& [native_pointer, mapping] : s_guest_mapped_buffers) {
@@ -842,6 +1025,19 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
             continue;
         }
 
+#if defined(BL2_NATIVE_ARM32)
+        if (mapping.native_direct) {
+            // Coherent stores already reach the GPU. Refresh only the opt-in
+            // audit snapshot; normal client-array/shadow reads use live ranges.
+            if (SceneAuditEnabled())
+                UpdateGlBufferShadow(mapping.buffer, static_cast<size_t>(mapping.offset),
+                                     mapping.length, mapping.host_pointer);
+            direct_bytes += mapping.length;
+            ++direct_count;
+            continue;
+        }
+#endif
+
         const void* guest_pointer =
             host.GetGuestMemoryBase() + mapping.guest_address;
         // The CPU shadow also backs client-array diagnostics. Compare it with
@@ -851,13 +1047,16 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
         // Arm before the initial copy. A write between that copy and Track()
         // would otherwise change guest bytes without marking the page dirty.
         const bool was_tracked = mapping.tracked;
-        if (tracker && !mapping.tracked) {
-            mapping.tracked = tracker->Track(mapping.guest_address, mapping.length);
+        if ((tracker || software) && !mapping.tracked) {
+            mapping.tracked = software
+                ? software->Track(mapping.guest_address, mapping.length)
+                : tracker->Track(mapping.guest_address, mapping.length);
         }
         // The dirty snapshot was taken before this loop. A newly successful
         // Track must scan its full range, including a retry after Track failed.
-        if (tracker && was_tracked && mapping.tracked && mapping.synchronized) {
-            const size_t page_size = tracker->PageSize();
+        if ((tracker || software) && was_tracked && mapping.tracked &&
+            mapping.synchronized && !force_full_scan) {
+            const size_t page_size = software ? software->PageSize() : tracker->PageSize();
             const uint64_t guest_begin = mapping.guest_address;
             const uint64_t guest_end = guest_begin + mapping.length;
             const size_t first_page = guest_begin / page_size;
@@ -890,6 +1089,9 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
             mapping.synchronized = true;
         }
 
+        steady = steady && mapping.tracked && mapping.synchronized &&
+                 !((mapping.access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
+                   !(mapping.access & kMapCoherentBit));
         // Coherent native mappings become visible without an explicit flush.
         // For an explicit-flush mapping, flush here only when its original
         // binding is still current; the guest's own flush thunk handles all
@@ -897,11 +1099,52 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
         if ((mapping.access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
             !(mapping.access & kMapCoherentBit) &&
             GetBoundGlBuffer(mapping.target) == mapping.buffer) {
-            glFlushMappedBufferRange(mapping.target, mapping.offset,
+            // Flush offsets are relative to this mapping in both guest ABIs.
+            glFlushMappedBufferRange(mapping.target, 0,
                                      static_cast<GLsizeiptr>(mapping.length));
         }
         ++mapping_count;
         mapped_bytes += mapping.length;
+    }
+    s_mapping_set_steady = steady;
+    if (copied_bytes) Bl2HitchAddBufferUpload(copied_bytes);
+#if defined(BL2_NATIVE_ARM32)
+    if (profile && (mapping_count || direct_count)) {
+        static thread_local std::array<uint64_t, 7> totals{};
+        totals[1] += direct_bytes;
+        totals[2] += mapped_bytes;
+        totals[3] += byte_count;
+        totals[4] += copied_bytes;
+        totals[5] += NativeMapClock(CLOCK_THREAD_CPUTIME_ID) - cpu_start;
+        totals[6] += NativeMapClock(CLOCK_MONOTONIC) - wall_start;
+        if (++totals[0] == 512) {
+            LOGI("Native persistent-map profile draws=512 mode=%s direct=%.1fMiB "
+                 "staged=%.1fMiB scanned=%.1fMiB copied=%.1fMiB cpu=%.3fms wall=%.3fms",
+                 NativeDirectGlMappingsRequested() ? "direct" : "staging",
+                 totals[1] / 1048576.0, totals[2] / 1048576.0,
+                 totals[3] / 1048576.0, totals[4] / 1048576.0,
+                 totals[5] / 1000000.0, totals[6] / 1000000.0);
+            totals = {};
+        }
+    }
+#endif
+    if (software && mapping_count != 0) {
+        static thread_local std::array<uint64_t, 6> watch_stats{};
+        watch_stats[0] += force_full_scan;
+        watch_stats[1] += mapped_bytes;
+        watch_stats[2] += byte_count;
+        watch_stats[3] += dirty_page_count;
+        if (++watch_stats[4] == 512) {
+            const uint64_t completed = software->UnknownCompleted();
+            LOGI("Software write watch: draws=512 conservative_full=%llu "
+                 "mapped=%.1fMiB scanned=%.1fMiB dirty_pages=%llu unknown_completed=%llu",
+                 static_cast<unsigned long long>(watch_stats[0]),
+                 watch_stats[1] / 1048576.0, watch_stats[2] / 1048576.0,
+                 static_cast<unsigned long long>(watch_stats[3]),
+                 static_cast<unsigned long long>(completed - watch_stats[5]));
+            watch_stats = {};
+            watch_stats[5] = completed;
+        }
     }
     if (mapping_count != 0 && HornPerfEnabled()) {
         static thread_local uint64_t calls = 0;
@@ -952,24 +1195,51 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
 
 void ResetGuestMappedDirtyTracker() {
     std::lock_guard mapping_lock(s_mapping_mutex);
+    s_mapping_set_steady = false;
     MappedDirtyTracker().Shutdown();
     for (auto& [native_pointer, mapping] : s_guest_mapped_buffers) {
         (void)native_pointer;
+        if (mapping.tracked && CurrentGuestSoftwareWriteWatch()) {
+            UntrackGuestMappedWriteWatch(mapping.guest_address, mapping.length);
+        }
         mapping.tracked = false;
     }
 }
 
+#if !defined(BL2_NATIVE_ARM32)
+static std::atomic<int> s_scene_audit_mode{-1};
+static int ReadSceneAuditMode() {
+    char value[PROP_VALUE_MAX] = {};
+    __system_property_get("debug.horn.scene_audit", value);
+    return SceneAuditModeFromValue(value);
+}
+#endif
+
 static int SceneAuditMode() {
-    // Permit a bounded audit to be armed after the intro: the first 48 samples
-    // otherwise belong to the menumap and never describe class/gameplay frames.
-    static thread_local int mode = 0;
-    static thread_local uint32_t calls = 0;
-    if ((++calls & 127u) == 1u) {
+#if defined(BL2_NATIVE_ARM32)
+    static const int mode = [] {
         char value[PROP_VALUE_MAX] = {};
         __system_property_get("debug.horn.scene_audit", value);
-        mode = SceneAuditModeFromValue(value);
+        return SceneAuditModeFromValue(value);
+    }();
+#else
+    // Permit a bounded audit to be armed after the intro: the first 48 samples
+    // otherwise belong to the menumap and never describe class/gameplay frames.
+    // Several draw-path calls per draw read one relaxed global; the property
+    // itself is re-read once per present (RefreshSceneAuditMode).
+    int mode = s_scene_audit_mode.load(std::memory_order_relaxed);
+    if (mode < 0) {
+        mode = ReadSceneAuditMode();
+        s_scene_audit_mode.store(mode, std::memory_order_relaxed);
     }
+#endif
     return mode;
+}
+
+void RefreshSceneAuditMode() {
+#if !defined(BL2_NATIVE_ARM32)
+    s_scene_audit_mode.store(ReadSceneAuditMode(), std::memory_order_relaxed);
+#endif
 }
 
 bool SceneAuditEnabled() { return SceneAuditMode() != 0; }
@@ -1570,6 +1840,8 @@ bool ResolveGlPixels(DynarmicHost& host, int width, int height, int depth,
     GLint pbo = 0;
     if (HasGlES3()) glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
     if (pbo) {
+        // Persistent-map writes reach the native buffer only at a sync.
+        SyncGuestMappedBuffersForGpuRead(host);
         *pixels = reinterpret_cast<const void*>(static_cast<uintptr_t>(address));
         return true;
     }
@@ -1665,6 +1937,7 @@ bool UploadBgraPixels2D(DynarmicHost& host, GLenum target, GLint level,
     std::vector<uint8_t> source_copy;
     const uint8_t* source = nullptr;
     if (pbo != 0) {
+        SyncGuestMappedBuffersForGpuRead(host);
         try { source_copy.resize(static_cast<size_t>(*required)); }
         catch (...) { return false; }
         if (!CopyGlBufferShadow(static_cast<GLuint>(pbo), address,
@@ -1745,22 +2018,84 @@ bool UploadBgraPixels2D(DynarmicHost& host, GLenum target, GLint level,
     return true;
 }
 
-void ForgetGuestGlMappings(DynarmicHost& host, GLsizei count, const GLuint* buffers) {
-    if(count<=0 || !buffers)return;
-    const EGLContext context=eglGetCurrentContext();
+bool ForgetGuestGlMappings(DynarmicHost& host, GLsizei count, const GLuint* buffers) {
+    if (count <= 0 || !buffers || eglGetCurrentContext() == EGL_NO_CONTEXT) return true;
     std::lock_guard lock(s_mapping_mutex);
-    for(auto it=s_guest_mapped_buffers.begin();it!=s_guest_mapped_buffers.end();) {
-        if(it->second.context==context && std::find(buffers,buffers+count,it->second.buffer)!=buffers+count) {
-            if (it->second.tracked) {
-                MappedDirtyTracker().Untrack(it->second.guest_address,
-                                             it->second.length);
-            }
-            host.GuestFree(it->second.guest_address);it=s_guest_mapped_buffers.erase(it);
-        } else ++it;
+    const bool has_candidate = std::any_of(s_guest_mapped_buffers.begin(),
+        s_guest_mapped_buffers.end(), [&](const auto& entry) {
+            return std::find(buffers, buffers + count, entry.second.buffer) != buffers + count;
+        });
+    if (!has_candidate) return true;
+
+    PreserveSceneAuditGlError(glGetError());
+    GLint old_read = 0, old_array = 0;
+    GLuint probe_array = 0;
+    glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &old_read);
+    GLenum target = GL_COPY_READ_BUFFER;
+    if (old_read != 0) {
+        // Rebinding an old name cannot restore a deferred-deleted object after
+        // that name was reused. A fresh VAO gives us an empty EBO binding.
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_array);
+        glGenVertexArrays(1, &probe_array);
+        if (!probe_array) {
+            PreserveSceneAuditGlError(glGetError());
+            return false;
+        }
+        glBindVertexArray(probe_array);
+        target = GL_ELEMENT_ARRAY_BUFFER;
     }
+    bool ready_to_delete = true;
+    for (GLsizei i = 0; i < count; ++i) {
+        const GLuint buffer = buffers[i];
+        if (!buffer || !glIsBuffer(buffer)) continue;
+        glBindBuffer(target, buffer);
+        void* pointer = nullptr;
+        glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &pointer);
+        const auto found = s_guest_mapped_buffers.find(pointer);
+        if (found == s_guest_mapped_buffers.end() || found->second.buffer != buffer) continue;
+        const auto& mapping = found->second;
+        // Complete the guest writes before the deletion's implicit unmap.
+        if ((mapping.access & GL_MAP_WRITE_BIT) &&
+            !(mapping.access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
+            GuestRangeValid(host.GetGuestMemorySize(), mapping.guest_address, mapping.length)) {
+            const void* data = host.GetGuestMemoryBase() + mapping.guest_address;
+            memcpy(mapping.host_pointer, data, mapping.length);
+            UpdateGlBufferShadow(mapping.buffer, static_cast<size_t>(mapping.offset), mapping.length, data);
+        }
+        // Mali keeps a deferred-deleted shared object's native mapping alive.
+        // Perform the specified unmap on this exact object before retiring its
+        // guest staging; keep the driver's other-context references untouched.
+        const GLboolean result = glUnmapBuffer(target);
+        GLint still_mapped = GL_TRUE;
+        glGetBufferParameteriv(target, GL_BUFFER_MAPPED, &still_mapped);
+        if (still_mapped != GL_FALSE) {
+            // FALSE alone can mean an unmapped object with corrupt data. Never
+            // free live staging on a failed unmap/query or claim deletion ran.
+            LOGE("glDeleteBuffers cannot retire live mapping buffer=%u native=%p "
+                 "unmap=%u mapped=%d; deletion not submitted",
+                 buffer, pointer, static_cast<unsigned>(result), still_mapped);
+            ready_to_delete = false;
+            break;
+        }
+        if (mapping.tracked) UntrackGuestMappedWriteWatch(mapping.guest_address, mapping.length);
+#if defined(BL2_NATIVE_ARM32)
+        if (!mapping.native_direct)
+#endif
+            host.GuestFree(mapping.guest_address);
+        s_guest_mapped_buffers.erase(found);
+        s_mapping_set_steady = false;
+    }
+    glBindBuffer(target, 0);
+    if (probe_array) {
+        glBindVertexArray(static_cast<GLuint>(old_array));
+        glDeleteVertexArrays(1, &probe_array);
+        InvalidateGlAttribCache();
+    }
+    PreserveSceneAuditGlError(glGetError());
+    return ready_to_delete;
 }
 
-void RefreshGlBindings();
+void RefreshGlVertexArrayBindings();
 void TrackGlBufferBinding(GLenum target, GLuint buffer);
 GLuint GetBoundGlBuffer(GLenum target);
 
@@ -1841,8 +2176,8 @@ static bool DrawGfxTextWithAlignedVertices(
     GLint base_vertex, PFNGLDRAWELEMENTSBASEVERTEXOESPROC function) {
     // ponytail: bound to 2048 glyph quads; widen only if a real UI exceeds it.
     constexpr uint32_t kMaxVertices = 8192;
-    if (!CurrentLegacyPipelineIsGfxText() || !function ||
-        mode != GL_TRIANGLES || type != GL_UNSIGNED_SHORT ||
+    if (!CurrentLegacyPipelineIsGfxText() || !GfxAttributesMayBeMisaligned() ||
+        !function || mode != GL_TRIANGLES || type != GL_UNSIGNED_SHORT ||
         count <= 0 || count > (kMaxVertices / 4) * 6 || base_vertex != 0) return false;
     GLint source = 0, position_type = 0, position_stride = 0;
     void* position_pointer = nullptr;
@@ -1851,9 +2186,13 @@ static bool DrawGfxTextWithAlignedVertices(
     glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &position_stride);
     glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER,
                               &position_pointer);
-    if (source <= 0 || position_type != GL_FLOAT ||
-        (position_stride != 16 && position_stride != 20) ||
-        (reinterpret_cast<uintptr_t>(position_pointer) & 3u) == 0) return false;
+    if (source <= 0 || (reinterpret_cast<uintptr_t>(position_pointer) & 3u) == 0) {
+        // Attribute 0 stays aligned until the next pointer/VAO change.
+        NoteGfxAttributesAligned();
+        return false;
+    }
+    if (position_type != GL_FLOAT ||
+        (position_stride != 16 && position_stride != 20)) return false;
     const size_t record_stride = static_cast<size_t>(position_stride);
     struct Attribute {
         GLuint index;
@@ -2198,8 +2537,11 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         const GLsizei width = static_cast<GLsizei>(args.I32());
         const GLsizei height = static_cast<GLsizei>(args.I32());
         const GLenum format = static_cast<GLenum>(args.U32());
-        const GLenum type = static_cast<GLenum>(args.U32());
+        GLenum type = static_cast<GLenum>(args.U32());
         const uint32_t pixels_address = args.Ptr();
+        // Desktop packed 8_8_8_8_REV is the RGBA/BGRA byte order on LE hosts.
+        if (type == 0x8367 && (format == GL_RGBA || format == GL_BGRA_EXT))
+            type = GL_UNSIGNED_BYTE;
         if (format == GL_BGRA_EXT && type == GL_UNSIGNED_BYTE) {
             if (!UploadBgraPixels2D(host, target, level, GL_RGBA8, width, height,
                                     0, x_offset, y_offset, pixels_address, true)) {
@@ -2213,6 +2555,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
                              pixels_address, &pixels, false)) {
             return;
         }
+        Bl2HitchAddTextureUpload(uint64_t(std::max(width, 0)) * uint64_t(std::max(height, 0)) * 4u);
         static std::atomic<uint32_t> calls{0};
         const uint32_t index = calls.fetch_add(1, std::memory_order_relaxed) + 1;
         GLint texture = 0;
@@ -2375,26 +2718,45 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         Arm32CallArgs args(jit, host);
         const GLuint query = static_cast<GLuint>(args.U32());
         const GLenum pname = static_cast<GLenum>(args.U32());
+        const uint32_t params_address = args.Ptr();
         GLuint* params = GuestOutputArray<GLuint>(
-            host, args.Ptr(), 1, 1, "glGetQueryObjectuiv");
+            host, params_address, 1, 1, "glGetQueryObjectuiv");
         if (!params) return;
-        glGetQueryObjectuiv(query, pname, params);
-        const GLuint native_value = *params;
-        const int probe_mode = OcclusionProbeMode();
+        // Desktop NO_WAIT leaves the caller's memory untouched until the real
+        // result is ready. GLES accepts only RESULT and RESULT_AVAILABLE.
+        constexpr GLenum kDesktopQueryResultNoWait = 0x9194;
+        GLenum native_pname = pname;
+        if (pname == kDesktopQueryResultNoWait) {
+            GLuint available = GL_FALSE;
+            glGetQueryObjectuiv(query, GL_QUERY_RESULT_AVAILABLE, &available);
+            if (available == GL_FALSE) return;
+            native_pname = GL_QUERY_RESULT;
+        }
         bool desktop_query = false;
-        if (pname == GL_QUERY_RESULT) {
+        if (native_pname == GL_QUERY_RESULT) {
             std::lock_guard lock(s_desktop_occlusion_queries_mutex);
             desktop_query = s_desktop_occlusion_queries.contains(query);
-            if (desktop_query && (native_value != 0 || probe_mode == 2)) {
-                // GLES exposes only a boolean result. A raw 1 would fail the
-                // UE3 caller's sample-count threshold and falsely cull even
-                // large visible objects. Keep the ordinary UINT_MAX mapping
-                // until a bounded count is validated on the menu and gameplay.
-                *params = probe_mode == 3 ? 65535u :
-                          probe_mode == 4 ? 262144u :
-                          probe_mode == 5 ? 1048576u :
-                          std::numeric_limits<GLuint>::max();
-            }
+        }
+        GLuint native_value = std::numeric_limits<GLuint>::max();
+        glGetQueryObjectuiv(query, native_pname, desktop_query ? &native_value : params);
+        if (desktop_query) {
+            // A boolean query can only produce 0 or 1. If the driver leaves
+            // this marker untouched on an error, preserve the guest's output
+            // and pending GL error rather than converting it into visibility.
+            if (native_value == std::numeric_limits<GLuint>::max()) return;
+            *params = native_value;
+        } else {
+            native_value = *params;
+        }
+        const int probe_mode = OcclusionProbeMode();
+        if (desktop_query && native_value != 0) {
+            // Preserve the existing conservative positive count: raw 1 fails
+            // UE3's >15-sample visibility threshold. The RHI must also be able
+            // to distinguish this ready result from its UINT_MAX sentinel.
+            *params = probe_mode == 3 ? 65535u :
+                      probe_mode == 4 ? 262144u :
+                      probe_mode == 5 ? 1048576u :
+                      std::numeric_limits<GLuint>::max() - 1u;
         }
         static std::atomic<uint32_t> query_reads{0};
         const uint32_t read = query_reads.fetch_add(1, std::memory_order_relaxed);
@@ -2409,6 +2771,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
                  read + 1, query, pname, native_value, *params,
                  desktop_query, probe_mode);
         }
+        NotifyGuestMemoryWritten(params_address, sizeof(GLuint));
     });
     manager.RegisterThunkIfAbsent("glGetFloatv", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         Arm32CallArgs args(jit, host);
@@ -3747,12 +4110,106 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
     manager.RegisterThunkIfAbsent("glMapBufferRange", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         const GLenum target = static_cast<GLenum>(jit.Regs()[0]);
         std::lock_guard mapping_lock(s_mapping_mutex);
+        s_mapping_set_steady = false;
         const GLintptr offset = static_cast<int32_t>(jit.Regs()[1]);
         const GLsizeiptr length = static_cast<int32_t>(jit.Regs()[2]);
         const GLbitfield access = static_cast<GLbitfield>(jit.Regs()[3]);
         const GLuint buffer = GetBoundGlBuffer(target);
+        const bool audit = GlMapAuditEnabled() &&
+            (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER);
+        GLint actual_buffer = -1, native_size = -1, native_mapped = -1;
+        GLint native_map_access = -1;
+        GLint native_immutable = -1, native_storage_flags = -1;
+        GLenum prior_error = GL_NO_ERROR, query_error = GL_NO_ERROR;
+        GLenum map_error = GL_NO_ERROR;
+        if (audit && eglGetCurrentContext() != EGL_NO_CONTEXT) {
+            prior_error = glGetError();
+            PreserveSceneAuditGlError(prior_error);
+            glGetIntegerv(target == GL_ARRAY_BUFFER ? GL_ARRAY_BUFFER_BINDING :
+                          GL_ELEMENT_ARRAY_BUFFER_BINDING, &actual_buffer);
+            if (actual_buffer != 0) {
+                glGetBufferParameteriv(target, GL_BUFFER_SIZE, &native_size);
+                glGetBufferParameteriv(target, GL_BUFFER_MAPPED, &native_mapped);
+                glGetBufferParameteriv(target, GL_BUFFER_ACCESS_FLAGS,
+                                       &native_map_access);
+            }
+            query_error = glGetError();
+            PreserveSceneAuditGlError(query_error);
+        }
+        const auto audit_result = [&](const char* reason, uint32_t result,
+                                      void* native_pointer) {
+            // The original RHI writes through the returned pointer unchecked:
+            // NULL turns its texture/buffer upload into stores at guest
+            // address 0+offset, where the SVC trampolines live. Always report.
+            static std::atomic<uint32_t> null_reports{0};
+            if (!result && null_reports.fetch_add(1, std::memory_order_relaxed) < 32)
+                __android_log_print(ANDROID_LOG_WARN, "BL2GLMap",
+                    "glMapBufferRange NULL reason=%s target=%04X buffer=%u offset=%lld "
+                    "length=%lld access=%04X PC=%08X LR=%08X",
+                    reason, target, buffer, static_cast<long long>(offset),
+                    static_cast<long long>(length), access, jit.Regs()[15], jit.Regs()[14]);
+            const bool failure = !result &&
+                (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER);
+            if (!audit && !failure) return;
+            static std::atomic<uint32_t> successes{0}, failures{0};
+            auto& counter = result ? successes : failures;
+            if (counter.fetch_add(1, std::memory_order_relaxed) >=
+                (result ? 128u : 32u)) return;
+            // A failed persistent map is cached by this guest's original RHI.
+            // Observe only after failure: successful production maps execute
+            // no extra queries, and neither the error nor NULL is concealed.
+            void* existing_pointer = nullptr;
+            if (!audit && eglGetCurrentContext() != EGL_NO_CONTEXT) {
+                map_error = glGetError();
+                PreserveSceneAuditGlError(map_error);
+                glGetIntegerv(target == GL_ARRAY_BUFFER ? GL_ARRAY_BUFFER_BINDING :
+                              GL_ELEMENT_ARRAY_BUFFER_BINDING, &actual_buffer);
+                if (actual_buffer != 0) {
+                    glGetBufferParameteriv(target, GL_BUFFER_SIZE, &native_size);
+                    glGetBufferParameteriv(target, GL_BUFFER_MAPPED, &native_mapped);
+                    glGetBufferParameteriv(target, GL_BUFFER_ACCESS_FLAGS,
+                                           &native_map_access);
+                    glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &existing_pointer);
+                    glGetBufferParameteriv(target, GL_BUFFER_IMMUTABLE_STORAGE_EXT,
+                                           &native_immutable);
+                    glGetBufferParameteriv(target, GL_BUFFER_STORAGE_FLAGS_EXT,
+                                           &native_storage_flags);
+                }
+                query_error = glGetError();
+                PreserveSceneAuditGlError(query_error);
+            }
+            const auto existing = s_guest_mapped_buffers.find(existing_pointer);
+            LOGI("%s reason=%s PC=%08X LR=%08X context=%p "
+                 "target=%04X mirror=%u actual=%d native_size=%d native_mapped=%d "
+                 "native_access=%04X native_immutable=%d native_storage_flags=%04X "
+                 "offset=%lld length=%lld access=%04X "
+                 "prior_error=%04X query_error=%04X map_error=%04X "
+                 "native_pointer=%p guest=%08X existing_pointer=%p "
+                 "existing_guest=%08X existing_buffer=%u existing_context=%p",
+                 audit ? "GL_MAP_AUDIT" : "GL_MAP_FAILURE",
+                 reason, jit.Regs()[15], jit.Regs()[14], eglGetCurrentContext(),
+                 target, buffer, actual_buffer, native_size, native_mapped,
+                 native_map_access, native_immutable, native_storage_flags,
+                 static_cast<long long>(offset),
+                 static_cast<long long>(length), access, prior_error, query_error,
+                 map_error, native_pointer, result, existing_pointer,
+                 existing == s_guest_mapped_buffers.end() ? 0 : existing->second.guest_address,
+                 existing == s_guest_mapped_buffers.end() ? 0 : existing->second.buffer,
+                 existing == s_guest_mapped_buffers.end() ? EGL_NO_CONTEXT : existing->second.context);
+            if (failure) {
+                [[maybe_unused]] const auto* call = bl2::gl::LastStorageCallDiagnostic(target);
+                LOGI("GL_MAP_STORAGE_FAILURE record_scope=current_thread "
+                     "target=%04X seen=%u buffer=%u PC=%08X LR=%08X size=%lld "
+                     "data=%08X flags=%04X native_flags=%04X route=%s",
+                     target, static_cast<unsigned>(call->seen), call->buffer,
+                     call->pc, call->lr, static_cast<long long>(call->size),
+                     call->data, call->flags, call->native_flags,
+                     !call->seen ? "none" : call->native_ext ? "EXT" : "BufferData");
+            }
+        };
         if (offset < 0 || length <= 0 ||
             static_cast<uint64_t>(length) > host.GetGuestMemorySize()) {
+            audit_result("guest_range", 0, nullptr);
             jit.Regs()[0] = 0;
             return;
         }
@@ -3767,6 +4224,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
                 ? static_cast<size_t>(page) : size_t{0};
         }();
         if (!mapping_page_size) {
+            audit_result("page_size", 0, nullptr);
             jit.Regs()[0] = 0;
             return;
         }
@@ -3774,25 +4232,88 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
             (static_cast<uint64_t>(length) + mapping_page_size - 1) &
             ~static_cast<uint64_t>(mapping_page_size - 1);
         if (reserved_length > host.GetGuestMemorySize()) {
+            audit_result("reserved_range", 0, nullptr);
             jit.Regs()[0] = 0;
             return;
         }
-        void* host_pointer = glMapBufferRange(target, offset, length, access);
+#if defined(BL2_NATIVE_ARM32)
+        const bool native_direct = NativeDirectGlMappingsRequested() &&
+                                   NativeDirectCoherentAccess(access);
+        const GLbitfield native_access = native_direct ? access | GL_MAP_READ_BIT : access;
+#else
+        const GLbitfield native_access = access;
+#endif
+        void* host_pointer = glMapBufferRange(target, offset, length, native_access);
+        if (audit) {
+            map_error = glGetError();
+            PreserveSceneAuditGlError(map_error);
+        }
         if (!host_pointer) {
+            audit_result("native_driver", 0, nullptr);
             jit.Regs()[0] = 0;
             return;
         }
+#if defined(BL2_NATIVE_ARM32)
+        if (native_direct) {
+            const uint32_t address = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(host_pointer));
+            if (!GuestRangeValid(host.GetGuestMemorySize(), address, static_cast<size_t>(length))) {
+                audit_result("native_direct_range", 0, host_pointer);
+                glUnmapBuffer(target);
+                jit.Regs()[0] = 0;
+                return;
+            }
+            if (auto old = s_guest_mapped_buffers.find(host_pointer);
+                old != s_guest_mapped_buffers.end()) {
+                if (old->second.tracked)
+                    UntrackGuestMappedWriteWatch(old->second.guest_address, old->second.length);
+                if (!old->second.native_direct) host.GuestFree(old->second.guest_address);
+                s_guest_mapped_buffers.erase(old);
+            }
+            auto [it, inserted] = s_guest_mapped_buffers.emplace(host_pointer,
+                GuestMappedBuffer{host_pointer, address, static_cast<size_t>(length), access,
+                                  eglGetCurrentContext(), buffer, target, offset});
+            (void)inserted;
+            it->second.native_direct = true;
+            static std::atomic<uint32_t> direct_logs{0};
+            const uint32_t index = direct_logs.fetch_add(1, std::memory_order_relaxed);
+            if (index < 16)
+                LOGI("Native persistent-map mode=direct buffer=%u target=0x%04X "
+                     "offset=%lld length=%lld access=0x%04X native_access=0x%04X pointer=0x%08X",
+                     buffer, target, static_cast<long long>(offset),
+                     static_cast<long long>(length), access, native_access, address);
+            jit.Regs()[0] = address;
+            audit_result("native_direct", address, host_pointer);
+            return;
+        }
+#endif
         const uint32_t guest_address = host.GuestAlloc(
             static_cast<size_t>(reserved_length), mapping_page_size);
         if (!guest_address) {
+            audit_result("guest_allocation", 0, host_pointer);
             glUnmapBuffer(target);
             jit.Regs()[0] = 0;
             return;
         }
+#if !defined(BL2_NATIVE_ARM32)
+        // Only persistent write mappings are watched. Their freshly allocated,
+        // exclusively owned pages get a shared RW alias before initialization;
+        // on failure the existing protection path remains in use.
+        if ((access & GL_MAP_WRITE_BIT) && (access & 0x0040) && MappedAliasEnabled() &&
+            DirtySyncRequested() && !CurrentGuestSoftwareWriteWatch()) {
+            MappedDirtyTracker().ShareRange(host.GetGuestMemoryBase(),
+                                            host.GetGuestMemorySize(), guest_address,
+                                            static_cast<size_t>(reserved_length));
+        }
+#endif
         if (access & GL_MAP_READ_BIT) {
             memcpy(host.GetGuestMemoryBase() + guest_address, host_pointer,
                    static_cast<size_t>(length));
-        } else if (!CopyGlBufferShadow(
+        } else if (
+#if defined(BL2_NATIVE_ARM32)
+                   !CopyGlBufferShadowSnapshot(
+#else
+                   !CopyGlBufferShadow(
+#endif
                        buffer, static_cast<size_t>(offset),
                        static_cast<size_t>(length),
                        host.GetGuestMemoryBase() + guest_address)) {
@@ -3803,10 +4324,14 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         // A successful new native map owns this address exclusively.
         if(auto old=s_guest_mapped_buffers.find(host_pointer);old!=s_guest_mapped_buffers.end()) {
             if (old->second.tracked) {
-                MappedDirtyTracker().Untrack(old->second.guest_address,
+                UntrackGuestMappedWriteWatch(old->second.guest_address,
                                              old->second.length);
             }
-            host.GuestFree(old->second.guest_address);s_guest_mapped_buffers.erase(old);
+#if defined(BL2_NATIVE_ARM32)
+            if (!old->second.native_direct)
+#endif
+                host.GuestFree(old->second.guest_address);
+            s_guest_mapped_buffers.erase(old);
         }
         s_guest_mapped_buffers.emplace(host_pointer,
             GuestMappedBuffer{host_pointer, guest_address, static_cast<size_t>(length), access,
@@ -3823,11 +4348,13 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
                  static_cast<long long>(length), access, guest_address,
                  static_cast<unsigned long long>(reserved_length), mapping_page_size);
         }
+        audit_result("staging", guest_address, host_pointer);
         jit.Regs()[0] = guest_address;
     });
     manager.RegisterThunkIfAbsent("glUnmapBuffer", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         const GLenum target = static_cast<GLenum>(jit.Regs()[0]);
         std::lock_guard mapping_lock(s_mapping_mutex);
+        s_mapping_set_steady = false;
         void* native = nullptr; glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &native);
         auto it = s_guest_mapped_buffers.find(native);
         if (it == s_guest_mapped_buffers.end()) {
@@ -3835,8 +4362,18 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
             return;
         }
         const GuestMappedBuffer mapping = it->second;
+#if defined(BL2_NATIVE_ARM32)
+        if (mapping.native_direct) {
+            if (mapping.access & GL_MAP_WRITE_BIT)
+                UpdateGlBufferShadow(mapping.buffer, static_cast<size_t>(mapping.offset),
+                                     mapping.length, mapping.host_pointer);
+            jit.Regs()[0] = static_cast<uint32_t>(glUnmapBuffer(target));
+            s_guest_mapped_buffers.erase(it);
+            return;
+        }
+#endif
         if (mapping.tracked) {
-            MappedDirtyTracker().Untrack(mapping.guest_address, mapping.length);
+            UntrackGuestMappedWriteWatch(mapping.guest_address, mapping.length);
         }
         if ((mapping.access & GL_MAP_WRITE_BIT) && !(mapping.access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
             GuestRangeValid(host.GetGuestMemorySize(), mapping.guest_address, mapping.length)) {
@@ -3855,9 +4392,33 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
     manager.RegisterThunkIfAbsent("glGetBufferPointerv", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         if(!GuestRangeValid(host.GetGuestMemorySize(),jit.Regs()[2],4))return;
         std::lock_guard mapping_lock(s_mapping_mutex);
-        void* native=nullptr;glGetBufferPointerv(jit.Regs()[0],jit.Regs()[1],&native);
+        const GLenum target = jit.Regs()[0];
+        const bool audit = GlMapAuditEnabled() &&
+            (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER);
+        GLint actual_buffer = -1;
+        if (audit) {
+            PreserveSceneAuditGlError(glGetError());
+            glGetIntegerv(target == GL_ARRAY_BUFFER ? GL_ARRAY_BUFFER_BINDING :
+                          GL_ELEMENT_ARRAY_BUFFER_BINDING, &actual_buffer);
+            PreserveSceneAuditGlError(glGetError());
+        }
+        void* native=nullptr;glGetBufferPointerv(target,jit.Regs()[1],&native);
         const auto found=s_guest_mapped_buffers.find(native);
-        host.MemoryWrite32(jit.Regs()[2],found==s_guest_mapped_buffers.end()?0:found->second.guest_address);
+        const uint32_t result = found==s_guest_mapped_buffers.end()?0:found->second.guest_address;
+        if (audit) {
+            const GLenum error = glGetError();
+            PreserveSceneAuditGlError(error);
+            static std::atomic<uint32_t> logs{0};
+            if (logs.fetch_add(1, std::memory_order_relaxed) < 128)
+                LOGI("GL_POINTER_AUDIT PC=%08X LR=%08X context=%p target=%04X "
+                     "mirror=%u actual=%d pname=%04X native_pointer=%p guest=%08X "
+                     "owner_context=%p owner_buffer=%u error=%04X",
+                     jit.Regs()[15], jit.Regs()[14], eglGetCurrentContext(), target,
+                     GetBoundGlBuffer(target), actual_buffer, jit.Regs()[1], native,
+                     result, found==s_guest_mapped_buffers.end()?EGL_NO_CONTEXT:found->second.context,
+                     found==s_guest_mapped_buffers.end()?0:found->second.buffer, error);
+        }
+        host.MemoryWrite32(jit.Regs()[2],result);
     });
     manager.RegisterThunkIfAbsent("glFlushMappedBufferRange", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         const GLenum target = static_cast<GLenum>(jit.Regs()[0]);
@@ -3866,30 +4427,38 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         const GLsizeiptr length = static_cast<int32_t>(jit.Regs()[2]);
         void* native = nullptr; glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &native);
         auto it = s_guest_mapped_buffers.find(native);
+#if defined(BL2_NATIVE_ARM32)
+        if (it != s_guest_mapped_buffers.end() && it->second.native_direct) {
+            // FlushMappedBufferRange offsets are relative to the mapped range.
+            // The driver validates invalid flags/ranges; never copy or free it.
+            const auto& mapping = it->second;
+            if ((mapping.access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
+                offset >= 0 && length >= 0 && static_cast<uint64_t>(offset) <= mapping.length &&
+                static_cast<uint64_t>(length) <= mapping.length - static_cast<size_t>(offset)) {
+                UpdateGlBufferShadow(mapping.buffer, static_cast<size_t>(mapping.offset + offset),
+                    static_cast<size_t>(length), static_cast<const uint8_t*>(native) + offset);
+            }
+            glFlushMappedBufferRange(target, offset, length);
+            return;
+        }
+#endif
         if (it != s_guest_mapped_buffers.end() &&
             (it->second.access & GL_MAP_WRITE_BIT) && offset >= 0 && length >= 0) {
             const GuestMappedBuffer& mapping = it->second;
-            const uint64_t mapping_start = static_cast<uint64_t>(mapping.offset);
-            const uint64_t flush_start = static_cast<uint64_t>(offset);
-            const uint64_t flush_end = flush_start + static_cast<uint64_t>(length);
-            const uint64_t mapping_end = mapping_start + mapping.length;
-            if (flush_start >= mapping_start && flush_end <= mapping_end) {
-                const size_t relative = static_cast<size_t>(flush_start - mapping_start);
-                const uint64_t guest_end =
-                    static_cast<uint64_t>(mapping.guest_address) + relative +
-                    static_cast<uint64_t>(length);
-                if (guest_end <= host.GetGuestMemorySize() &&
-                GuestRangeValid(host.GetGuestMemorySize(),
-                                mapping.guest_address + static_cast<uint32_t>(relative),
+            const size_t relative = static_cast<size_t>(offset);
+            const uint64_t guest_start = uint64_t(mapping.guest_address) + relative;
+            if ((mapping.access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
+                relative <= mapping.length &&
+                static_cast<uint64_t>(length) <= mapping.length - relative &&
+                guest_start <= UINT32_MAX &&
+                GuestRangeValid(host.GetGuestMemorySize(), static_cast<uint32_t>(guest_start),
                                 static_cast<size_t>(length))) {
-                    const void* guest_pointer =
-                        host.GetGuestMemoryBase() + mapping.guest_address + relative;
-                    memcpy(reinterpret_cast<uint8_t*>(mapping.host_pointer) + relative,
-                           guest_pointer, static_cast<size_t>(length));
-                    UpdateGlBufferShadow(mapping.buffer,
-                                         static_cast<size_t>(offset),
-                                         static_cast<size_t>(length), guest_pointer);
-                }
+                const void* guest_pointer = host.GetGuestMemoryBase() + guest_start;
+                std::memcpy(static_cast<uint8_t*>(mapping.host_pointer) + relative,
+                            guest_pointer, static_cast<size_t>(length));
+                UpdateGlBufferShadow(mapping.buffer,
+                    static_cast<size_t>(mapping.offset) + relative,
+                    static_cast<size_t>(length), guest_pointer);
             }
         }
         glFlushMappedBufferRange(target, offset, length);
@@ -3914,11 +4483,11 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         const GLsizei count = static_cast<int32_t>(jit.Regs()[0]);
         bool valid = false;
         const auto* arrays = CountedGuestValues<GLuint>(host, jit.Regs()[1], count, 1, "glDeleteVertexArrays", &valid);
-        if (valid) { glDeleteVertexArrays(count, arrays); RefreshGlBindings(); }
+        if (valid) { glDeleteVertexArrays(count, arrays); RefreshGlVertexArrayBindings(); }
     });
     manager.RegisterThunkIfAbsent("glBindVertexArray", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {
         glBindVertexArray(jit.Regs()[0]);
-        RefreshGlBindings();
+        RefreshGlVertexArrayBindings();
     });
     manager.RegisterThunkIfAbsent("glIsVertexArray", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {
         jit.Regs()[0] = glIsVertexArray(jit.Regs()[0]);
@@ -4106,3 +4675,544 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         else { if (length) *length = 0; if (label) *label = 0; }
     });
 }
+
+#if defined(BL2_NATIVE_ARM32)
+// Runs from native_host_check in its own process, with the same registered
+// handlers as the game. A real pbuffer/driver verifies CPU and GPU visibility,
+// shadow boundaries and mapping ownership across a shared EGL context.
+bool NativeGlMappingSelfCheck() {
+    auto& host = GetNativeHost();
+    if (!host.Initialize() || eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, nullptr, nullptr) ||
+        !eglBindAPI(EGL_OPENGL_ES_API)) return false;
+    EGLConfig config{};
+    EGLint count = 0;
+    const EGLint attributes[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, 0x0040, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8, EGL_NONE};
+    if (!eglChooseConfig(display, attributes, &config, 1, &count) || count != 1) {
+        eglTerminate(display);
+        return false;
+    }
+    const EGLint surface_attributes[] = {EGL_WIDTH, 2, EGL_HEIGHT, 2, EGL_NONE};
+    const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    EGLSurface surface = eglCreatePbufferSurface(display, config, surface_attributes);
+    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
+    EGLContext sibling = context == EGL_NO_CONTEXT ? EGL_NO_CONTEXT :
+        eglCreateContext(display, config, context, context_attributes);
+    bool good = surface != EGL_NO_SURFACE && context != EGL_NO_CONTEXT &&
+        sibling != EGL_NO_CONTEXT && eglMakeCurrent(display, surface, surface, context);
+    GLuint source = 0, scratch = 0;
+    const auto call = [&](const char* name, std::array<uint32_t, 4> words) {
+        Dynarmic::A32::Jit frame;
+        std::copy(words.begin(), words.end(), frame.Regs().begin());
+        if (!host.GetThunkManager().DispatchNamedThunk(name, frame)) good = false;
+        return frame.Regs()[0];
+    };
+    const auto address = [](const void* pointer) {
+        return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pointer));
+    };
+    std::array<uint8_t, 80> expected{}, observed{};
+    for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<uint8_t>(i + 1);
+    if (good) {
+        glGenBuffers(1, &source);
+        call("glBindBuffer", {GL_ARRAY_BUFFER, source, 0, 0});
+        call("glBufferStorage", {GL_ARRAY_BUFFER, expected.size(), address(expected.data()), 0x00C2});
+        const auto mapped = call("glMapBufferRange", {GL_ARRAY_BUFFER, 8, 32, 0x00C2});
+        void* native = nullptr;
+        glGetBufferPointerv(GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, &native);
+        good = good && mapped && native && glGetError() == GL_NO_ERROR &&
+            ((mapped == address(native)) == NativeDirectGlMappingsRequested());
+        if (good) {
+            auto* bytes = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(mapped));
+            for (size_t i = 0; i < 32; ++i) expected[8 + i] = bytes[i] = static_cast<uint8_t>(0x80 + i);
+            SyncGuestMappedBuffersForGpuRead(host);
+            uint32_t reported = 0;
+            call("glGetBufferPointerv", {GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, address(&reported), 0});
+            good = good && reported == mapped &&
+                CopyGlBufferShadow(source, 0, observed.size(), observed.data()) && observed == expected &&
+                !CopyGlBufferShadow(source, 0, observed.size() + 1, observed.data());
+            // A coherent map without FLUSH_EXPLICIT still rejects an explicit
+            // flush; the native shortcut must leave this driver guard intact.
+            call("glFlushMappedBufferRange", {GL_ARRAY_BUFFER, 0, 1, 0});
+            good = good && glGetError() == GL_INVALID_OPERATION;
+            glGenBuffers(1, &scratch);
+            glBindBuffer(GL_COPY_READ_BUFFER, source);
+            glBindBuffer(GL_COPY_WRITE_BUFFER, scratch);
+            glBufferData(GL_COPY_WRITE_BUFFER, expected.size(), nullptr, GL_STREAM_READ);
+            glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, expected.size());
+            const auto fence = call("glFenceSync", {GL_SYNC_GPU_COMMANDS_COMPLETE, 0, 0, 0});
+            const auto waited = fence ? call("glClientWaitSync",
+                {fence, GL_SYNC_FLUSH_COMMANDS_BIT, 500000000, 0}) : GL_WAIT_FAILED;
+            good = good && (waited == GL_ALREADY_SIGNALED || waited == GL_CONDITION_SATISFIED);
+            if (fence) call("glDeleteSync", {fence, 0, 0, 0});
+            void* gpu = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, expected.size(), GL_MAP_READ_BIT);
+            good = good && gpu && std::memcmp(gpu, expected.data(), expected.size()) == 0;
+            if (gpu) good = (glUnmapBuffer(GL_COPY_WRITE_BUFFER) == GL_TRUE) && good;
+            good = (call("glUnmapBuffer", {GL_ARRAY_BUFFER, 0, 0, 0}) == GL_TRUE) && good;
+            good = CopyGlBufferShadow(source, 0, observed.size(), observed.data()) &&
+                observed == expected && good;
+            // Remap, then delete from the sibling which shares the object.
+            const auto remapped = call("glMapBufferRange", {GL_ARRAY_BUFFER, 8, 32, 0x00C2});
+            void* remapped_native = nullptr;
+            glGetBufferPointerv(GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, &remapped_native);
+            good = remapped && remapped_native && good;
+            good = eglMakeCurrent(display, surface, surface, sibling) && good;
+            call("glDeleteBuffers", {1, address(&source), 0, 0});
+            {
+                std::lock_guard lock(s_mapping_mutex);
+                good = s_guest_mapped_buffers.find(remapped_native) == s_guest_mapped_buffers.end() && good;
+            }
+            good = !glIsBuffer(source) && !CopyGlBufferShadow(source, 8, 1, observed.data()) &&
+                glGetError() == GL_NO_ERROR && good;
+            source = 0;
+        }
+    }
+    if (eglGetCurrentContext() != EGL_NO_CONTEXT) {
+        if (source) call("glDeleteBuffers", {1, address(&source), 0, 0});
+        if (scratch) glDeleteBuffers(1, &scratch);
+    }
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (sibling != EGL_NO_CONTEXT) eglDestroyContext(display, sibling);
+    if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
+    if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+    eglTerminate(display);
+    LOGI("Native GL mapping selfcheck mode=%s result=%s",
+         NativeDirectGlMappingsRequested() ? "direct" : "staging", good ? "PASS" : "FAIL");
+    return good;
+}
+#endif
+
+#if defined(HORN_GL_SELF_CHECK) && !defined(BL2_NATIVE_ARM32)
+bool NativeLegacySamplerSelfCheck();
+bool NativeLegacyPipelineSelfCheck(EGLDisplay, EGLSurface, EGLContext, EGLContext,
+                                   DynarmicHost*);
+
+static bool MappedBufferDeletionSelfCheck(EGLDisplay display, EGLSurface surface,
+                                         EGLConfig config, EGLContext owner,
+                                         EGLContext sibling, DynarmicHost& host) {
+    const EGLContext previous = eglGetCurrentContext();
+    const EGLint attrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, 0x30FB, 2, EGL_NONE};
+    EGLContext unrelated = eglCreateContext(display, config, EGL_NO_CONTEXT, attrs);
+    const uint32_t memory = host.GuestAlloc(192, 16);
+    bool good = unrelated != EGL_NO_CONTEXT && memory;
+    std::array<uint8_t, 64> initial{}, expected{}, observed{};
+    for (size_t i = 0; i < initial.size(); ++i) initial[i] = static_cast<uint8_t>(i + 1);
+    if (memory) memcpy(host.GetGuestMemoryBase() + memory + 64, initial.data(), initial.size());
+    const auto call = [&](const char* name, std::initializer_list<uint32_t> args) {
+        return host.RunFunction(host.GetThunkManager().FindRegisteredSymbol(name),
+                                std::vector<uint32_t>(args));
+    };
+    const auto current = [&](EGLContext context) {
+        const bool result = eglMakeCurrent(display, surface, surface, context);
+        if (result) RefreshGlBindings();
+        good = result && good;
+    };
+    const auto error = [&] { return call("glGetError", {}); };
+    GLint old_owner_array = 0, old_owner_read = 0, old_owner_write = 0;
+    GLint old_sibling_read = 0, old_sibling_write = 0;
+    current(owner);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_owner_array);
+    glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &old_owner_read);
+    glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &old_owner_write);
+    current(sibling);
+    glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &old_sibling_read);
+    glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &old_sibling_write);
+
+    // Same-owner and sibling deletion use the real registered A32 imports.
+    // The unrelated context deliberately has a distinct object of the same name.
+    for (unsigned mode = 0; mode < 2 && good; ++mode) {
+        const auto expect = [&](bool condition, const char* label) {
+            if (!condition)
+                std::fprintf(stderr, "ARM64 mapped-buffer delete mode=%u failed: %s\n", mode, label);
+            good = condition && good;
+        };
+        current(owner);
+        call("glGenBuffers", {1, memory});
+        const GLuint buffer = host.MemoryRead32(memory);
+        call("glBindBuffer", {GL_ARRAY_BUFFER, buffer});
+        call("glBufferStorage", {GL_ARRAY_BUFFER, 64, memory + 64, 0xC3});
+        const uint32_t mapped = call("glMapBufferRange", {GL_ARRAY_BUFFER, 8, 32, 0xC3});
+        void* native = nullptr;
+        glGetBufferPointerv(GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, &native);
+        const GLenum owner_error = error();
+        std::fprintf(stderr, "ARM64 mapped-buffer delete mode=%u setup name=%u guest=%08X native=%p error=%04X\n",
+                     mode, buffer, mapped, native, owner_error);
+        expect(mapped && native && buffer && buffer < 4096 && owner_error == GL_NO_ERROR,
+               "owner storage/map");
+        if (!good) break;
+        current(sibling);
+        call("glBindBuffer", {GL_COPY_READ_BUFFER, buffer});
+        current(unrelated);
+        std::vector<GLuint> reserved(static_cast<size_t>(buffer) + 16);
+        glGenBuffers(static_cast<GLsizei>(reserved.size()), reserved.data());
+        expect(std::find(reserved.begin(), reserved.end(), buffer) != reserved.end(),
+               "unrelated context reserves colliding numeric name");
+        call("glBindBuffer", {GL_ARRAY_BUFFER, buffer});
+        call("glBufferStorage", {GL_ARRAY_BUFFER, 64, memory + 64, 0xC3});
+        const uint32_t unrelated_map = call("glMapBufferRange", {GL_ARRAY_BUFFER, 0, 64, 0xC3});
+        void* unrelated_native = nullptr;
+        glGetBufferPointerv(GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, &unrelated_native);
+        const GLenum unrelated_error = error();
+        std::fprintf(stderr, "ARM64 mapped-buffer delete mode=%u unrelated guest=%08X native=%p error=%04X\n",
+                     mode, unrelated_map, unrelated_native, unrelated_error);
+        expect(unrelated_map && unrelated_native && unrelated_native != native &&
+                   unrelated_error == GL_NO_ERROR,
+               "unrelated storage/map with distinct native identity");
+        SyncGuestMappedBuffersForGpuRead(host); // Arms real dirty tracking before deletion.
+        current(mode == 0 ? owner : sibling);
+        // Force the temporary-VAO probe rather than borrowing a live copy binding.
+        if (mode == 0) call("glBindBuffer", {GL_COPY_READ_BUFFER, static_cast<GLuint>(old_owner_array)});
+        GLint vao = 0, read_binding = 0;
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &read_binding);
+        for (size_t i = 0; i < 32; ++i)
+            host.MemoryWrite8(memory + 128 + static_cast<uint32_t>(i), static_cast<uint8_t>(0x80 + i));
+        call("memcpy", {mapped, memory + 128, 32});
+        glEnable(0xFFFFFFFFu); // Cleanup must preserve an already pending error.
+        call("glDeleteBuffers", {1, memory});
+        GLint actual_vao = 0, actual_read = 0;
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &actual_vao);
+        glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &actual_read);
+        const size_t retired_size = host.GuestAllocSize(mapped);
+        const GLenum deletion_error = error(), next_error = error();
+        std::fprintf(stderr, "ARM64 mapped-buffer delete mode=%u deleted vao=%d/%d read=%d/%d guest_size=%zu error=%04X/%04X\n",
+                     mode, actual_vao, vao, actual_read, mode == 0 ? read_binding : 0,
+                     retired_size, deletion_error, next_error);
+        expect(actual_vao == vao, "deletion restores occupied VAO");
+        expect(actual_read == (mode == 0 ? read_binding : 0), "deletion preserves/deletes actual copy binding");
+        expect(retired_size == 0, "deletion frees mapped guest staging");
+        expect(deletion_error == GL_INVALID_ENUM && next_error == GL_NO_ERROR,
+               "deletion preserves preexisting error exactly once");
+        {
+            std::lock_guard lock(s_mapping_mutex);
+            expect(!s_guest_mapped_buffers.contains(native), "deletion removes matching map identity");
+            expect(s_guest_mapped_buffers.contains(unrelated_native), "deletion retains unrelated map identity");
+        }
+        // The driver's deferred object remains bound in the other shared context.
+        current(mode == 0 ? sibling : owner);
+        const GLenum retained = mode == 0 ? GL_COPY_READ_BUFFER : GL_ARRAY_BUFFER;
+        GLint retained_binding = 0, mapped_state = -1;
+        glGetIntegerv(mode == 0 ? GL_COPY_READ_BUFFER_BINDING : GL_ARRAY_BUFFER_BINDING,
+                      &retained_binding);
+        glGetBufferParameteriv(retained, GL_BUFFER_MAPPED, &mapped_state);
+        GLuint scratch = 0;
+        glGenBuffers(1, &scratch);
+        glBindBuffer(GL_COPY_WRITE_BUFFER, scratch);
+        glBufferData(GL_COPY_WRITE_BUFFER, 64, nullptr, GL_STREAM_READ);
+        glCopyBufferSubData(retained, GL_COPY_WRITE_BUFFER, 0, 0, 64);
+        void* copied = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, 64, GL_MAP_READ_BIT);
+        if (copied) memcpy(observed.data(), copied, observed.size());
+        if (copied) glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+        expected = initial;
+        for (size_t i = 0; i < 32; ++i) expected[8 + i] = static_cast<uint8_t>(0x80 + i);
+        const GLenum retained_error = error();
+        std::fprintf(stderr, "ARM64 mapped-buffer delete mode=%u retained binding=%d/%u mapped=%d copied=%p bytes_equal=%d error=%04X\n",
+                     mode, retained_binding, buffer, mapped_state, copied,
+                     observed == expected, retained_error);
+        if (copied && observed != expected) {
+            for (size_t i = 0; i < observed.size(); ++i)
+                if (observed[i] != expected[i]) {
+                    std::fprintf(stderr, "ARM64 mapped-buffer delete first differing byte=%zu actual=%02X expected=%02X\n",
+                                 i, observed[i], expected[i]);
+                    break;
+                }
+        }
+        expect(retained_binding == static_cast<GLint>(buffer), "shared context keeps deferred object binding");
+        expect(mapped_state == GL_FALSE, "driver implicitly unmaps deleted shared object");
+        expect(copied && observed == expected && retained_error == GL_NO_ERROR,
+               "shared deferred object retains latest staged bytes");
+        glDeleteBuffers(1, &scratch);
+        glBindBuffer(retained, 0);
+        current(unrelated);
+        call("glGetBufferPointerv", {GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, memory + 4});
+        const uint32_t pointer_result = host.MemoryRead32(memory + 4);
+        const size_t unrelated_size = host.GuestAllocSize(unrelated_map);
+        const GLenum pointer_error = error();
+        std::fprintf(stderr, "ARM64 mapped-buffer delete mode=%u unrelated getter=%08X/%08X guest_size=%zu error=%04X\n",
+                     mode, pointer_result, unrelated_map, unrelated_size, pointer_error);
+        expect(pointer_result == unrelated_map && unrelated_size != 0 && pointer_error == GL_NO_ERROR,
+               "unrelated colliding object remains usable through guest getter");
+        call("glUnmapBuffer", {GL_ARRAY_BUFFER});
+        glDeleteBuffers(static_cast<GLsizei>(reserved.size()), reserved.data());
+    }
+    current(sibling);
+    glBindBuffer(GL_COPY_READ_BUFFER, static_cast<GLuint>(old_sibling_read));
+    glBindBuffer(GL_COPY_WRITE_BUFFER, static_cast<GLuint>(old_sibling_write));
+    current(owner);
+    glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(old_owner_array));
+    glBindBuffer(GL_COPY_READ_BUFFER, static_cast<GLuint>(old_owner_read));
+    glBindBuffer(GL_COPY_WRITE_BUFFER, static_cast<GLuint>(old_owner_write));
+    RefreshGlBindings();
+    if (unrelated != EGL_NO_CONTEXT) eglDestroyContext(display, unrelated);
+    if (memory) host.GuestFree(memory);
+    current(previous);
+    std::fprintf(stderr, "ARM64 mapped-buffer deletion owner/shared/unrelated/deferred/error: %s\n",
+                 good ? "PASS" : "FAIL");
+    return good;
+}
+
+// Dedicated check build only. Execute the actual A32 import trampolines rather
+// than a synthetic register frame; every output/data pointer is guest memory.
+extern "C" __attribute__((visibility("default"))) bool Bl2Arm64GlParitySelfCheck() {
+    DynarmicHost host;
+    if (eglGetCurrentContext() != EGL_NO_CONTEXT || !host.Initialize()) return false;
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, nullptr, nullptr) ||
+        !eglBindAPI(EGL_OPENGL_ES_API)) return false;
+    EGLConfig config{};
+    EGLint count = 0;
+    const EGLint config_attributes[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, 0x0040, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+    if (!eglChooseConfig(display, config_attributes, &config, 1, &count) || count != 1) {
+        eglTerminate(display);
+        return false;
+    }
+    const EGLint surface_attributes[] = {EGL_WIDTH, 2, EGL_HEIGHT, 2, EGL_NONE};
+    const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3,
+        0x30FB /* EGL_CONTEXT_MINOR_VERSION_KHR */, 2, EGL_NONE};
+    EGLSurface surface = eglCreatePbufferSurface(display, config, surface_attributes);
+    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
+    EGLContext sibling = context == EGL_NO_CONTEXT ? EGL_NO_CONTEXT :
+        eglCreateContext(display, config, context, context_attributes);
+    bool good = surface != EGL_NO_SURFACE && context != EGL_NO_CONTEXT &&
+        sibling != EGL_NO_CONTEXT && eglMakeCurrent(display, surface, surface, context);
+    unsigned checks = 0;
+    const auto check = [&](bool result, const char* label) {
+        ++checks;
+        if (!result) std::fprintf(stderr, "ARM64 GL check %u failed: %s\n", checks, label);
+        good = result && good;
+        return result;
+    };
+    const auto call = [&](const char* name, std::initializer_list<uint32_t> words) {
+        const uint32_t entry = host.GetThunkManager().FindRegisteredSymbol(name);
+        if (!entry) { check(false, name); return uint32_t{0}; }
+        return host.RunFunction(entry, std::vector<uint32_t>(words));
+    };
+    const auto error = [&] { return call("glGetError", {}); };
+    const uint32_t memory = host.GuestAlloc(512, 16);
+    if (memory) std::memset(host.GetGuestMemoryBase() + memory, 0, 512);
+    const uint32_t output = memory + 64, initial = memory + 128;
+    const uint32_t on_screen = memory + 256, off_screen = memory + 288;
+    const std::array<float, 6> on{{-1, -1, 3, -1, -1, 3}};
+    const std::array<float, 6> off{{4, 4, 5, 4, 4, 5}};
+    std::array<GLuint, 4> buffers{};
+    std::array<GLuint, 2> arrays{}, queries{}, shaders{};
+    GLuint program = 0;
+    bool mapped = false, coherent_mapped = false;
+    const auto write_output = [&](GLuint value) { host.MemoryWrite32(output, value); };
+    const auto result = [&] { return host.MemoryRead32(output); };
+    const auto pixels = [&](bool lit) {
+        std::array<uint8_t, 16> actual{};
+        glReadPixels(0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, actual.data());
+        const std::array<uint8_t, 4> expected = lit ?
+            std::array<uint8_t, 4>{255, 255, 0, 255} :
+            std::array<uint8_t, 4>{0, 0, 0, 255};
+        bool match = error() == GL_NO_ERROR;
+        for (size_t i = 0; i < actual.size(); ++i)
+            match = actual[i] == expected[i % 4] && match;
+        return match;
+    };
+    do {
+        if (!check(good && memory, "fresh shared GLES3.2 contexts/guest allocation")) break;
+        std::printf("Actual GL: %s | %s | %s | %s\n", glGetString(GL_VENDOR),
+            glGetString(GL_RENDERER), glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
+        glViewport(0, 0, 2, 2);
+        glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_DITHER);
+        glDisable(GL_RASTERIZER_DISCARD); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0, 0, 0, 1);
+        if (!check(error() == GL_NO_ERROR && NativeLegacySamplerSelfCheck(),
+                   "real sampler-only/active-unit state")) break;
+        if (!check(NativeLegacyPipelineSelfCheck(display, surface, context, sibling, &host),
+                   "guest stage binds/production pair lookup/shared uniform reupload/rejections")) break;
+        std::memcpy(host.GetGuestMemoryBase() + on_screen, on.data(), sizeof(on));
+        std::memcpy(host.GetGuestMemoryBase() + off_screen, off.data(), sizeof(off));
+        std::memset(host.GetGuestMemoryBase() + initial, 0, 64);
+        std::memcpy(host.GetGuestMemoryBase() + initial + 16, on.data(), sizeof(on));
+        const std::array<const char*, 2> sources{{
+            "#version 300 es\nlayout(location=0) in vec2 p;void main(){gl_Position=vec4(p,0,1);}",
+            "#version 300 es\nprecision highp float;out vec4 c;void main(){c=vec4(1,1,0,1);}"
+        }};
+        program = glCreateProgram();
+        for (size_t i = 0; i < shaders.size(); ++i) {
+            shaders[i] = glCreateShader(i ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+            glShaderSource(shaders[i], 1, &sources[i], nullptr);
+            glCompileShader(shaders[i]);
+            GLint compiled = GL_FALSE;
+            glGetShaderiv(shaders[i], GL_COMPILE_STATUS, &compiled);
+            check(compiled == GL_TRUE, "owned test shader compile");
+            glAttachShader(program, shaders[i]);
+        }
+        glLinkProgram(program);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (!check(linked == GL_TRUE && error() == GL_NO_ERROR, "owned test program link")) break;
+        call("glUseProgram", {program});
+        call("glGenBuffers", {4, memory});
+        call("glGenVertexArrays", {2, memory + 32});
+        call("glGenQueries", {2, memory + 48});
+        std::memcpy(buffers.data(), host.GetGuestMemoryBase() + memory, sizeof(buffers));
+        std::memcpy(arrays.data(), host.GetGuestMemoryBase() + memory + 32, sizeof(arrays));
+        std::memcpy(queries.data(), host.GetGuestMemoryBase() + memory + 48, sizeof(queries));
+        call("glBindVertexArray", {arrays[0]});
+        call("glBindBuffer", {GL_ELEMENT_ARRAY_BUFFER, buffers[0]});
+        call("glBindBuffer", {GL_ARRAY_BUFFER, buffers[2]});
+        call("glBufferData", {GL_ARRAY_BUFFER, 64, initial, GL_STREAM_DRAW});
+        call("glVertexAttribPointer", {0, 2, GL_FLOAT, GL_FALSE, 0, 16});
+        call("glEnableVertexAttribArray", {0});
+        call("glBindVertexArray", {arrays[1]});
+        call("glBindBuffer", {GL_ELEMENT_ARRAY_BUFFER, buffers[1]});
+        glEnable(0xffffffffu);
+        call("glBindVertexArray", {arrays[0]});
+        glGetIntegerv(GL_CURRENT_PROGRAM, &linked);
+        if (!check(GetBoundGlBuffer(GL_ELEMENT_ARRAY_BUFFER) == buffers[0] &&
+                   GetBoundGlBuffer(GL_ARRAY_BUFFER) == buffers[2] &&
+                   static_cast<GLuint>(linked) == program && error() == GL_INVALID_ENUM &&
+                   error() == GL_NO_ERROR, "narrow VAO mirror/pending error/program preservation")) break;
+        glClear(GL_COLOR_BUFFER_BIT);
+        call("glBeginQuery", {0x8914, queries[0]});
+        call("glDrawArrays", {GL_TRIANGLES, 0, 3});
+        call("glEndQuery", {0x8914});
+        write_output(0xa5a5a5a5u);
+        call("glGetQueryObjectuiv", {queries[0], 0x9194, output});
+        if (!check((result() == 0xa5a5a5a5u || result() == UINT32_MAX - 1u) &&
+                   error() == GL_NO_ERROR, "NO_WAIT real readiness/race without sentinel fabrication")) break;
+        glFinish(); // Dedicated check only; production never adds a wait.
+        write_output(UINT32_MAX);
+        call("glGetQueryObjectuiv", {queries[0], GL_QUERY_RESULT, output});
+        if (!check(result() == UINT32_MAX - 1u && pixels(true), "ready positive differs from unavailable sentinel")) break;
+        glEnable(GL_SCISSOR_TEST); glScissor(0, 0, 0, 0);
+        call("glBeginQuery", {0x8914, queries[1]});
+        call("glDrawArrays", {GL_TRIANGLES, 0, 3});
+        call("glEndQuery", {0x8914});
+        glDisable(GL_SCISSOR_TEST);
+        glFinish();
+        call("glGetQueryObjectuiv", {queries[1], GL_QUERY_RESULT, output});
+        if (!check(result() == 0 && error() == GL_NO_ERROR, "real zero visibility")) break;
+        call("glBeginQuery", {0x8914, queries[0]});
+        write_output(0xa5a5a5a5u);
+        call("glGetQueryObjectuiv", {queries[0], GL_QUERY_RESULT, output});
+        check(result() == 0xa5a5a5a5u && error() == GL_INVALID_OPERATION && error() == GL_NO_ERROR,
+              "active-query failure preserves output and actual error");
+        call("glEndQuery", {0x8914});
+        glFinish();
+        write_output(0xa5a5a5a5u);
+        call("glGetQueryObjectuiv", {queries[0], 0xffffffffu, output});
+        check(result() == 0xa5a5a5a5u && error() == GL_INVALID_ENUM && error() == GL_NO_ERROR,
+              "invalid query pname preserves output");
+        host.MemoryWrite32(output - 4, 0x12345678u);
+        host.MemoryWrite32(output + 4, 0x87654321u);
+        call("glGetQueryObjectuiv", {queries[0], GL_QUERY_RESULT_AVAILABLE, output});
+        check(result() == GL_TRUE && host.MemoryRead32(output - 4) == 0x12345678u &&
+              host.MemoryRead32(output + 4) == 0x87654321u, "guest output extent");
+        glEnable(0xffffffffu);
+        call("glGetQueryObjectuiv", {queries[0], GL_QUERY_RESULT, 0});
+        call("glGetQueryObjectuiv", {queries[0], GL_QUERY_RESULT, UINT32_MAX - 1u});
+        if (!check(error() == GL_INVALID_ENUM && error() == GL_NO_ERROR,
+                   "null/out-of-range query outputs preserve pending error")) break;
+        // Recreate VBO storage as persistent noncoherent, with offset16/length32.
+        call("glBindBuffer", {GL_ARRAY_BUFFER, buffers[3]});
+        call("glBufferStorage", {GL_ARRAY_BUFFER, 64, initial, 0x0042});
+        call("glVertexAttribPointer", {0, 2, GL_FLOAT, GL_FALSE, 0, 16});
+        const uint32_t mapping = call("glMapBufferRange", {GL_ARRAY_BUFFER, 16, 32, 0x0052});
+        mapped = mapping != 0;
+        void* native = nullptr;
+        glGetBufferPointerv(GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, &native);
+        if (!check(mapped && native && static_cast<uintptr_t>(mapping) !=
+                   reinterpret_cast<uintptr_t>(native) && error() == GL_NO_ERROR,
+                   "ARM64 guest staging pointer is distinct from host persistent mapping")) break;
+        call("memcpy", {mapping, off_screen, sizeof(off)});
+        call("glFlushMappedBufferRange", {GL_ARRAY_BUFFER, 0, sizeof(off)});
+        glClear(GL_COLOR_BUFFER_BIT); glDrawArrays(GL_TRIANGLES, 0, 3);
+        std::array<float, 6> shadow{};
+        if (!check(error() == GL_NO_ERROR && pixels(false) &&
+                   CopyGlBufferShadow(buffers[3], 16, sizeof(shadow), shadow.data()) && shadow == off,
+                   "registered relative0 flush changes real GPU data/shadow at buffer16")) break;
+        call("memcpy", {mapping, on_screen, sizeof(on)});
+        SyncGuestMappedBuffersForGpuRead(host); // No repair/flush before this helper.
+        glClear(GL_COLOR_BUFFER_BIT); glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (!check(error() == GL_NO_ERROR && pixels(true), "whole mapping helper flush uses relative0 at offset16")) break;
+        call("memcpy", {mapping, off_screen, sizeof(off)});
+        call("glFlushMappedBufferRange", {GL_ARRAY_BUFFER, 32, 1});
+        if (!check(error() == GL_INVALID_VALUE && error() == GL_NO_ERROR &&
+                   CopyGlBufferShadow(buffers[3], 16, sizeof(shadow), shadow.data()) && shadow == on,
+                   "invalid relative flush cannot copy staged bytes or hide driver error")) break;
+        glClear(GL_COLOR_BUFFER_BIT); glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (!check(pixels(true), "invalid flush retains actual GPU bytes")) break;
+        check(call("glUnmapBuffer", {GL_ARRAY_BUFFER}) == GL_TRUE && error() == GL_NO_ERROR,
+              "explicit map release");
+        mapped = false;
+        // Existing coherent guest path remains staged; explicit flush is illegal.
+        call("glBindBuffer", {GL_ARRAY_BUFFER, buffers[2]});
+        call("glBufferStorage", {GL_ARRAY_BUFFER, 64, initial, 0x00c2});
+        const uint32_t coherent = call("glMapBufferRange", {GL_ARRAY_BUFFER, 16, 32, 0x00c2});
+        coherent_mapped = coherent != 0;
+        if (!check(coherent_mapped && error() == GL_NO_ERROR, "coherent staging map")) break;
+        call("memcpy", {coherent, off_screen, sizeof(off)});
+        call("glFlushMappedBufferRange", {GL_ARRAY_BUFFER, 0, sizeof(off)});
+        if (!check(error() == GL_INVALID_OPERATION && error() == GL_NO_ERROR &&
+                   CopyGlBufferShadow(buffers[2], 16, sizeof(shadow), shadow.data()) && shadow == on,
+                   "nonexplicit flush preserves original shadow and error")) break;
+        SyncGuestMappedBuffersForGpuRead(host);
+        call("glGetBufferPointerv", {GL_ARRAY_BUFFER, GL_BUFFER_MAP_POINTER, output});
+        check(result() == coherent && CopyGlBufferShadow(buffers[2], 16, sizeof(shadow), shadow.data()) &&
+              shadow == off && error() == GL_NO_ERROR, "coherent GPU-read sync/translated pointer output");
+        if (!eglMakeCurrent(display, surface, surface, sibling)) { check(false, "shared context switch"); break; }
+        call("glBindBuffer", {GL_ARRAY_BUFFER, buffers[2]});
+        check(call("glUnmapBuffer", {GL_ARRAY_BUFFER}) == GL_TRUE && error() == GL_NO_ERROR,
+              "shared context releases translated mapping");
+        coherent_mapped = false;
+        if (!check(MappedBufferDeletionSelfCheck(display, surface, config, context, sibling, host),
+                   "actual mapped-buffer deletion ownership/data/deferred bindings")) break;
+        if (!eglMakeCurrent(display, surface, surface, context)) { check(false, "return to VAO owner"); break; }
+        call("glDeleteVertexArrays", {2, memory + 32});
+        glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &linked);
+        check(linked == 0 && GetBoundGlBuffer(GL_ELEMENT_ARRAY_BUFFER) == 0 &&
+              error() == GL_NO_ERROR, "bound VAO deletion refreshes actual element mirror");
+    } while (false);
+    if (eglGetCurrentContext() != EGL_NO_CONTEXT) {
+        if (mapped) { call("glBindBuffer", {GL_ARRAY_BUFFER, buffers[3]}); call("glUnmapBuffer", {GL_ARRAY_BUFFER}); }
+        if (coherent_mapped) { call("glBindBuffer", {GL_ARRAY_BUFFER, buffers[2]}); call("glUnmapBuffer", {GL_ARRAY_BUFFER}); }
+        if (memory) {
+            call("glDeleteQueries", {2, memory + 48});
+            // VAOs are context-local. Return to their owning context before deletion.
+            check(eglMakeCurrent(display, surface, surface, context), "cleanup owning context");
+            call("glDeleteVertexArrays", {2, memory + 32});
+            call("glDeleteBuffers", {4, memory});
+        }
+        if (program) glDeleteProgram(program);
+        for (GLuint shader : shaders) if (shader) glDeleteShader(shader);
+        check(error() == GL_NO_ERROR, "owned GL cleanup");
+    }
+    if (memory) {
+        // Fault-only quiet logs must be bounded, and must not change guest halt/return behavior.
+        const uint32_t fault = memory + 448, normal = fault + 4;
+        host.MemoryWrite32(fault, 0xe7f000f0u); // ARM UDF
+        host.MemoryWrite32(normal, 0xe12fff1eu); // BX LR
+        bool fault_returns = true;
+        for (unsigned i = 0; i < 10; ++i)
+            fault_returns = host.RunFunction(fault, {}) == 0 && fault_returns;
+        check(fault_returns, "guest exception preserves return path");
+        check(host.RunFunction(normal, {0x71u}) == 0x71u, "normal guest call after exception");
+        const uint32_t guard_failure = host.GetThunkManager().FindRegisteredSymbol("__stack_chk_fail");
+        bool guard_returns = guard_failure != 0;
+        if (guard_failure) {
+            for (unsigned i = 0; i < 10; ++i)
+                guard_returns = host.RunFunction(guard_failure, {}) == 0 && guard_returns;
+        }
+        check(guard_returns, "stack guard preserves halt path without a game ELF");
+        check(host.RunFunction(normal, {0x72u}) == 0x72u, "normal guest call after stack guard");
+        host.GuestFree(memory);
+    }
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (sibling != EGL_NO_CONTEXT) eglDestroyContext(display, sibling);
+    if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
+    if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+    eglTerminate(display);
+    std::printf("ARM64 translated GL selfcheck: %u checks, %s\n", checks, good ? "PASS" : "FAIL");
+    return good;
+}
+#endif

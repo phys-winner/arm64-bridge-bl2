@@ -55,7 +55,9 @@ ObbSplitScanResult Rejected(const char* reason) {
 
 ObbSplitScanResult ScanObbSplitFd(int fd,
                                  ObbSplitContinueFn should_continue,
-                                 const void* continue_context) {
+                                 const void* continue_context,
+                                 bool allow_rebalanced,
+                                 bool verify_content) {
     struct stat file_stat{};
     if (fd < 0 || fstat(fd, &file_stat) != 0 || file_stat.st_size < 22) {
         return Rejected("invalid APK descriptor or size");
@@ -192,6 +194,25 @@ ObbSplitScanResult ScanObbSplitFd(int fd,
         Le32(container_header + 4) != (main ? 8136U : 24368U)) {
         return Rejected("original OBB index header mismatch");
     }
+    const bool rebalanced = entry_size == (main ? bl2_cache_payload::kMainBytes : bl2_cache_payload::kPatchBytes);
+    if (rebalanced && !allow_rebalanced) return Rejected("relocated base cache files not available");
+    const std::string_view expected_hash = rebalanced
+        ? (main ? bl2_cache_payload::kMainSha256 : bl2_cache_payload::kPatchSha256)
+        : (main ? kMainObbSha256 : kPatchObbSha256);
+    if (!verify_content) {
+        // PackageManager verifies installed APK signatures and seals /data/app.
+        // Keep all direct-read bounds/index/version gates, without hashing GBs
+        // again on every launch. Only the installed-path caller uses this mode.
+        ObbSplitScanResult out;
+        out.status = ObbSplitScanStatus::Verified;
+        out.reason = "signed installed APK: compatible OBB metadata verified";
+        out.main = main;
+        out.apk_data_offset = entry_offset;
+        out.obb_size = entry_size;
+        out.zip_crc32 = expected_crc;
+        std::copy(expected_hash.begin(), expected_hash.end(), out.sha256.begin());
+        return out;
+    }
     std::vector<uint8_t> buffer(kHashChunkBytes);
     ObbSha256 sha;
     uLong crc = crc32(0L, Z_NULL, 0);
@@ -214,8 +235,6 @@ ObbSplitScanResult ScanObbSplitFd(int fd,
         hashed += count;
     }
     const auto hex = ObbSha256::Hex(sha.Finalize());
-    const std::string_view expected_hash =
-        main ? kMainObbSha256 : kPatchObbSha256;
     if (!sha.IsValid() || std::string_view(hex.data()) != expected_hash ||
         static_cast<uint32_t>(crc) != expected_crc) {
         return Rejected("OBB SHA-256 or ZIP CRC32 mismatch");
@@ -228,6 +247,7 @@ ObbSplitScanResult ScanObbSplitFd(int fd,
     out.obb_size = entry_size;
     out.bytes_hashed = hashed;
     out.zip_crc32 = static_cast<uint32_t>(crc);
+    out.content_verified = true;
     out.sha256 = hex;
     return out;
 }

@@ -60,12 +60,9 @@ index bbdf925f..44d77fba 100644
      prelude_info.end_of_prelude = code.offset();
  
 diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
-index 2c7ae777..421623ab 100644
 --- a/src/dynarmic/backend/arm64/address_space.cpp
 +++ b/src/dynarmic/backend/arm64/address_space.cpp
-@@ -61,16 +61,34 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
- }
- 
+@@ -63,3 +63,10 @@
  CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
 +    FastDispatchEntry& fast_entry = fast_dispatch_table[FastDispatchIndex(descriptor)];
 +    if (fast_entry.code_ptr && fast_entry.descriptor == descriptor.Value()) {
@@ -76,14 +73,11 @@ index 2c7ae777..421623ab 100644
 +        fast_entry.code_ptr = block_entry;
 +        fast_entry.descriptor = descriptor.Value();
          return block_entry;
-     }
- 
-     IR::Block ir_block = GenerateIR(descriptor);
-     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
+@@ -70,1 +77,3 @@
 +    fast_entry.code_ptr = block_info.entry_point;
 +    fast_entry.descriptor = descriptor.Value();
      return block_info.entry_point;
- }
+@@ -72,3 +81,12 @@
  
 +void AddressSpace::ClearFastDispatchTable() {
 +    for (FastDispatchEntry& entry : fast_dispatch_table) {
@@ -96,16 +90,10 @@ index 2c7ae777..421623ab 100644
 +    // tiny lookup cache wholesale instead of risking a stale JIT code pointer.
 +    ClearFastDispatchTable();
      UnprotectCodeMemory();
- 
-     for (const auto& descriptor : descriptors) {
-@@ -90,6 +108,7 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
- }
- 
+@@ -92,2 +110,3 @@
  void AddressSpace::ClearCache() {
 +    ClearFastDispatchTable();
      block_entries.clear();
-     reverse_block_entries.clear();
-     block_infos.clear();
 diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
 index 835566bd..d678ecf6 100644
 --- a/src/dynarmic/backend/arm64/address_space.h

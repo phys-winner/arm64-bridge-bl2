@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(BL2_NATIVE_ARM32)
+#include "../../arm32_compat/src/native_elf_loader.h"
+#else
+
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -46,6 +50,8 @@ public:
     // non-writable PT_LOAD segment. Relocations are finished before guest
     // execution, so Dynarmic may safely fold constant reads from these ranges.
     bool IsReadOnlyRange(uint32_t address, size_t size) const;
+    // Complete relocated guest range within one executable PT_LOAD segment.
+    bool IsCodeRange(uint32_t address, size_t size) const;
 
 private:
     bool ParseHeader(const uint8_t* data, size_t size);
@@ -73,3 +79,4 @@ private:
     uint32_t m_plt_rel_size = 0;
     uint32_t m_got_vaddr = 0;
 };
+#endif

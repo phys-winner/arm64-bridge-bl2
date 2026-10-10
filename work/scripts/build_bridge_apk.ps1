@@ -2,11 +2,17 @@ param(
     [Parameter(Mandatory)][ValidateRange(1,99999)][int]$Seed,
     [ValidateRange(0,99999)][int]$PreviousSeed = 0,
     [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$NativeBuildDir = 'bridge-seed2',
-    [switch]$Diagnostics
+    [switch]$Diagnostics,
+    [switch]$PhysxCookieWatch,
+    [switch]$Release
 )
 $ErrorActionPreference = 'Stop'
+if ($PhysxCookieWatch -and !$Diagnostics) { throw 'PhysX cookie watch requires a diagnostic build' }
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $build = Join-Path $root 'work\build'
+$stagePack = Get-Item -LiteralPath (Join-Path $root 'app/assets/bl2_shader_stages.bin')
+if ($stagePack.Length -le 56 -or $stagePack.Length -gt 256MB) { throw 'Invalid full shader-stage asset size' }
+$stagePackHash = (Get-FileHash -LiteralPath $stagePack.FullName).Hash
 $nativeBuild = Join-Path $build $NativeBuildDir
 $java = 'C:\Portable\jdk-24.0.1\bin\java.exe'
 $apktool = 'D:\ai_test\old_game_restoration\tools\android\apktool.jar'
@@ -15,18 +21,29 @@ $signer = 'C:\Portable\Total.Commander\Utilites\Just Another Tool for APK\bin'
 $unsigned = Join-Path $build "bl2-arm64-bridge-seed$Seed-unsigned.apk"
 $aligned = Join-Path $build "bl2-arm64-bridge-seed$Seed-aligned.apk"
 $signed = Join-Path $build "bl2-arm64-bridge-seed$Seed.apk"
-if (Test-Path -LiteralPath $signed) { throw "Signed candidate already exists: $signed" }
+    if (Test-Path -LiteralPath $signed) { throw "Signed candidate already exists: $signed" }
 $deleted = @()
 $timer = [Diagnostics.Stopwatch]::StartNew()
+[IO.Directory]::CreateDirectory($build) | Out-Null
 try {
     if (Test-Path -LiteralPath (Join-Path $root 'android_port\src\com\tt2kgames\Borderlands2\LaunchControls.java')) {
         & (Join-Path $PSScriptRoot 'build_launch_controls.ps1')
     }
     $cmake = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\cmake.exe'
     $diagnosticFlag = if ($Diagnostics) { 'ON' } else { 'OFF' }
-    & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag"
+    $physxDiagnosticFlag = if ($PhysxCookieWatch) { 'ON' } else { 'OFF' }
+    $debugMenuFlag = if ($Release) { 'OFF' } else { 'ON' }
+    if (!(Test-Path -LiteralPath (Join-Path $nativeBuild 'CMakeCache.txt'))) {
+        $ndk = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018'
+        & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild -G Ninja `
+            "-DCMAKE_TOOLCHAIN_FILE=$ndk\build\cmake\android.toolchain.cmake" `
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release `
+            '-DCMAKE_MAKE_PROGRAM=C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\ninja.exe'
+        if ($LASTEXITCODE) { throw 'Fresh offline native configuration failed' }
+    }
+    & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag" "-DHORN_ENABLE_PHYSX_COOKIE_WATCH=$physxDiagnosticFlag" '-DHORN_GL_SELF_CHECK=OFF' "-DBL2_ENABLE_DEBUG_MENU_DEFAULT=$debugMenuFlag"
     if ($LASTEXITCODE) { throw 'Native configuration failed' }
-    & $cmake --build $nativeBuild --config Release --parallel
+    & $cmake --build $nativeBuild --config Release --parallel 8
     if ($LASTEXITCODE) { throw 'Native build failed' }
     Copy-Item -LiteralPath (Join-Path $nativeBuild 'libUnrealEngine3.so') -Destination (Join-Path $root 'app\lib\arm64-v8a\libUnrealEngine3.so') -Force
     $nativePath = Join-Path $root 'app\lib\arm64-v8a\libUnrealEngine3.so'
@@ -40,6 +57,17 @@ try {
     if (!$nativeText.Contains('debug.bl2.render_scale') -or
         !$nativeText.Contains('debug.bl2.legacy_resolution')) {
         throw 'Verified native 100% resolution policy is missing from the bridge'
+    }
+    foreach ($bufferNameHook in @('bl2_fresh_persistent_vertex_name',
+            'bl2_fresh_persistent_index_name', 'bl2_fresh_persistent_pixel_name')) {
+        if (!$nativeText.Contains($bufferNameHook)) {
+            throw "Required persistent buffer allocation hook is missing: $bufferNameHook"
+        }
+    }
+    if ($PhysxCookieWatch -and
+        (!$nativeText.Contains('debug.bl2.physx_cookie_watch') -or
+         !$nativeText.Contains('PHYSX_COOKIE cause='))) {
+        throw 'Requested PhysX diagnostic is missing from the native payload'
     }
     $nativeText = $null
     # Apktool -f can retain deleted resource files in its APK staging directory.
@@ -70,17 +98,33 @@ try {
     if (!($badging -match "targetSdkVersion:'37'")) { throw 'Target SDK 37 gate failed' }
     $zip = [IO.Compression.ZipFile]::OpenRead($signed)
     try {
-        foreach ($name in @('assets/guest_libs/libUnrealEngine3.so','lib/arm64-v8a/libUnrealEngine3.so')) {
+        foreach ($name in @('assets/guest_libs/libUnrealEngine3.so','lib/arm64-v8a/libUnrealEngine3.so',
+                           'assets/bl2_cache/WillowGame/Movies/Attract.bik',
+                           'assets/bl2_cache/WillowGame/CookedAndroid_DXT/Textures.tfc',
+                           'assets/bl2_cache/WillowGame/CookedAndroid_DXT/CharTextures.tfc')) {
             $entry = $zip.GetEntry($name)
             if (!$entry -or $entry.Length -ne $entry.CompressedLength) { throw "STORED payload gate failed: $name" }
         }
+        $stageEntry = $zip.GetEntry('assets/bl2_shader_stages.bin')
+        if (!$stageEntry -or $stageEntry.Length -ne $stagePack.Length) { throw 'Full shader-stage asset missing from ARM64 APK' }
+        $stageStream = $stageEntry.Open()
+        $stageHasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $packedStageHash = [BitConverter]::ToString($stageHasher.ComputeHash($stageStream)).Replace('-','')
+            if ($packedStageHash -ne $stagePackHash) { throw 'Packed full shader-stage asset differs' }
+        } finally { $stageStream.Dispose(); $stageHasher.Dispose() }
     } finally { $zip.Dispose() }
+    if ((Get-Item -LiteralPath $signed).Length -ge 2000000000L) { throw 'Base APK exceeds decimal 2 GB' }
+    & 'C:\Program Files\Python313\python.exe' -X utf8 -B (Join-Path $PSScriptRoot 'verify_embedded_locale.py') --apk $signed
+    if ($LASTEXITCODE) { throw 'Embedded Russian text payload gate failed' }
     if (!$Diagnostics) {
         $llvmBin = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin'
-        $dynamic = & "$llvmBin\llvm-readelf.exe" -d $nativePath
-        if ($LASTEXITCODE -or ($dynamic -match 'liblog\.so')) { throw 'Silent bridge retains a liblog dependency' }
-        $imports = & "$llvmBin\llvm-nm.exe" -D --undefined-only $nativePath
-        if ($LASTEXITCODE -or ($imports -match '__android_log_')) { throw 'Silent bridge retains an Android log import' }
+        $cache = Get-Content -LiteralPath (Join-Path $nativeBuild 'CMakeCache.txt') -Raw
+        foreach ($flag in @('HORN_ENABLE_LOGGING','HORN_ENABLE_PERF_PROBE','HORN_ENABLE_PHYSX_COOKIE_WATCH','HORN_GL_SELF_CHECK')) {
+            if ($cache -notmatch "(?m)^${flag}:BOOL=OFF\r?$") { throw "Quiet build flag gate failed: $flag" }
+        }
+        $exports = & "$llvmBin\llvm-nm.exe" -D --defined-only $nativePath
+        if ($LASTEXITCODE -or ($exports -match 'Bl2Arm64GlParitySelfCheck|Bl2FreshPersistentBufferNamesSelfCheck')) { throw 'Gameplay bridge retains a GPU self-check entry' }
     }
     if ($PreviousSeed -gt 0 -and $PreviousSeed -ne $Seed) {
         $previous = Join-Path $build "bl2-arm64-bridge-seed$PreviousSeed.apk"
@@ -99,19 +143,36 @@ try {
 }
 $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;bytes=(Get-Item -LiteralPath $signed).Length;
     bridge_logging=[bool]$Diagnostics.IsPresent;perf_probe_compiled=[bool]$Diagnostics.IsPresent;
+    release_build=[bool]$Release.IsPresent;debug_menu_default_enabled=(!$Release);
+    russian_text_in_base=$true;app_locales=@('en','ru');cache_layout='rebalanced';
+    bounded_backend_cache_display_logs=$true;gl_self_check_compiled=$false;
+    physx_cookie_watch_compiled=[bool]$PhysxCookieWatch.IsPresent;
     cmake_source_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'arm64_bridge\CMakeLists.txt')).Hash;
     fastmem_fpsr_patch_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'arm64_bridge\patches\dynarmic-arm64-fastmem-fpsr.patch')).Hash;
     sha256=(Get-FileHash -LiteralPath $signed).Hash;
     bridge_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'app\lib\arm64-v8a\libUnrealEngine3.so')).Hash;
     guest_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'app\assets\guest_libs\libUnrealEngine3.so')).Hash;
+    stage_table_sha256=$stagePackHash;stage_table_bytes=$stagePack.Length;
     native_code='arm64-v8a';gles='3.2';zip_page_alignment=16384;
     movies_skip_default=$true;movies_playback_property='debug.horn.play_movies';
-    render_scale_default='native-surface-1:1';render_scale_diagnostic_property='debug.bl2.render_scale';
-    quality_default='saved-game SystemSettings';low_quality_diagnostic_property='debug.bl2.low_quality=1';
+    render_scale_default='50%';render_scale_diagnostic_property='debug.bl2.render_scale';
+    render_scale_user_min_percent=50;render_scale_user_max_percent=150;render_scale_user_step_percent=10;
+    render_scale_user_preference='touch-controls.properties:renderPercent';
+    ui_scale_default_percent=125;ui_scale_user_min_percent=100;ui_scale_user_max_percent=200;
+    ui_scale_user_step_percent=10;ui_scale_user_preference='touch-controls.properties:uiPercent';
+    ui_scale_default_first_decrement=120;ui_scale_default_first_increment=130;
+    ui_scale_independent_from_render_resolution=$true;touch_settings_wire_version=5;
+    performance_default_mask=33;performance_preferences=@('fasterVisibility','fasterAudioLimiter');
+    quality_default='minimum original Android video options';low_quality_diagnostic_property='debug.bl2.low_quality=1';
+    additional_graphics_defaults='original runtime values';potato_default=$false;potato_preserves_render_scale=$true;
     fps_limit_default='Display.getRefreshRate';fps_limit_diagnostic_property='debug.bl2.fps_limit=900';
     legacy_resolution_diagnostic_property='debug.bl2.legacy_resolution';
     signature=$verification;elapsed_s=$timer.Elapsed.TotalSeconds;deleted=$deleted;
     source_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'arm64_bridge\src') -File | Get-FileHash | Select-Object Path,Hash);
+    bridge_patch_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'arm64_bridge\patches') -File | Get-FileHash | Select-Object Path,Hash);
+    bridge_build_support_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'arm64_bridge\cmake') -File | Get-FileHash | Select-Object Path,Hash);
+    bridge_test_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'arm64_bridge\tests') -File | Get-FileHash | Select-Object Path,Hash);
+    warmup_asset_hashes=@(Get-FileHash -LiteralPath (Join-Path $root 'app\assets\bl2_shader_warmup.bin'),(Join-Path $root 'app\assets\bl2_jit_warmup.bin'),$stagePack.FullName | Select-Object Path,Hash);
     touch_core_source_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'touch_native_design\arm64_bridge') -File | Get-FileHash | Select-Object Path,Hash);
     android_source_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'android_port\src') -Recurse -File | Get-FileHash | Select-Object Path,Hash);
     app_hook_hashes=@(Get-FileHash -LiteralPath (Join-Path $root 'app\smali\com\tt2kgames\Borderlands2\UE3JavaApp.smali'),(Join-Path $root 'app\smali\com\tt2kgames\Borderlands2\Downloader.smali'),(Join-Path $root 'app\AndroidManifest.xml'),(Join-Path $root 'app\apktool.yml') | Select-Object Path,Hash)}

@@ -1,3 +1,4 @@
+#include "guest_software_write_watch.h"
 #include "thunks_opensles.h"
 #include "bridge_log.h"
 #include "thunk_manager.h"
@@ -45,7 +46,7 @@ constexpr uint32_t kAudioDumpMinDurationMs = 1500u;
 constexpr uint32_t kMaxAudioDumpFiles = 48u;
 constexpr uint64_t kMaxAudioDumpBytes = 64u * 1024u * 1024u;
 constexpr const char* kAudioDumpDirectory =
-    "/sdcard/Android/data/com.Phosphor.Horn.Paid/files/horn_audio_probe";
+    "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/bl2_audio_probe";
 // A guest requeue callback is deliberately forwarded after the first slice so
 // a looping sound can enqueue its next copy while the current copy's tail is
 // playing. The host queue therefore needs room for that tail plus one complete
@@ -710,6 +711,7 @@ uint32_t AllocAndRegisterIID(ThunkManager& manager, DynarmicHost& host,
 
     std::memcpy(host.GetGuestMemoryBase() + struct_addr, host_iid,
                 sizeof(struct SLInterfaceID_));
+    NotifyGuestMemoryWritten(struct_addr, sizeof(struct SLInterfaceID_));
     host.MemoryWrite32(pointer_addr, struct_addr);
     manager.RegisterSymbol(name, pointer_addr);
     g_iid_pointer_map[name] = pointer_addr;
@@ -744,6 +746,7 @@ uint32_t AllocGuestHandle(DynarmicHost& host, uint32_t vtable) {
     const uint32_t handle = host.GuestAlloc(kGuestHandleBytes, 8);
     if (!handle) return 0;
     std::memset(host.GetGuestMemoryBase() + handle, 0, kGuestHandleBytes);
+    NotifyGuestMemoryWritten(handle, kGuestHandleBytes);
     host.MemoryWrite32(handle, vtable);
     return handle;
 }

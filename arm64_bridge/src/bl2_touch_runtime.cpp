@@ -3,13 +3,20 @@
 #include "bl2_touch_gameplay_hooks.h"
 #include "bl2_touch_physical.h"
 #include "bl2_touch_ui_sink.h"
+#include "bl2_touch_widget_sink.h"
 #include "bl2_touch_combined_sink.h"
 #include "bl2_touch_ui_model_probe.h"
+#include "bl2_touch_ui_model.h"
+#include "bl2_pause_debug_menu.h"
+#include "bl2_graphics_settings.h"
+#include "bl2_performance_settings.h"
+#include "bl2_perf_hint.h"
 #include "../../touch_native_design/arm64_bridge/bl2_touch_engine_adapter.h"
 #include <memory>
 
 #include "bridge_log.h"
 #include "dynarmic_host.h"
+#include "bl2_touch_guest_call.h"
 #include "elf_loader.h"
 #include "obb_sha256.h"
 #include "thunk_manager.h"
@@ -41,6 +48,7 @@ std::string lastObservation;
 thread_local bool insideProbe = false;
 std::unique_ptr<bl2::touch::Ue3GameplaySink> gameplaySink;
 std::unique_ptr<bl2::touch::Ue3UiSink> uiSink;
+std::unique_ptr<bl2::touch::Ue3WidgetSink> widgetSink;
 std::unique_ptr<bl2::touch::CombinedSink> combinedSink;
 bool uiModelObserverEnabled = false;
 std::uint64_t currentLifetimeGeneration() { return lifetimeGeneration.load(std::memory_order_relaxed); }
@@ -83,6 +91,17 @@ public:
     bool span(std::uint32_t p, std::size_t n) const {
         return p >= 0x10000 && p <= host.GetGuestMemorySize() &&
                n <= host.GetGuestMemorySize() - p;
+    }
+    static bool copyMemory(const void* context, std::uint32_t p, void* out, std::size_t n) {
+        const auto& read = *static_cast<const Reader*>(context);
+#if defined(BL2_NATIVE_ARM32)
+        if (!read.span(p,n)) return false;
+        std::memcpy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p)),n);
+#else
+        if (!read.span(p,n) || !read.host.GetGuestMemoryBase()) return false;
+        std::memcpy(out,read.host.GetGuestMemoryBase() + p,n);
+#endif
+        return true;
     }
     std::uint32_t u32(std::uint32_t p) const {
         return span(p, 4) ? host.MemoryRead32(p) : 0;
@@ -210,6 +229,13 @@ Observation observe(Reader& read, std::uint32_t viewport) {
                 out.movie = movie; out.movieOwner = owner; out.movieClass = read.className(owner);
                 out.identity = mix(out.identity, movie);
                 out.identity = mix(out.identity, read.objectToken(owner));
+                if (out.movieClass == "StatusMenuExGFxMovie" || out.movieClass == "CharacterSelectionReduxGFxMovie") {
+                    const auto direct = bl2::touch::CaptureBl2DirectUi({&read,Reader::copyMemory},read.base,owner,0);
+                    // Changing a status tab or character UI state retires its
+                    // old pointer capture even when the Movie address is reused.
+                    // Selection itself stays outside this scene identity.
+                    out.identity = mix(out.identity,direct.valid ? direct.structure : 0);
+                }
             }
         }
     }
@@ -243,19 +269,38 @@ Observation observe(Reader& read, std::uint32_t viewport) {
     std::sort(actions.begin(), actions.end());
     actions.erase(std::unique(actions.begin(), actions.end()), actions.end());
     if (actions.size() > 256) { out.reason = "too-many-context-actions"; return out; }
-    // This leaf function is the game's actual availability check. RunGuestCallback
-    // uses the secondary core/stack while the primary input core is suspended.
+    // This leaf is the game's actual availability check. Its result must be
+    // synchronous even when ProcessInput runs on a suspended callback core.
     const auto isAvailable = read.base + 0x0235679C;
     for (const auto action : actions) {
         const auto name = read.name(action + 0x58);
+#if defined(BL2_NATIVE_ARM32)
         if (!name.empty() && read.host.RunGuestCallback(isAvailable, {out.input, action})) out.available.push_back(name);
+#else
+        if (name.empty()) continue;
+        std::uint32_t value = 0;
+        if (!bl2::touch::Bl2TouchCallGuest(read.host,isAvailable,{out.input,action},value)) {
+            out.reason = "availability-call-failed"; return out;
+        }
+        if (value) out.available.push_back(name);
+#endif
     }
     std::sort(out.available.begin(), out.available.end());
     const auto has = [&](const char* name) {
         return std::find(out.contexts.begin(), out.contexts.end(), name) != out.contexts.end();
     };
     out.reason = "observed-only";
-    if (out.movie && out.movieClass != "WillowHUDGFxMovie") out.mode = bl2::touch::Mode::Menu;
+    bool nativeMenuOpen = false;
+    if (!out.movie) {
+        const auto client = bl2::touch::Bl2TouchGameViewportClient({&read,Reader::copyMemory},read.base);
+        const auto nativeUi = bl2::touch::CaptureBl2UiModel({&read,Reader::copyMemory},
+            read.base,client);
+        if (nativeUi.valid) {
+            out.identity = mix(out.identity,nativeUi.structure);
+            nativeMenuOpen = nativeUi.nativeMenuOpen;
+        }
+    }
+    if (nativeMenuOpen || (out.movie && out.movieClass != "WillowHUDGFxMovie")) out.mode = bl2::touch::Mode::Menu;
     else if (has("InputContext_Cinematic")) out.mode = bl2::touch::Mode::Cinematic;
     else if (has("InputContext_DrivingVehicle") || has("InputContext_InVehicleTurret") ||
              has("InputContext_VehicleAttachedRider")) out.mode = bl2::touch::Mode::Vehicle;
@@ -275,6 +320,9 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
     if (!active || insideProbe) return;
     insideProbe = true;
     struct Guard { ~Guard() { insideProbe = false; } } guard;
+    SyncBl2GraphicsSettings(host);
+    SyncBl2PerformanceSettings();
+    Bl2PerfHintGameThread();
     const auto tick = inputTicks.fetch_add(1, std::memory_order_relaxed) + 1;
     Reader read(host);
     const auto result = observe(read, jit.Regs()[0]);
@@ -284,26 +332,51 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
     context.sceneIdentity = result.identity;
     if (gameplaySink) {
         gameplaySink->expirePendingAxes();
-        // Exact state witnessed on build218/PID14654, 2026-09-27 00:10:09.610.
-        // Vehicles, injured, GFx screens and ambiguous multi-context states stay
-        // on the temporary fallback until separately verified.
-        const bool onFoot = result.mode == bl2::touch::Mode::Gameplay && !result.movie &&
-            result.contexts.size() == 1 && result.contexts[0] == "InputContext_OnFoot";
-        const auto mask = gameplaySink->prepare(onFoot ? result.controller : 0,
-            onFoot ? result.input : 0, result.identity);
-        if (onFoot && gameplaySink->ready()) {
+        // Injured uses the same original PlayerWalking axes. Its Pawn state
+        // keeps the native crawl/zero-speed timing and ProcessInjuredViewRotation.
+        // Native14 witnessed that the OnFoot-only gate suppressed both axes in
+        // FFYL. Vehicles, focused GFx and ambiguous multi-contexts stay denied.
+        const bool gameplayAxes = bl2::touch::Bl2TouchGameplayAxes(result.mode,result.movie,
+            result.contexts.size(),result.contexts.empty() ? std::string_view{} : result.contexts[0]);
+        const auto mask = gameplaySink->prepare(gameplayAxes ? result.controller : 0,
+                                               gameplayAxes ? result.input : 0, result.identity, result.viewport);
+        if (gameplayAxes && gameplaySink->ready()) {
             context.capabilities = bl2::touch::GameplayInput | bl2::touch::RelativeLook;
-            context.availableActions = mask & ((std::uint64_t{1} << 15) - 1);
+            context.availableActions = mask & (((std::uint64_t{1} << 15) - 1) |
+                bl2::touch::actionBit(bl2::touch::Action::LastWeapon) |
+                bl2::touch::actionBit(bl2::touch::Action::Chat));
+            gameplaySink->telemetry(context);
         }
-        if (uiSink) {
-            const auto caps = uiSink->prepare(result.viewport, result.controller, result.movie,
-                result.movieOwner, result.identity);
+        if (uiSink || widgetSink) {
+            const auto caps = widgetSink ? widgetSink->prepare(result.viewport,result.controller,result.movie,result.movieOwner,result.identity) :
+                uiSink->prepare(result.viewport, result.controller, result.movie,result.movieOwner, result.identity);
             if (caps) {
                 context.capabilities = caps;
-                context.availableActions = bl2::touch::kUiActions;
-                context.mode = result.movieClass == "WillowGFxDialogBox" ? bl2::touch::Mode::Dialog :
+                context.availableActions = (caps & bl2::touch::DebugCanvas) ?
+                    bl2::touch::kDebugMenuActions : bl2::touch::kUiActions;
+                context.mode = bl2::touch::Bl2TouchNativeDialogMovie(result.movieClass) ? bl2::touch::Mode::Dialog :
                     (result.movieClass == "FrontendGFxMovie" ? bl2::touch::Mode::Frontend : bl2::touch::Mode::Menu);
             }
+        }
+        if (context.mode == bl2::touch::Mode::Menu || context.mode == bl2::touch::Mode::Dialog) {
+#if HORN_ENABLE_LOGGING
+            std::string pauseReason;
+            const auto diagnostic = &pauseReason;
+#else
+            std::string* diagnostic = nullptr;
+#endif
+            const bool paused = bl2::touch::Bl2TouchPausedWorld({&read,Reader::copyMemory},read.base,result.controller,
+                result.movieClass == "PauseGFxMovie" ? result.movieOwner : 0,diagnostic);
+            if (paused) context.capabilities |= bl2::touch::PauseBackdrop;
+#if HORN_ENABLE_LOGGING
+            static std::string lastPauseReason; static unsigned pauseLogs = 0;
+            const auto state = result.movieClass + "/" + pauseReason;
+            if (pauseLogs < 24 && state != lastPauseReason) {
+                lastPauseReason = state; ++pauseLogs;
+                HORN_LOGI("BL2TouchDiagnostics","pause backdrop active=%u movie=%s owner=%08X controller=%08X reason=%s",
+                    paused ? 1u : 0u,result.movieClass.c_str(),result.movieOwner,result.controller,pauseReason.c_str());
+            }
+#endif
         }
         if (bl2::touch::physicalOwnership().ownsInput(bl2::touch::monotonicMilliseconds())) {
             context.capabilities = bl2::touch::PhysicalOwnsInput;
@@ -330,8 +403,13 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         static_cast<unsigned long long>(tick), static_cast<unsigned long long>(epoch),
         static_cast<unsigned long long>(snapshot.frameSerial), result.viewport, result.world,
         result.controller, result.input, result.movie, result.movieOwner, result.movieClass.c_str(),
+#if defined(BL2_NATIVE_ARM32)
+        static_cast<unsigned>(context.mode), result.reason.c_str(), contexts.c_str(), actions.c_str(),
+        context.capabilities, widgetSink ? "native-widgets" : (uiSink ? "native-ui-test" : (gameplaySink ? "gameplay-test" : "disabled")));
+#else
         static_cast<unsigned>(result.mode), result.reason.c_str(), contexts.c_str(), actions.c_str(),
         context.capabilities, uiSink ? "native-ui-test" : (gameplaySink ? "gameplay-test" : "disabled"));
+#endif
 }
 
 void lifetimeBoundary(Dynarmic::A32::Jit&, DynarmicHost&) {
@@ -344,6 +422,8 @@ void inputDestroyed(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
 }
 
 } // namespace
+
+std::uint64_t Bl2TouchLifetimeGeneration() { return currentLifetimeGeneration(); }
 
 bool VerifyBl2TouchInput(const std::uint8_t* bytes, std::size_t size) {
     inputVerified = false;
@@ -360,9 +440,10 @@ bool InstallBl2TouchRuntime(DynarmicHost& host) {
     if (installed) return true;
     char mode[PROP_VALUE_MAX] = {};
     __system_property_get("debug.bl2.native_touch", mode);
-    if (!*mode || std::strcmp(mode, "0") == 0) return true;
+    if (std::strcmp(mode,"off")==0) return true;
+    const bool nativeDefault=!*mode || std::strcmp(mode,"0")==0 || std::strcmp(mode,"native")==0;
     const bool tapTest = std::strcmp(mode, "ui-tap-test") == 0;
-    const bool uiDelivery = tapTest || std::strcmp(mode, "ui-test") == 0;
+    const bool uiDelivery = nativeDefault || tapTest || std::strcmp(mode, "ui-test") == 0;
     const bool delivery = uiDelivery || std::strcmp(mode, "gameplay-test") == 0;
     if (std::strcmp(mode, "observe") != 0 && !delivery) {
         HORN_LOGE(kTag, "native-touch mode refused; valid modes: 0, observe, gameplay-test, ui-test, ui-tap-test");
@@ -393,9 +474,34 @@ bool InstallBl2TouchRuntime(DynarmicHost& host) {
     for (std::size_t i = 0; i < availability.size(); ++i)
         if (host.MemoryRead32(base + 0x0235679C + std::uint32_t(i * 4)) != availability[i]) return false;
 
+    std::array<std::uint32_t, sizeof(hooks) / sizeof(hooks[0])> sites{};
+#if defined(BL2_NATIVE_ARM32)
+    std::array<std::uint32_t, sites.size()> dispatchers{};
+    for (std::size_t i = 0; i < sites.size(); ++i) {
+        const auto& hook = hooks[i];
+        const auto site = base + hook.rva + hook.offset;
+        sites[i] = site;
+        const std::array<std::uint32_t, 4> words = {
+            host.MemoryRead32(site), host.MemoryRead32(site + 4), 0xE51FF004, site + 8};
+        const auto continuation = host.CreateCodeVeneer(words);
+        if (!continuation) return false;
+        const ThunkHandler handler = i == 0 ? ThunkHandler(inputBoundary) :
+            (i == 3 ? ThunkHandler(inputDestroyed) : ThunkHandler(lifetimeBoundary));
+        dispatchers[i] = host.GetThunkManager().RegisterThunk(hook.thunk,
+            [handler,continuation](Dynarmic::A32::Jit& jit, DynarmicHost& current) {
+                handler(jit,current);
+                jit.Regs()[15] = continuation;
+            });
+        if (!dispatchers[i]) return false;
+    }
+    for (std::size_t i = 0; i < sites.size(); ++i) {
+        host.MemoryWrite32(sites[i], 0xE51FF004);
+        host.MemoryWrite32(sites[i] + 4, dispatchers[i]);
+        host.InvalidateGuestCode(sites[i], 8);
+    }
+#else
     const auto code = host.GuestAlloc(sizeof(hooks) / sizeof(hooks[0]) * 20, 4);
     if (!code) return false;
-    std::array<std::uint32_t, sizeof(hooks) / sizeof(hooks[0])> sites{};
     // Prepare and validate every veneer before touching any original entry.
     for (std::size_t i = 0; i < sites.size(); ++i) {
         const auto& hook = hooks[i];
@@ -419,6 +525,7 @@ bool InstallBl2TouchRuntime(DynarmicHost& host) {
         host.MemoryWrite32(sites[i] + 4, code + std::uint32_t(i * 20));
         host.InvalidateGuestCode(sites[i], 8);
     }
+#endif
     active = installed = true;
     if (delivery) {
         gameplaySink = std::make_unique<bl2::touch::Ue3GameplaySink>(host, currentLifetimeGeneration);
@@ -428,7 +535,11 @@ bool InstallBl2TouchRuntime(DynarmicHost& host) {
             return false;
         }
     }
-    if (uiDelivery && gameplaySink) {
+    if(nativeDefault && gameplaySink) {
+        widgetSink=std::make_unique<bl2::touch::Ue3WidgetSink>(host,currentLifetimeGeneration);
+        if(!widgetSink->verified()) { widgetSink.reset();return false; }
+        combinedSink=std::make_unique<bl2::touch::CombinedSink>(*gameplaySink,*widgetSink);
+    } else if (uiDelivery && gameplaySink) {
         uiSink = std::make_unique<bl2::touch::Ue3UiSink>(host, currentLifetimeGeneration, tapTest);
         if (!uiSink->verified()) {
             uiSink.reset();
@@ -436,6 +547,11 @@ bool InstallBl2TouchRuntime(DynarmicHost& host) {
         } else combinedSink = std::make_unique<bl2::touch::CombinedSink>(*gameplaySink, *uiSink);
     }
     HORN_LOGI(kTag, "native-touch stage=%u mode=%s sha256=%s hooks=%zu boundedChanges=64",
-              uiSink ? 3u : (gameplaySink ? 2u : 1u), mode, kSha, sites.size() + (gameplaySink ? 2 : 0));
+#if defined(BL2_NATIVE_ARM32)
+              widgetSink ? 4u : (uiSink ? 3u : (gameplaySink ? 2u : 1u)),
+#else
+              uiSink ? 3u : (gameplaySink ? 2u : 1u),
+#endif
+              mode, kSha, sites.size() + (gameplaySink ? 2 : 0));
     return true;
 }

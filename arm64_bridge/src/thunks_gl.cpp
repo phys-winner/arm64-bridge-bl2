@@ -6,7 +6,10 @@
 #include "perf_probe.h"
 #include "legacy_glsl_compat.h"
 #include "buffer_shadow_sync.h"
+#include "gl_storage_call_diagnostic.h"
 #include "obb_sha256.h"
+#include "bl2_shader_warmup.h"
+#include "bl2_graphics_settings.h"
 #include "scene_texture_targets.h"
 #include "obb_pair_selection.h"
 #include "thunk_types.h"
@@ -16,11 +19,14 @@
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
 #include <GLES2/gl2ext.h>
+#include <android/log.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <time.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -34,12 +40,23 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <memory>
+#include "bl2_shader_stage_cache.h"
+#include "bl2_hitch_report.h"
+#if !defined(BL2_NATIVE_ARM32)
+#include "bl2_program_upgrade.h"
+#endif
 
 #define LOG_TAG "Arm32Bridge_GL"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
 #define LOGE(...) HORN_LOGE(LOG_TAG, __VA_ARGS__)
 
 void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host);
+bool ForgetGuestGlMappings(DynarmicHost& host, GLsizei count, const GLuint* buffers);
+#if defined(BL2_NATIVE_ARM32)
+bool NativeDirectGlMappingsRequested();
+bool CopyNativeGlMappedBuffer(GLuint buffer, size_t offset, size_t size, void* output);
+#endif
 bool SceneAuditEnabled();
 void SceneAuditLogError(const char* phase);
 void SceneAuditNoteDraw(GLuint program);
@@ -48,6 +65,9 @@ void SceneAuditDrawCompleted(const char* operation);
 void SceneAuditFramebufferTransition(GLenum target, GLuint next_framebuffer);
 void SceneAuditLogFramebufferPixels(const char* label, uint32_t index,
                                     GLint x0, GLint y0, GLint x1, GLint y1);
+bool ResolveGlPixels(DynarmicHost& host, int width, int height, int depth,
+                     uint32_t format, uint32_t type, uint32_t address,
+                     const void** pixels, bool volume);
 bool UploadBgraPixels2D(DynarmicHost& host, GLenum target, GLint level,
                         GLint internalformat, GLsizei width, GLsizei height,
                         GLint border, GLint xoffset, GLint yoffset,
@@ -67,6 +87,8 @@ static thread_local float s_depth_bias_units_scale = 1.0f;
 static thread_local bool s_depth_bias_cache_valid = false;
 static thread_local std::unordered_map<GLenum, GLuint> s_bound_buffers;
 void InvalidateGlStateCaches();
+void InvalidateGlAttribCache();
+static void RefreshNativeProgramBinding();
 
 static bool ShouldLogTelemetry(std::atomic<uint32_t>& counter, uint32_t limit,
                                const char* name, uint32_t* index) {
@@ -94,10 +116,10 @@ void TrackGlBufferBinding(GLenum target, GLuint buffer) {
 }
 
 GLuint GetBoundGlBuffer(GLenum target) {
-    const auto it = s_bound_buffers.find(target);
-    if (it != s_bound_buffers.end()) return it->second;
     if (target == GL_ARRAY_BUFFER) return s_bound_array_buffer;
     if (target == GL_ELEMENT_ARRAY_BUFFER) return s_bound_element_buffer;
+    const auto it = s_bound_buffers.find(target);
+    if (it != s_bound_buffers.end()) return it->second;
     return 0;
 }
 
@@ -112,6 +134,16 @@ void ForgetGlBufferBindings(GLsizei count, const GLuint* buffers) {
         if (s_bound_array_buffer == deleted) s_bound_array_buffer = 0;
         if (s_bound_element_buffer == deleted) s_bound_element_buffer = 0;
     }
+}
+
+void RefreshGlVertexArrayBindings() {
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) return;
+    // Only the element buffer and attribute arrays belong to a VAO. Keep the
+    // current program, textures and all other buffer mirrors across VAO binds.
+    GLint element = static_cast<GLint>(s_bound_element_buffer);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &element);
+    TrackGlBufferBinding(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(element));
+    InvalidateGlAttribCache();
 }
 
 void RefreshGlBindings() {
@@ -129,6 +161,7 @@ void RefreshGlBindings() {
     TrackGlBufferBinding(GL_ARRAY_BUFFER, static_cast<GLuint>(array));
     TrackGlBufferBinding(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(element));
     s_bound_framebuffer = static_cast<GLuint>(framebuffer);
+    RefreshNativeProgramBinding();
 }
 
 static uint64_t EstimatedPixelBytes(GLsizei width, GLsizei height,
@@ -378,7 +411,11 @@ static std::mutex s_buffer_mapping_mutex;
 static std::unordered_map<GLuint, GuestBufferMapping> s_buffer_mappings;
 static std::unordered_map<GLuint, std::vector<uint8_t>> s_buffer_shadows;
 
+#if defined(BL2_NATIVE_ARM32)
+bool CopyGlBufferShadowSnapshot(GLuint buffer, size_t offset, size_t size, void* output) {
+#else
 bool CopyGlBufferShadow(GLuint buffer, size_t offset, size_t size, void* output) {
+#endif
     if (!buffer || !output) return false;
     std::lock_guard<std::mutex> lock(s_buffer_mapping_mutex);
     const auto found = s_buffer_shadows.find(buffer);
@@ -389,6 +426,14 @@ bool CopyGlBufferShadow(GLuint buffer, size_t offset, size_t size, void* output)
     std::memcpy(output, found->second.data() + offset, size);
     return true;
 }
+
+#if defined(BL2_NATIVE_ARM32)
+bool CopyGlBufferShadow(GLuint buffer, size_t offset, size_t size, void* output) {
+    if (!buffer || !output) return false;
+    if (CopyNativeGlMappedBuffer(buffer, offset, size, output)) return true;
+    return CopyGlBufferShadowSnapshot(buffer, offset, size, output);
+}
+#endif
 
 size_t SyncChangedGlBufferMapping(GLuint buffer, size_t offset, size_t size,
                                   void* native_mapping, const void* guest_data,
@@ -583,6 +628,8 @@ static const uint8_t* GuestTextureBytes(DynarmicHost& host, uint32_t guest_ptr,
     if (HasGlES3()) glGetIntegerv(0x88EF /* GL_PIXEL_UNPACK_BUFFER_BINDING */,
                                   &unpack_buffer);
     if (unpack_buffer != 0) {
+        // The CPU shadow follows persistent-map writes only after a sync.
+        SyncGuestMappedBuffersForGpuRead(host);
         std::lock_guard<std::mutex> lock(s_buffer_mapping_mutex);
         const auto it = s_buffer_shadows.find(static_cast<GLuint>(unpack_buffer));
         const uint64_t offset = guest_ptr;
@@ -682,9 +729,8 @@ static DepthBoundsProc NativeDepthBoundsProc() {
 
 constexpr GLenum kDepthBoundsTestEXT = 0x8890;
 
-// The 2013 guest never sets anisotropic filtering. Request the host maximum
-// only when the real driver advertises the extension; querying its enum on an
-// unsupported context would itself generate GL_INVALID_ENUM.
+// The shipped OpenGL RHI never forwards anisotropy to GLES. Use the native
+// selected value, with the real extension/driver limit, on the render thread.
 static std::atomic<int> s_aniso_support{-1};  // -1 unknown, 0 absent, 1 present
 static std::atomic<GLint> s_max_aniso{-1};
 static std::atomic<bool> s_logged_aniso{false};
@@ -700,7 +746,7 @@ static void ForceAnisotropy(GLenum target) {
             extensions, "GL_EXT_texture_filter_anisotropic") ? 1 : 0;
         s_aniso_support.store(support, std::memory_order_release);
     }
-    if (support == 0) return;
+    if (support == 0) { Bl2GraphicsHostAnisotropy(1); return; }
 
     GLint max_aniso = s_max_aniso.load(std::memory_order_acquire);
     if (max_aniso < 0) {
@@ -708,23 +754,18 @@ static void ForceAnisotropy(GLenum target) {
         if (max_aniso < 1) max_aniso = 0;
         s_max_aniso.store(max_aniso, std::memory_order_release);
     }
+    Bl2GraphicsHostAnisotropy(static_cast<std::uint32_t>(std::max(max_aniso,1)));
     if (max_aniso > 1) {
-        glTexParameteri(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, max_aniso);
+        const auto selected = static_cast<GLint>(Bl2GraphicsFiltering() & 0xFFu);
+        const auto requested = selected ? selected : max_aniso;
+        glTexParameteri(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, std::clamp(requested,1,max_aniso));
         bool expected = false;
         if (s_logged_aniso.compare_exchange_strong(expected, true)) {
-            LOGI("Anisotropic filtering: host maximum %dx", max_aniso);
+            LOGI("Anisotropic filtering: native setting %dx; host maximum %dx", requested,max_aniso);
         }
     }
 }
 
-// Keep the game's mip filtering, but blend between adjacent mip levels rather
-// than snapping to the nearest one. Both values are exact integers even in the
-// glTexParameterf entry point.
-static GLint UpgradeMinFilter(GLenum pname, GLint value) {
-    return pname == GL_TEXTURE_MIN_FILTER && value == GL_LINEAR_MIPMAP_NEAREST
-        ? GL_LINEAR_MIPMAP_LINEAR
-        : value;
-}
 static thread_local bool s_logged_trilinear_upgrade = false;
 
 enum class UniformTuning : uint8_t {
@@ -746,6 +787,11 @@ struct UniformBinding {
 // therefore thread-local while the immutable location/name cache is shared.
 static thread_local GLuint s_current_program = 0;
 static thread_local bool s_program_cache_valid = false;
+static thread_local GLuint s_current_sso_pipeline = 0;
+static thread_local EGLContext s_current_sso_context = EGL_NO_CONTEXT;
+static thread_local GLuint s_current_sso_vertex_program = 0;
+static thread_local GLuint s_current_sso_fragment_program = 0;
+static thread_local bool s_explicit_gl_program = false;
 struct LegacyUnitBinding {
     GLenum target = 0;
     GLuint texture = 0;
@@ -766,6 +812,10 @@ struct AttribPointerBinding {
     bool valid = false;
 };
 static thread_local std::array<AttribPointerBinding, 32> s_attrib_pointers{};
+// Attribute 0 buffer offset as last specified: 0 aligned, 1 misaligned,
+// 2 unknown (VAO switch or bridge-internal attribute rewrite). It gates the
+// GFx repack so aligned UI draws skip its per-attribute GL queries.
+static thread_local uint8_t s_attr0_alignment = 2;
 static std::atomic<uint64_t> s_gl_program_attempts{0}, s_gl_program_redundant{0},
     s_gl_program_skipped{0}, s_gl_texture_attempts{0},
     s_gl_texture_redundant{0}, s_gl_texture_skipped{0},
@@ -775,8 +825,9 @@ static std::atomic<uint64_t> s_gl_program_attempts{0}, s_gl_program_redundant{0}
 
 static int GlStateCacheMode() {
     static const int mode = [] {
+        constexpr int default_mode = 3; // Program/texture/sampler binds only; attributes stay uncached.
         char value[PROP_VALUE_MAX] = {};
-        if (__system_property_get("debug.bl2.gl_state_mode", value) <= 0) return 0;
+        if (__system_property_get("debug.bl2.gl_state_mode", value) <= 0) return default_mode;
         return std::clamp(atoi(value), 0, 7);
     }();
     return mode;
@@ -793,7 +844,11 @@ static bool GlStateCacheAuditEnabled() {
 
 void InvalidateGlAttribCache() {
     for (auto& entry : s_attrib_pointers) entry.valid = false;
+    s_attr0_alignment = 2;
 }
+
+bool GfxAttributesMayBeMisaligned() { return s_attr0_alignment != 0; }
+void NoteGfxAttributesAligned() { s_attr0_alignment = 0; }
 
 void InvalidateLegacyTextureCache() {
     for (auto& entry : s_legacy_unit_bindings) {
@@ -805,6 +860,10 @@ void InvalidateLegacyTextureCache() {
 
 void InvalidateGlStateCaches() {
     s_program_cache_valid = false;
+    s_current_sso_pipeline = 0;
+    s_current_sso_context = EGL_NO_CONTEXT;
+    s_current_sso_vertex_program = 0;
+    s_current_sso_fragment_program = 0;
     InvalidateLegacyTextureCache();
     InvalidateGlAttribCache();
 }
@@ -819,7 +878,9 @@ void GlStateProbePresent() {
     static std::atomic<uint64_t> frames{0};
     const uint64_t frame = frames.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frame % 240 != 0) return;
-    LOGI("GL_STATE mode=%d frames=%llu program=%llu/%llu/%llu "
+    if (frame > 1920) return;
+    __android_log_print(ANDROID_LOG_INFO, "BL2GlState",
+         "GL_STATE mode=%d frames=%llu program=%llu/%llu/%llu "
          "texture=%llu/%llu/%llu sampler=%llu/%llu/%llu attrib=%llu/%llu/%llu",
          GlStateCacheMode(), static_cast<unsigned long long>(frame),
          static_cast<unsigned long long>(s_gl_program_attempts.exchange(0)),
@@ -867,9 +928,19 @@ struct LegacyConstantGroup {
     uint16_t byte_count = 0;
 };
 
+struct LegacyAssemblyPipeline;
+
 struct LegacyAssemblyStage {
     GLenum target = 0;
     GLuint shader = 0;
+    // Original bytes are retained solely for genuine lazy monolithic fallback.
+    // Program names and uniform caches belong to each real share group; even
+    // identical source in two guest stages gets two private program objects.
+    std::string original_source;
+    std::string sso_source;
+    std::unordered_map<uint64_t, std::unique_ptr<LegacyAssemblyPipeline>> sso_programs;
+    std::unordered_map<uint64_t, GLuint> mono_shaders;
+    ObbSha256::Digest source_digest{};
     std::string name;
     std::string diagnostic_source;
     std::vector<uint32_t> local_parameters;
@@ -884,6 +955,10 @@ struct LegacyAssemblyStage {
 
 struct LegacyAssemblyPipeline {
     GLuint program = 0;
+    GLuint sso_pipeline = 0;
+    GLuint vertex_program = 0;
+    GLuint fragment_program = 0;
+    uint64_t share_group = 0;
     bool samplers_initialized = false;
     // Uniform values belong to the linked GL program, rather than the current
     // context. The program mutex serializes stage changes and draw uploads.
@@ -899,16 +974,245 @@ struct LegacyAssemblyPipeline {
     LegacyUniformArray fragment_int;
     LegacyUniformArray vertex_bool;
     LegacyUniformArray fragment_bool;
+    // Stage names never change for a pipeline: re-specifying a stage erases
+    // its pipelines. Classified once instead of string compares per draw.
+    int8_t name_flags = -1;
+    // Hot SSO pairs are replaced by one linked program (bl2_program_upgrade):
+    // 0 eligible, 1 requested, 2 settled. The serial ties a worker result to
+    // this exact pipeline even if its stage names are later re-specified.
+    uint8_t upgrade = 0;
+    uint32_t sso_draws = 0;
+    uint64_t serial = 0;
+};
+
+enum : int8_t {
+    kPipelineGfxText = 1,
+    kPipelineGfxAny = 2,
+    kPipelinePostprocessBlend = 4,
+    kPipelineUberBlendFragment = 8,
 };
 
 static std::mutex s_legacy_program_mutex;
+static Bl2ShaderWarmup s_shader_warmup;
+struct ShaderShareGroup { EGLDisplay display; uint64_t group; };
+static std::unordered_map<EGLContext, ShaderShareGroup> s_shader_share_groups;
+static uint64_t s_next_shader_share_group = 1;
+static uint64_t s_shader_warmup_group = 0;
+static bool s_shader_warmup_attempted = false;
 static std::unordered_map<GLuint, LegacyAssemblyStage> s_legacy_stages;
 static std::unordered_map<uint64_t, LegacyAssemblyPipeline> s_legacy_pipelines;
+static Bl2ShaderStageCache s_shader_stage_cache;
+static bool s_shader_stage_preparation_attempted = false;
+// shortcut: Keep the captured common stages resident; extend the set after profiling new effects.
+static std::vector<LegacyAssemblyStage> s_hot_legacy_stages;
+static std::unordered_set<uint64_t> s_hot_legacy_groups;
+// Pipeline containers are context-local, whereas stage programs are shared.
+static std::unordered_map<EGLContext, std::unordered_map<uint64_t, LegacyAssemblyPipeline>> s_native_legacy_pipelines;
+struct RetiredLegacyObjects { std::vector<GLuint> programs, shaders; };
+static std::unordered_map<uint64_t, RetiredLegacyObjects> s_retired_legacy_objects;
+static std::unordered_map<EGLContext, std::vector<GLuint>> s_retired_legacy_pipelines;
+// Draw-path memo over the stage/pipeline maps above. Every path that erases a
+// stage, pipeline, stage program or share group bumps this generation, so a
+// cached node pointer is only used while its owning map still holds it.
+static uint64_t s_legacy_object_generation = 1;  // Guarded by s_legacy_program_mutex.
+static uint64_t s_next_legacy_pipeline_serial = 1;
+static void InvalidateLegacyDrawCacheLocked() { ++s_legacy_object_generation; }
+struct LegacyDrawCacheEntry {
+    uint64_t key = 0;
+    uint64_t generation = 0;
+    EGLContext context = EGL_NO_CONTEXT;
+    LegacyAssemblyPipeline* pipeline = nullptr;
+    const LegacyAssemblyStage* vertex = nullptr;
+    const LegacyAssemblyStage* fragment = nullptr;
+    LegacyAssemblyPipeline* vertex_state = nullptr;    // SSO stage programs.
+    LegacyAssemblyPipeline* fragment_state = nullptr;
+};
+// A frame binds 150+ distinct pairs: 512 direct-mapped slots keep conflict
+// misses rare (measured ~70 misses per frame with 64).
+static thread_local std::array<LegacyDrawCacheEntry, 512> s_legacy_draw_cache;
+static size_t LegacyDrawCacheSlot(uint64_t key, EGLContext context) {
+    const uint64_t mixed = (key ^ reinterpret_cast<uintptr_t>(context)) *
+                           0x9E3779B97F4A7C15ull;
+    return static_cast<size_t>(mixed >> 55);
+}
+
+static uint64_t CurrentShaderShareGroupLocked() {
+    const auto found = s_shader_share_groups.find(eglGetCurrentContext());
+    return found == s_shader_share_groups.end() ? 0 : found->second.group;
+}
+struct TextureFiltering { GLint original=0; std::uint32_t control=UINT32_MAX; };
+static thread_local std::unordered_map<EGLContext,std::unordered_map<GLuint,TextureFiltering>> textureFiltering;
+static GLint GraphicsMinFilter(GLint original) {
+    return static_cast<GLint>(bl2::graphics::MinificationFilter(
+        static_cast<std::uint32_t>(original),Bl2GraphicsFiltering()));
+}
+static void ApplyTextureFiltering(GLenum target,GLuint texture) {
+    if(target!=GL_TEXTURE_2D || !texture)return;
+    auto& current=textureFiltering[eglGetCurrentContext()][texture];
+    const auto control=Bl2GraphicsFiltering();if(current.control==control)return;
+    ForceAnisotropy(target);
+    if(current.original)glTexParameteri(target,GL_TEXTURE_MIN_FILTER,GraphicsMinFilter(current.original));
+    current.control=control;
+}
+static void RememberTextureMinFilter(GLenum target,GLint original) {
+    if(target!=GL_TEXTURE_2D)return;
+    GLint texture=0;glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);if(!texture)return;
+    auto& current=textureFiltering[eglGetCurrentContext()][static_cast<GLuint>(texture)];
+    current.original=original;current.control=UINT32_MAX;ApplyTextureFiltering(target,static_cast<GLuint>(texture));
+}
+
+static void DrainRetiredLegacyObjectsLocked() {
+    const auto context = eglGetCurrentContext();
+    const uint64_t group = CurrentShaderShareGroupLocked();
+    if (!group) return;
+    if (auto found = s_retired_legacy_pipelines.find(context); found != s_retired_legacy_pipelines.end()) {
+        glDeleteProgramPipelines(static_cast<GLsizei>(found->second.size()), found->second.data());
+        s_retired_legacy_pipelines.erase(found);
+    }
+    if (auto found = s_retired_legacy_objects.find(group); found != s_retired_legacy_objects.end()) {
+        for (const auto name : found->second.programs) glDeleteProgram(name);
+        for (const auto name : found->second.shaders) glDeleteShader(name);
+        s_retired_legacy_objects.erase(found);
+    }
+}
+
+static void RetireLegacyProgramLocked(uint64_t group, GLuint program) {
+    if (!program) return;
+    if (group == CurrentShaderShareGroupLocked()) glDeleteProgram(program);
+    else s_retired_legacy_objects[group].programs.push_back(program);
+}
+
+static void RetireLegacyShaderLocked(uint64_t group, GLuint shader) {
+    if (!shader) return;
+    if (group == CurrentShaderShareGroupLocked()) glDeleteShader(shader);
+    else s_retired_legacy_objects[group].shaders.push_back(shader);
+}
+
+static void RetireNativeContextProgramsLocked(EGLContext context) {
+    InvalidateLegacyDrawCacheLocked();
+    const auto found = s_native_legacy_pipelines.find(context);
+    if (found == s_native_legacy_pipelines.end()) return;
+    for (const auto& [key, pipeline] : found->second) {
+        RetireLegacyProgramLocked(pipeline.share_group, pipeline.program);
+    }
+    s_native_legacy_pipelines.erase(found);
+}
+
+static void AbandonDeadNativeShaderObjectsLocked() {
+    InvalidateLegacyDrawCacheLocked();
+    const auto alive = [](uint64_t group) {
+        return std::any_of(s_shader_share_groups.begin(), s_shader_share_groups.end(),
+            [group](const auto& entry) { return entry.second.group == group; });
+    };
+#if !defined(BL2_NATIVE_ARM32)
+    // The worker context alone must not keep a dead group's objects alive.
+    if (const uint64_t group = Bl2ProgramUpgradeGroup(); group && !alive(group))
+        Bl2ProgramUpgradeStop();
+#endif
+    for (auto& [name, stage] : s_legacy_stages) {
+        std::erase_if(stage.sso_programs, [&](const auto& entry) { return !alive(entry.first); });
+        std::erase_if(stage.mono_shaders, [&](const auto& entry) { return !alive(entry.first); });
+    }
+    for (auto& stage : s_hot_legacy_stages)
+        std::erase_if(stage.sso_programs, [&](const auto& entry) { return !alive(entry.first); });
+    std::erase_if(s_hot_legacy_groups, [&](uint64_t group) { return !alive(group); });
+    std::erase_if(s_retired_legacy_objects, [&](const auto& entry) { return !alive(entry.first); });
+    // GL destroys each context's pipeline namespace itself. Never delete a
+    // vanished context's numeric name in another context (an ABA collision).
+    std::erase_if(s_native_legacy_pipelines, [](const auto& entry) { return !s_shader_share_groups.contains(entry.first); });
+    std::erase_if(s_retired_legacy_pipelines, [](const auto& entry) { return !s_shader_share_groups.contains(entry.first); });
+}
+
+static void RefreshNativeProgramBinding() {
+    GLint program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    s_current_program = static_cast<GLuint>(program);
+    s_explicit_gl_program = program != 0;
+    if (!s_explicit_gl_program) return;
+    std::lock_guard lock(s_legacy_program_mutex);
+    const auto found = s_native_legacy_pipelines.find(eglGetCurrentContext());
+    if (found != s_native_legacy_pipelines.end()) {
+        for (const auto& [key, pipeline] : found->second) {
+            if (pipeline.program == s_current_program) { s_explicit_gl_program = false; break; }
+        }
+    }
+}
 static std::atomic<uint32_t> s_next_legacy_program_name{kFirstLegacyProgramName};
 static std::atomic<uint32_t> s_legacy_compile_logs{0};
 static std::atomic<uint32_t> s_legacy_link_logs{0};
 static thread_local GLuint s_bound_legacy_vertex = 0;
 static thread_local GLuint s_bound_legacy_fragment = 0;
+
+void Bl2ShaderWarmupContextCreated(EGLDisplay display, EGLContext context,
+                                  EGLContext share) {
+    if (context == EGL_NO_CONTEXT) return;
+    std::lock_guard lock(s_legacy_program_mutex);
+    const auto parent = s_shader_share_groups.find(share);
+    const uint64_t group = parent != s_shader_share_groups.end()
+        ? parent->second.group : s_next_shader_share_group++;
+    s_shader_share_groups[context] = {display, group};
+    InvalidateLegacyDrawCacheLocked();  // A recycled EGLContext address.
+}
+
+static void AbandonDeadShaderWarmupGroupLocked() {
+    const bool group_alive = std::any_of(s_shader_share_groups.begin(),
+        s_shader_share_groups.end(), [](const auto& entry) {
+            return entry.second.group == s_shader_warmup_group;
+        });
+    if (!group_alive) {
+        s_shader_warmup.Abandon();
+        s_shader_warmup_group = 0;
+        s_shader_warmup_attempted = false;
+    }
+}
+
+void Bl2ShaderWarmupContextDestroyed(EGLContext context) {
+    std::lock_guard lock(s_legacy_program_mutex);
+    RetireNativeContextProgramsLocked(context);
+    s_shader_share_groups.erase(context);
+    AbandonDeadNativeShaderObjectsLocked();
+    s_program_cache_valid = false;
+    s_current_sso_pipeline = 0;
+    AbandonDeadShaderWarmupGroupLocked();
+}
+
+void Bl2ShaderWarmupDisplayTerminated(EGLDisplay display) {
+    std::lock_guard lock(s_legacy_program_mutex);
+    std::erase_if(s_shader_share_groups, [display](const auto& entry) {
+        return entry.second.display == display;
+    });
+    AbandonDeadNativeShaderObjectsLocked();
+    s_program_cache_valid = false;
+    s_current_sso_pipeline = 0;
+    AbandonDeadShaderWarmupGroupLocked();
+}
+
+// Access under the existing program mutex; no GL names cross share groups.
+static bool EnsureBl2ShaderWarmupLocked() {
+    const auto current = s_shader_share_groups.find(eglGetCurrentContext());
+    if (current == s_shader_share_groups.end()) return false;
+    if (!s_shader_warmup_attempted) {
+        s_shader_warmup_attempted = true;
+        s_shader_warmup_group = current->second.group;
+        extern std::vector<uint8_t> LoadBl2ShaderWarmupTable();
+        const auto bytes = LoadBl2ShaderWarmupTable();
+#if defined(BL2_NATIVE_ARM32)
+        extern const std::string& NativeSavedFilesRoot();
+        const std::string& cache_directory = NativeSavedFilesRoot();
+#else
+        extern std::string g_bl2_shader_cache_dir;
+        const std::string& cache_directory = g_bl2_shader_cache_dir;
+#endif
+        const auto start = std::chrono::steady_clock::now();
+        const bool warmed = s_shader_warmup.Warm(bytes, cache_directory);
+        __android_log_print(ANDROID_LOG_INFO, "BL2ShaderCache",
+            "warmup bytes=%zu ready=%d binary_hits=%zu elapsed_ms=%.3f",
+            bytes.size(), warmed, s_shader_warmup.BinaryHitCount(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        LOGI("BL2 shader warmup bytes=%zu ready=%d", bytes.size(), warmed);
+    }
+    return current->second.group == s_shader_warmup_group;
+}
 
 static bool ModelAuditEnabled() {
     static const bool enabled = [] {
@@ -930,6 +1234,11 @@ static std::atomic<uint32_t> s_next_legacy_texture_handle{1};
 static std::unordered_map<uint64_t, LegacyTextureHandle>
     s_legacy_texture_handles;
 static std::unordered_map<uint64_t, uint64_t> s_legacy_texture_handle_by_pair;
+// Handles carry a serial number; this vector indexed by serial replaces the
+// per-sampler hash lookup on every draw. The maps above remain the owners.
+struct LegacyTextureSlot { GLuint texture = 0, sampler = 0; bool valid = false; };
+static std::vector<LegacyTextureSlot> s_legacy_texture_slots;
+constexpr uint32_t kMaxLegacyTextureSlots = 1u << 22;
 
 struct SceneTextureFingerprint {
     std::array<char, 65> sha256{};
@@ -969,6 +1278,19 @@ static void RecordSceneTextureUpload(GLenum target, GLint level,
     fingerprint.format = format;
     std::lock_guard<std::mutex> lock(s_scene_texture_fingerprints_mutex);
     s_scene_texture_fingerprints[static_cast<GLuint>(texture)] = fingerprint;
+}
+
+// Constant setters run several times per draw on the two bound stages.
+static LegacyAssemblyStage* FindLegacyStageLocked(GLuint name) {
+    struct Entry { GLuint name = 0; uint64_t generation = 0; LegacyAssemblyStage* stage = nullptr; };
+    static thread_local std::array<Entry, 32> cache;
+    Entry& entry = cache[(name * 0x9E3779B1u) >> 27];
+    if (entry.stage && entry.name == name && entry.generation == s_legacy_object_generation)
+        return entry.stage;
+    const auto found = s_legacy_stages.find(name);
+    if (found == s_legacy_stages.end()) return nullptr;
+    entry = {name, s_legacy_object_generation, &found->second};
+    return entry.stage;
 }
 
 static uint64_t LegacyPipelineKey(GLuint vertex, GLuint fragment) {
@@ -1045,7 +1367,30 @@ static uint64_t GetOrCreateLegacyTextureHandleLocked(GLuint texture,
     s_legacy_texture_handles.emplace(
         handle, LegacyTextureHandle{texture, sampler, false});
     s_legacy_texture_handle_by_pair.emplace(pair, handle);
+    if (serial < kMaxLegacyTextureSlots) {
+        try {
+            if (s_legacy_texture_slots.size() <= serial)
+                s_legacy_texture_slots.resize(static_cast<size_t>(serial) + 1);
+            s_legacy_texture_slots[serial] = {texture, sampler, true};
+        } catch (...) {}  // The map lookup still resolves this handle.
+    }
     return handle;
+}
+
+static bool ResolveLegacyTextureHandleLocked(uint64_t handle, GLuint& texture,
+                                             GLuint& sampler) {
+    const uint32_t serial = static_cast<uint32_t>(handle);
+    if ((handle & ~0xFFFFFFFFull) == kLegacyTextureHandleMagic &&
+        serial < s_legacy_texture_slots.size() && s_legacy_texture_slots[serial].valid) {
+        texture = s_legacy_texture_slots[serial].texture;
+        sampler = s_legacy_texture_slots[serial].sampler;
+        return true;
+    }
+    const auto found = s_legacy_texture_handles.find(handle);
+    if (found == s_legacy_texture_handles.end()) return false;
+    texture = found->second.texture;
+    sampler = found->second.sampler;
+    return true;
 }
 
 static uint64_t GuestU64(const Dynarmic::A32::Jit& jit, size_t first_reg = 0) {
@@ -1211,6 +1556,59 @@ static std::string ProgramInfoLog(GLuint program) {
     return log;
 }
 
+static void CaptureLegacyShaderPair(GLuint vertex, GLuint fragment
+    , std::string_view vertex_source = {}, std::string_view fragment_source = {}
+) {
+#if HORN_ENABLE_PERF_PROBE || (defined(BL2_NATIVE_ARM32) && HORN_ENABLE_LOGGING)
+    char enabled[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.bl2.capture_shaders", enabled) <= 0 ||
+        std::strcmp(enabled, "1") != 0) return;
+#if defined(BL2_NATIVE_ARM32)
+    extern const std::string& NativeSavedFilesRoot();
+    const std::string& capture_root = NativeSavedFilesRoot();
+#else
+    extern std::string g_saved_files_dir;
+    const std::string& capture_root = g_saved_files_dir;
+#endif
+    std::array<std::string, 2> sources;
+    const std::array<GLuint, 2> shaders{vertex, fragment};
+    for (size_t i = 0; i < shaders.size(); ++i) {
+        const auto original = i == 0 ? vertex_source : fragment_source;
+        if (!original.empty()) {
+            if (original.size() > 131072) return;
+            sources[i] = original;
+            continue;
+        }
+        GLint length = 0;
+        glGetShaderiv(shaders[i], GL_SHADER_SOURCE_LENGTH, &length);
+        if (length < 2 || length > 131072) return;
+        sources[i].resize(static_cast<size_t>(length));
+        GLsizei written = 0;
+        glGetShaderSource(shaders[i], length, &written, sources[i].data());
+        if (written <= 0) return;
+        sources[i].resize(static_cast<size_t>(written));
+    }
+    if (capture_root.empty()) return;
+    const std::string path = capture_root + "/bl2-shader-pairs.bin";
+    FILE* file = std::fopen(path.c_str(), "ab");
+    if (!file) return;
+    const long current = std::fseek(file, 0, SEEK_END) == 0 ? std::ftell(file) : -1;
+    const std::array<uint32_t, 2> lengths{
+        static_cast<uint32_t>(sources[0].size()),
+        static_cast<uint32_t>(sources[1].size())};
+    const size_t bytes = sizeof(lengths) + sources[0].size() + sources[1].size();
+    if (current >= 0 && static_cast<size_t>(current) + bytes <= 8 * 1024 * 1024) {
+        if (std::fwrite(lengths.data(), sizeof(lengths), 1, file) == 1 &&
+            std::fwrite(sources[0].data(), 1, sources[0].size(), file) == sources[0].size() &&
+            std::fwrite(sources[1].data(), 1, sources[1].size(), file) == sources[1].size()) {
+            LOGI("Shader warmup capture pair bytes=%zu total=%zu", bytes,
+                 static_cast<size_t>(current) + bytes);
+        }
+    }
+    std::fclose(file);
+#endif
+}
+
 static LegacyUniformArray FindLegacyUniformArray(GLuint program,
                                                   const char* wanted) {
     LegacyUniformArray result;
@@ -1241,16 +1639,41 @@ static LegacyUniformArray FindLegacyUniformArray(GLuint program,
     return result;
 }
 
-static void ConfigureLegacySamplers(GLuint program) {
+// The original shaders reach vertex and pixel samplers through separate
+// bindless handles. Horn binds both to texture units, so vertex samplers get
+// their own range: VelocityShader's skinning texture (VSampler0) and a masked
+// material's PSampler0 must never share unit 0 in one pair.
+static GLint LegacyVertexSamplerUnitBase() {
+    static std::atomic<GLint> base{-1};
+    GLint value = base.load(std::memory_order_relaxed);
+    if (value < 0) {
+        GLint combined = 0;
+        glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &combined);
+        value = combined >= 32 ? 16 : 0;
+        base.store(value, std::memory_order_relaxed);
+    }
+    return value;
+}
+
+static void ConfigureLegacySamplers(GLuint program
+    , bool separable = false
+) {
     GLint max_units = 0;
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &max_units);
     const GLint limit = std::clamp(max_units, 0, 32);
+    const GLint vertex_base = LegacyVertexSamplerUnitBase();
     for (GLint unit = 0; unit < limit; ++unit) {
         for (const char prefix : {'V', 'P'}) {
             const std::string name = std::string(1, prefix) +
                                      "Sampler" + std::to_string(unit);
             const GLint location = glGetUniformLocation(program, name.c_str());
-            if (location >= 0) glUniform1i(location, unit);
+            if (location >= 0) {
+                const GLint bound = prefix == 'V' ? vertex_base + unit : unit;
+                if (bound >= limit) continue;
+                if (separable) glProgramUniform1i(program, location, bound);
+                else
+                    glUniform1i(location, bound);
+            }
         }
     }
 }
@@ -1261,7 +1684,9 @@ static void UploadLegacyConstantGroup(LegacyAssemblyPipeline& pipeline,
                                      const LegacyAssemblyStage& stage,
                                      const LegacyUniformArray& uniforms,
                                      size_t group_index,
-                                     LegacyConstantType type) {
+                                     LegacyConstantType type
+                                     , bool separable = false
+) {
     const auto& group = stage.constant_groups[group_index];
     if (uniforms.location < 0 || uniforms.size <= 0 || group.first_register < 0 ||
         group.byte_count == 0) return;
@@ -1290,8 +1715,11 @@ static void UploadLegacyConstantGroup(LegacyAssemblyPipeline& pipeline,
         for (GLsizei index = 0; index < count; ++index) {
             previous[index] = static_cast<uint32_t>(data[index * width] != 0);
         }
-        glUniform1iv(uniforms.location, count,
-                     reinterpret_cast<const GLint*>(previous.data()));
+        if (separable) glProgramUniform1iv(pipeline.program, uniforms.location, count,
+                                          reinterpret_cast<const GLint*>(previous.data()));
+        else
+            glUniform1iv(uniforms.location, count,
+                         reinterpret_cast<const GLint*>(previous.data()));
         pipeline.uploaded_counts[group_index] = count;
         return;
     }
@@ -1304,10 +1732,14 @@ static void UploadLegacyConstantGroup(LegacyAssemblyPipeline& pipeline,
     }
     switch (type) {
         case LegacyConstantType::Float4:
-            glUniform4fv(uniforms.location, count, reinterpret_cast<const GLfloat*>(data));
+            if (separable) glProgramUniform4fv(pipeline.program, uniforms.location, count, reinterpret_cast<const GLfloat*>(data));
+            else
+                glUniform4fv(uniforms.location, count, reinterpret_cast<const GLfloat*>(data));
             break;
         case LegacyConstantType::Int4:
-            glUniform4iv(uniforms.location, count, reinterpret_cast<const GLint*>(data));
+            if (separable) glProgramUniform4iv(pipeline.program, uniforms.location, count, reinterpret_cast<const GLint*>(data));
+            else
+                glUniform4iv(uniforms.location, count, reinterpret_cast<const GLint*>(data));
             break;
         case LegacyConstantType::Bool:
             // Scalar booleans were gathered and uploaded above.
@@ -1315,6 +1747,222 @@ static void UploadLegacyConstantGroup(LegacyAssemblyPipeline& pipeline,
     }
     previous.assign(data, data + uploaded_words);
     pipeline.uploaded_counts[group_index] = count;
+}
+
+static void DiscardPrivateLegacyErrors() {
+    // Private cache-import/validation errors can fall back without exposing a
+    // failed private GL name to the game. Preserve the prior guest error first.
+    for (unsigned i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {}
+}
+
+static void PopulateLegacyUniformArrays(LegacyAssemblyPipeline& state,
+                                        GLuint vertex, GLuint fragment) {
+    state.vertex_global = FindLegacyUniformArray(vertex, "VConstGlobal");
+    state.vertex_float = FindLegacyUniformArray(vertex, "VConstFloat");
+    state.vertex_bones = FindLegacyUniformArray(vertex, "VConstBones");
+    state.vertex_int = FindLegacyUniformArray(vertex, "VConstInt");
+    state.vertex_bool = FindLegacyUniformArray(vertex, "VConstBool");
+    state.fragment_global = FindLegacyUniformArray(fragment, "PConstGlobal");
+    state.fragment_float = FindLegacyUniformArray(fragment, "PConstFloat");
+    state.fragment_int = FindLegacyUniformArray(fragment, "PConstInt");
+    state.fragment_bool = FindLegacyUniformArray(fragment, "PConstBool");
+}
+
+static std::unique_ptr<LegacyAssemblyPipeline> LoadNativeSsoStateLocked(
+        const LegacyAssemblyStage& stage, uint64_t group) {
+    auto state = std::make_unique<LegacyAssemblyPipeline>();
+    state->program = s_shader_stage_cache.LoadProgram(
+        LegacyShaderType(stage.target), stage.original_source, stage.sso_source);
+    if (state->program) {
+        state->share_group = group;
+        try {
+            PopulateLegacyUniformArrays(*state, state->program, state->program);
+            ConfigureLegacySamplers(state->program, true);
+            state->samplers_initialized = true;
+        } catch (...) {
+            glDeleteProgram(state->program);
+            state.reset();
+        }
+    } else state.reset();
+    DiscardPrivateLegacyErrors();
+    return state;
+}
+
+static void EnsureHotLegacyStagesLocked(uint64_t group) {
+    if (!s_hot_legacy_groups.insert(group).second) return;
+    if (s_hot_legacy_stages.empty()) {
+        extern std::vector<uint8_t> LoadBl2ShaderWarmupTable();
+        const auto bytes = LoadBl2ShaderWarmupTable();
+        std::vector<std::pair<std::string_view, std::string_view>> pairs;
+        if (!Bl2ShaderWarmup::ParsePairs(bytes, pairs)) return;
+        std::vector<LegacyAssemblyStage> stages;
+        for (const auto& pair : pairs) {
+            const std::array<std::pair<GLenum, std::string_view>, 2> sources{{
+                {kVertexProgramArb, pair.first}, {kFragmentProgramArb, pair.second}}};
+            for (const auto& [target, source] : sources) {
+                if (std::any_of(stages.begin(), stages.end(), [&](const auto& stage) {
+                        return stage.target == target && stage.original_source == source;
+                    })) continue;
+                if (stages.size() >= 128) return;
+                LegacyAssemblyStage stage;
+                stage.target = target;
+                stage.original_source = source;
+                stage.source_digest = Bl2ShaderWarmup::Hash(source);
+                if (!legacy_glsl::CompleteSsoInterface(source, target == kVertexProgramArb,
+                                                       &stage.sso_source)) return;
+                stages.push_back(std::move(stage));
+            }
+        }
+        s_hot_legacy_stages.swap(stages);
+    }
+    size_t ready = 0;
+    for (auto& stage : s_hot_legacy_stages) {
+        auto state = LoadNativeSsoStateLocked(stage, group);
+        if (!state) continue;
+        const GLuint program = state->program;
+        try {
+            stage.sso_programs.emplace(group, std::move(state));
+            ++ready;
+        } catch (...) {
+            glDeleteProgram(program);
+            break;
+        }
+    }
+    LOGI("Hot SSO stages group=%llu ready=%zu total=%zu",
+         static_cast<unsigned long long>(group), ready, s_hot_legacy_stages.size());
+}
+
+static std::unique_ptr<LegacyAssemblyPipeline> TakeHotLegacyStageLocked(
+        LegacyAssemblyStage& requested, uint64_t group) {
+    for (auto& stage : s_hot_legacy_stages) {
+        if (stage.target != requested.target || stage.source_digest != requested.source_digest ||
+            stage.original_source != requested.original_source ||
+            (!requested.sso_source.empty() && stage.sso_source != requested.sso_source)) continue;
+        const auto found = stage.sso_programs.find(group);
+        if (found == stage.sso_programs.end()) return nullptr;
+        if (requested.sso_source.empty()) requested.sso_source = stage.sso_source;
+        auto state = std::move(found->second);
+        stage.sso_programs.erase(found);
+        return state;
+    }
+    return nullptr;
+}
+
+static LegacyAssemblyPipeline* NativeSsoStageProgramLocked(LegacyAssemblyStage& stage,
+                                                          uint64_t group) {
+    if (!group || stage.original_source.empty()) return nullptr;
+    if (const auto found = stage.sso_programs.find(group); found != stage.sso_programs.end())
+        return found->second.get();
+    PreserveSceneAuditGlError(glGetError());
+    if (!s_shader_stage_preparation_attempted) {
+        s_shader_stage_preparation_attempted = true;
+        extern bool PrepareBl2ShaderStageCache(Bl2ShaderStageCache&);
+        const bool prepared = PrepareBl2ShaderStageCache(s_shader_stage_cache);
+        const auto& stats = s_shader_stage_cache.Stats();
+        __android_log_print(ANDROID_LOG_INFO, "BL2ShaderCache",
+            "all-stage preparation ready=%d stages=%u compiled=%u binary_hits=%u marker=%d failed=%u binary_bytes=%llu",
+            prepared, stats.stageCount, stats.compiled, stats.binaryHits,
+            stats.preparedFromMarker, stats.failed, static_cast<unsigned long long>(stats.binaryBytes));
+        DiscardPrivateLegacyErrors();
+    }
+    std::unique_ptr<LegacyAssemblyPipeline> state;
+    try { EnsureHotLegacyStagesLocked(group); }
+    catch (...) { DiscardPrivateLegacyErrors(); }
+    state = TakeHotLegacyStageLocked(stage, group);
+    LOGI("Hot SSO registration hit=%d group=%llu target=0x%04X source=%s",
+         state != nullptr, static_cast<unsigned long long>(group), stage.target,
+         ObbSha256::Hex(stage.source_digest).data());
+    if (stage.sso_source.empty())
+        legacy_glsl::CompleteSsoInterface(stage.original_source, stage.target == kVertexProgramArb,
+                                         &stage.sso_source);
+    if (stage.sso_source.empty()) return nullptr;
+    if (!state) state = LoadNativeSsoStateLocked(stage, group);
+    const auto [found, inserted] = stage.sso_programs.emplace(group, std::move(state));
+    return found->second.get();
+}
+
+static GLuint NativeMonolithicShaderLocked(LegacyAssemblyStage& stage, uint64_t group) {
+    if (stage.original_source.empty()) return stage.shader; // Existing GPU check.
+    if (!group) return 0;
+    if (const auto found = stage.mono_shaders.find(group); found != stage.mono_shaders.end()) return found->second;
+    const GLuint shader = glCreateShader(LegacyShaderType(stage.target));
+    GLint compiled = GL_FALSE;
+    if (shader) {
+        const char* source = stage.original_source.data();
+        const GLint bytes = static_cast<GLint>(stage.original_source.size());
+        glShaderSource(shader, 1, &source, &bytes);
+        HornPerfScope compile_scope(HornPerfCategory::ShaderCompile);
+        glCompileShader(shader);
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    }
+    if (compiled != GL_TRUE) {
+        LOGE("Legacy monolithic fallback compile failed shader=%s: %s",
+             stage.name.c_str(), (shader ? ShaderInfoLog(shader) : std::string{}).c_str());
+        if (shader) glDeleteShader(shader);
+        stage.mono_shaders.emplace(group, 0);
+        return 0;
+    }
+    stage.mono_shaders.emplace(group, shader);
+    return shader;
+}
+
+static void RetireNativeStageObjectsLocked(LegacyAssemblyStage& stage) {
+    InvalidateLegacyDrawCacheLocked();
+    for (const auto& [group, state] : stage.sso_programs)
+        if (state) RetireLegacyProgramLocked(group, state->program);
+    for (const auto& [group, shader] : stage.mono_shaders) RetireLegacyShaderLocked(group, shader);
+    stage.sso_programs.clear();stage.mono_shaders.clear();
+    if (stage.original_source.empty() && stage.shader) glDeleteShader(stage.shader);
+    stage.shader = 0;
+}
+
+static void UploadNativeSsoStageLocked(LegacyAssemblyPipeline& state,
+                                       const LegacyAssemblyStage& stage,
+                                       EGLContext context) {
+    if (state.uniforms_context != context) {
+        state.uniforms_context = context;
+        state.uploaded_counts.fill(0);
+    }
+    if (stage.target == kVertexProgramArb) {
+        UploadLegacyConstantGroup(state, stage, state.vertex_global, 0, LegacyConstantType::Float4, true);
+        UploadLegacyConstantGroup(state, stage, state.vertex_float, 1, LegacyConstantType::Float4, true);
+        UploadLegacyConstantGroup(state, stage, state.vertex_bones, 2, LegacyConstantType::Float4, true);
+        UploadLegacyConstantGroup(state, stage, state.vertex_int, 3, LegacyConstantType::Int4, true);
+        UploadLegacyConstantGroup(state, stage, state.vertex_bool, 4, LegacyConstantType::Bool, true);
+    } else {
+        UploadLegacyConstantGroup(state, stage, state.fragment_global, 5, LegacyConstantType::Float4, true);
+        UploadLegacyConstantGroup(state, stage, state.fragment_float, 6, LegacyConstantType::Float4, true);
+        UploadLegacyConstantGroup(state, stage, state.fragment_int, 7, LegacyConstantType::Int4, true);
+        UploadLegacyConstantGroup(state, stage, state.fragment_bool, 8, LegacyConstantType::Bool, true);
+    }
+}
+
+static GLuint LegacyStageUniformProgram(const LegacyAssemblyPipeline& pipeline, bool vertex) {
+    return pipeline.sso_pipeline ? vertex ? pipeline.vertex_program : pipeline.fragment_program : pipeline.program;
+}
+
+static GLuint CurrentLegacyUniformProgram(std::string_view name) {
+    if (s_current_sso_pipeline) {
+        if (name.starts_with('V')) return s_current_sso_vertex_program;
+        if (name.starts_with('P')) return s_current_sso_fragment_program;
+    }
+    return s_current_program;
+}
+
+static void SelectExplicitGlProgram(GLuint program) {
+    // A rejected ordinary program must leave the prior SSO selection intact.
+    // Read actual binding rather than consuming an older guest GL error.
+    glUseProgram(program);
+    GLint actual = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &actual);
+    if (static_cast<GLuint>(actual) != program) return;
+    s_explicit_gl_program = program != 0;
+    glBindProgramPipeline(0);
+    s_current_sso_pipeline = 0;
+    s_current_sso_vertex_program = 0;
+    s_current_sso_fragment_program = 0;
+    s_current_program = program;
+    s_program_cache_valid = false;
 }
 
 static void BindLegacyStageTexturesLocked(const LegacyAssemblyStage& stage) {
@@ -1327,33 +1975,37 @@ static void BindLegacyStageTexturesLocked(const LegacyAssemblyStage& stage) {
     }
     GLint previous_active = GL_TEXTURE0;
     bool changed_active = false;
-    for (size_t unit = 0; unit < stage.sampler_registers.size(); ++unit) {
-        const int register_index = stage.sampler_registers[unit];
-        const GLenum texture_target = stage.sampler_targets[unit];
-        if (register_index < 0 || !texture_target) continue;
+    const size_t unit_base = stage.target == kVertexProgramArb
+        ? static_cast<size_t>(LegacyVertexSamplerUnitBase()) : 0;
+    for (size_t stage_unit = 0; stage_unit < stage.sampler_registers.size(); ++stage_unit) {
+        const int register_index = stage.sampler_registers[stage_unit];
+        const GLenum texture_target = stage.sampler_targets[stage_unit];
+        const size_t unit = unit_base + stage_unit;
+        if (register_index < 0 || !texture_target ||
+            unit >= s_legacy_unit_bindings.size()) continue;
         const size_t word = static_cast<size_t>(register_index) * 4;
         if (word + 1 >= stage.local_parameters.size()) continue;
         const uint64_t handle =
             static_cast<uint64_t>(stage.local_parameters[word]) |
             (static_cast<uint64_t>(stage.local_parameters[word + 1]) << 32);
-        const auto resolved = s_legacy_texture_handles.find(handle);
-        if (resolved == s_legacy_texture_handles.end()) continue;
+        GLuint texture = 0, sampler = 0;
+        if (!ResolveLegacyTextureHandleLocked(handle, texture, sampler)) continue;
         if (!track_bindings) {
             if (!changed_active) {
                 glGetIntegerv(GL_ACTIVE_TEXTURE, &previous_active);
                 changed_active = true;
             }
             glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
-            glBindTexture(texture_target, resolved->second.texture);
-            glBindSampler(static_cast<GLuint>(unit), resolved->second.sampler);
+            glBindTexture(texture_target, texture);
+            glBindSampler(static_cast<GLuint>(unit), sampler);
             continue;
         }
         auto& bound = s_legacy_unit_bindings[unit];
         const bool same_texture = bound.texture_valid &&
             bound.target == texture_target &&
-            bound.texture == resolved->second.texture;
+            bound.texture == texture;
         const bool same_sampler = bound.sampler_valid &&
-            bound.sampler == resolved->second.sampler;
+            bound.sampler == sampler;
         const bool skip_texture = cache_enabled && same_texture;
         const bool skip_sampler = cache_enabled && same_sampler;
         if (audit_enabled) {
@@ -1364,28 +2016,158 @@ static void BindLegacyStageTexturesLocked(const LegacyAssemblyStage& stage) {
             if (skip_texture) s_gl_texture_skipped.fetch_add(1, std::memory_order_relaxed);
             if (skip_sampler) s_gl_sampler_skipped.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!skip_texture || !skip_sampler) {
+        if (!skip_texture) {
             if (!changed_active) {
                 glGetIntegerv(GL_ACTIVE_TEXTURE, &previous_active);
                 changed_active = true;
             }
             glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
-            if (!skip_texture) glBindTexture(texture_target, resolved->second.texture);
-            if (!skip_sampler) glBindSampler(static_cast<GLuint>(unit), resolved->second.sampler);
+            glBindTexture(texture_target, texture);
         }
+        // Sampler binding names its unit and does not use active texture.
+        if (!skip_sampler) glBindSampler(static_cast<GLuint>(unit), sampler);
         bound.target = texture_target;
-        bound.texture = resolved->second.texture;
-        bound.sampler = resolved->second.sampler;
+        bound.texture = texture;
+        bound.sampler = sampler;
         bound.texture_valid = true;
         bound.sampler_valid = true;
     }
     if (changed_active) glActiveTexture(static_cast<GLenum>(previous_active));
 }
 
+bool NativeLegacySamplerSelfCheck() {
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) return false;
+    std::lock_guard lock(s_legacy_program_mutex);
+    GLint previous_active = GL_TEXTURE0;
+    std::array<GLint, 2> previous_textures{}, previous_samplers{};
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previous_active);
+    for (size_t i = 0; i < previous_textures.size(); ++i) {
+        glActiveTexture(i == 0 ? GL_TEXTURE0 : GL_TEXTURE3);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_textures[i]);
+        glGetIntegerv(GL_SAMPLER_BINDING, &previous_samplers[i]);
+    }
+    std::array<GLuint, 2> textures{}, samplers{};
+    glGenTextures(textures.size(), textures.data());
+    glGenSamplers(samplers.size(), samplers.data());
+    glSamplerParameteri(samplers[0], GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glSamplerParameteri(samplers[1], GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, textures[1]);
+    glBindSampler(3, samplers[0]);
+    bool good = glGetError() == GL_NO_ERROR && textures[0] && textures[1] &&
+        samplers[0] && samplers[1];
+
+    const size_t previous_handles = s_legacy_texture_handles.size();
+    const size_t previous_pairs = s_legacy_texture_handle_by_pair.size();
+    const std::array<std::pair<GLuint, GLuint>, 4> pairs{{
+        {textures[0], samplers[0]}, {textures[0], samplers[1]},
+        {textures[1], samplers[1]}, {textures[1], samplers[0]}}};
+    std::array<uint64_t, 4> handles{};
+    std::array<bool, 4> created{};
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        const uint64_t pair = (static_cast<uint64_t>(pairs[i].first) << 32) |
+            pairs[i].second;
+        created[i] = !s_legacy_texture_handle_by_pair.contains(pair);
+        handles[i] = GetOrCreateLegacyTextureHandleLocked(pairs[i].first,
+                                                          pairs[i].second);
+    }
+    LegacyAssemblyStage stage;
+    stage.sampler_registers[0] = 0;
+    stage.sampler_targets[0] = GL_TEXTURE_2D;
+    stage.local_parameters.resize(4);
+    const auto set_handle = [&](uint64_t handle) {
+        stage.local_parameters[0] = static_cast<uint32_t>(handle);
+        stage.local_parameters[1] = static_cast<uint32_t>(handle >> 32);
+    };
+    const auto check = [&](GLuint texture, GLuint sampler,
+                           GLenum expected_error = GL_NO_ERROR) {
+        GLint active = 0, actual_texture = 0, actual_sampler = 0;
+        GLint sentinel_texture = 0, sentinel_sampler = 0, min_filter = 0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &actual_texture);
+        glGetIntegerv(GL_SAMPLER_BINDING, &actual_sampler);
+        glGetSamplerParameteriv(sampler, GL_TEXTURE_MIN_FILTER, &min_filter);
+        glActiveTexture(GL_TEXTURE3);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &sentinel_texture);
+        glGetIntegerv(GL_SAMPLER_BINDING, &sentinel_sampler);
+        good = glGetError() == expected_error && active == GL_TEXTURE3 &&
+            static_cast<GLuint>(actual_texture) == texture &&
+            static_cast<GLuint>(actual_sampler) == sampler &&
+            static_cast<GLuint>(sentinel_texture) == textures[1] &&
+            static_cast<GLuint>(sentinel_sampler) == samplers[0] &&
+            min_filter == (sampler == samplers[0] ? GL_NEAREST : GL_LINEAR) && good;
+    };
+    set_handle(handles[0]);
+    InvalidateLegacyTextureCache();
+    BindLegacyStageTexturesLocked(stage);
+    check(textures[0], samplers[0]);
+    if ((GlStateCacheMode() & 2) != 0) {
+        const auto& bound = s_legacy_unit_bindings[0];
+        good = bound.texture_valid && bound.target == GL_TEXTURE_2D &&
+            bound.texture == textures[0] && bound.sampler_valid &&
+            bound.sampler == samplers[0] && good;
+    }
+    BindLegacyStageTexturesLocked(stage); // Unchanged bindings.
+    check(textures[0], samplers[0]);
+    set_handle(handles[1]); // Same texture, different sampler.
+    BindLegacyStageTexturesLocked(stage);
+    check(textures[0], samplers[1]);
+    set_handle(handles[2]); // Different texture, same sampler.
+    BindLegacyStageTexturesLocked(stage);
+    check(textures[1], samplers[1]);
+    set_handle(0); // No registered handle.
+    BindLegacyStageTexturesLocked(stage);
+    check(textures[1], samplers[1]);
+    stage.local_parameters.resize(1); // Incomplete handle must be skipped.
+    BindLegacyStageTexturesLocked(stage);
+    check(textures[1], samplers[1]);
+    stage.local_parameters.resize(4);
+    set_handle(handles[3]);
+    glEnable(0xffffffffu);
+    BindLegacyStageTexturesLocked(stage);
+    check(textures[1], samplers[0], GL_INVALID_ENUM);
+
+    for (size_t i = 0; i < previous_textures.size(); ++i) {
+        glActiveTexture(i == 0 ? GL_TEXTURE0 : GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_textures[i]));
+        glBindSampler(i == 0 ? 0 : 3, static_cast<GLuint>(previous_samplers[i]));
+    }
+    glActiveTexture(static_cast<GLenum>(previous_active));
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        if (!created[i]) continue;
+        s_legacy_texture_handles.erase(handles[i]);
+        if (static_cast<uint32_t>(handles[i]) < s_legacy_texture_slots.size())
+            s_legacy_texture_slots[static_cast<uint32_t>(handles[i])].valid = false;
+        s_legacy_texture_handle_by_pair.erase(
+            (static_cast<uint64_t>(pairs[i].first) << 32) | pairs[i].second);
+    }
+    glDeleteSamplers(samplers.size(), samplers.data());
+    glDeleteTextures(textures.size(), textures.data());
+    InvalidateLegacyTextureCache();
+    good = glGetError() == GL_NO_ERROR &&
+        s_legacy_texture_handles.size() == previous_handles &&
+        s_legacy_texture_handle_by_pair.size() == previous_pairs && good;
+    LOGI("Native legacy sampler selfcheck mode=%d result=%s",
+         GlStateCacheMode(), good ? "PASS" : "FAIL");
+    return good;
+}
+
 static void UploadLegacyPipelineStateLocked(
     LegacyAssemblyPipeline& pipeline,
     const LegacyAssemblyStage& vertex,
-    const LegacyAssemblyStage& fragment) {
+    const LegacyAssemblyStage& fragment,
+    EGLContext context,
+    LegacyAssemblyPipeline* vertex_state = nullptr,
+    LegacyAssemblyPipeline* fragment_state = nullptr) {
+    if (pipeline.sso_pipeline) {
+        UploadNativeSsoStageLocked(vertex_state ? *vertex_state
+            : *vertex.sso_programs.at(pipeline.share_group), vertex, context);
+        UploadNativeSsoStageLocked(fragment_state ? *fragment_state
+            : *fragment.sso_programs.at(pipeline.share_group), fragment, context);
+        BindLegacyStageTexturesLocked(vertex);
+        BindLegacyStageTexturesLocked(fragment);
+        return;
+    }
     // The 9 metadata pairs map logical UE3 constant banks to *packed* NV
     // local registers. SetProgramLocals/sub_1E331A0 subtracts each logical
     // bank's offset then adds this per-shader register base. Raw D3D c249/c217
@@ -1411,6 +2193,20 @@ static void UploadLegacyPipelineStateLocked(
 }
 
 static void EraseLegacyPipelinesForStageLocked(GLuint stage_name) {
+    InvalidateLegacyDrawCacheLocked();
+    for (auto& [context, pipelines] : s_native_legacy_pipelines) {
+        for (auto it = pipelines.begin(); it != pipelines.end();) {
+            if (static_cast<GLuint>(it->first >> 32) == stage_name || static_cast<GLuint>(it->first) == stage_name) {
+                if (it->second.sso_pipeline) {
+                    if (context == eglGetCurrentContext()) glDeleteProgramPipelines(1, &it->second.sso_pipeline);
+                    else s_retired_legacy_pipelines[context].push_back(it->second.sso_pipeline);
+                }
+                RetireLegacyProgramLocked(it->second.share_group, it->second.program);
+                it = pipelines.erase(it);
+            } else ++it;
+        }
+    }
+    s_program_cache_valid = false;
     for (auto it = s_legacy_pipelines.begin(); it != s_legacy_pipelines.end();) {
         const GLuint vertex = static_cast<GLuint>(it->first >> 32);
         const GLuint fragment = static_cast<GLuint>(it->first);
@@ -1423,28 +2219,87 @@ static void EraseLegacyPipelinesForStageLocked(GLuint stage_name) {
     }
 }
 
-static LegacyAssemblyPipeline* GetLegacyPipelineLocked(GLuint vertex_name,
-                                                        GLuint fragment_name) {
+static LegacyAssemblyPipeline* GetLegacyPipelineLocked(
+    GLuint vertex_name, GLuint fragment_name,
+    const LegacyAssemblyStage*& vertex_stage,
+    const LegacyAssemblyStage*& fragment_stage) {
     auto vertex = s_legacy_stages.find(vertex_name);
     auto fragment = s_legacy_stages.find(fragment_name);
     if (vertex == s_legacy_stages.end() || fragment == s_legacy_stages.end() ||
         vertex->second.target != kVertexProgramArb ||
-        fragment->second.target != kFragmentProgramArb ||
-        !vertex->second.shader || !fragment->second.shader) {
+        fragment->second.target != kFragmentProgramArb
+    ) {
         return nullptr;
     }
 
+    vertex_stage = &vertex->second;
+    fragment_stage = &fragment->second;
+
     const uint64_t key = LegacyPipelineKey(vertex_name, fragment_name);
-    auto existing = s_legacy_pipelines.find(key);
-    if (existing != s_legacy_pipelines.end()) return &existing->second;
+    auto* pipelines = &s_legacy_pipelines;
+    const bool native_source = !vertex->second.original_source.empty() && !fragment->second.original_source.empty();
+    if (!native_source && (!vertex->second.shader || !fragment->second.shader)) return nullptr;
+    const uint64_t group = CurrentShaderShareGroupLocked();
+    if (native_source) {
+        if (!group) return nullptr;
+        DrainRetiredLegacyObjectsLocked();
+        pipelines = &s_native_legacy_pipelines[eglGetCurrentContext()];
+    }
+    auto existing = pipelines->find(key);
+    if (existing != pipelines->end()) return &existing->second;
 
     LegacyAssemblyPipeline pipeline;
-    pipeline.program = glCreateProgram();
-    glAttachShader(pipeline.program, vertex->second.shader);
-    glAttachShader(pipeline.program, fragment->second.shader);
-    glLinkProgram(pipeline.program);
-    GLint linked = GL_FALSE;
-    glGetProgramiv(pipeline.program, GL_LINK_STATUS, &linked);
+    pipeline.share_group = group;
+    if (native_source) {
+        auto* v = NativeSsoStageProgramLocked(vertex->second, group);
+        auto* f = NativeSsoStageProgramLocked(fragment->second, group);
+        if (v && f) {
+            PreserveSceneAuditGlError(glGetError());
+            glGenProgramPipelines(1, &pipeline.sso_pipeline);
+            GLint valid = GL_FALSE;
+            if (pipeline.sso_pipeline) {
+                glUseProgramStages(pipeline.sso_pipeline, GL_VERTEX_SHADER_BIT, v->program);
+                glUseProgramStages(pipeline.sso_pipeline, GL_FRAGMENT_SHADER_BIT, f->program);
+                glValidateProgramPipeline(pipeline.sso_pipeline);
+                glGetProgramPipelineiv(pipeline.sso_pipeline, GL_VALIDATE_STATUS, &valid);
+            }
+            if (valid == GL_TRUE) {
+                pipeline.vertex_program = v->program;
+                pipeline.fragment_program = f->program;
+                pipeline.vertex_global = v->vertex_global;pipeline.vertex_float = v->vertex_float;
+                pipeline.vertex_bones = v->vertex_bones;pipeline.vertex_int = v->vertex_int;pipeline.vertex_bool = v->vertex_bool;
+                pipeline.fragment_global = f->fragment_global;pipeline.fragment_float = f->fragment_float;
+                pipeline.fragment_int = f->fragment_int;pipeline.fragment_bool = f->fragment_bool;
+                DiscardPrivateLegacyErrors();
+                CaptureLegacyShaderPair(0, 0, vertex->second.original_source, fragment->second.original_source);
+                const auto index = s_legacy_link_logs.fetch_add(1, std::memory_order_relaxed);
+                if (index < 64) LOGI("Legacy SSO linked #%u pipeline=%u VS=%u PS=%u context=%p group=%llu",
+                    index + 1, pipeline.sso_pipeline, v->program, f->program, eglGetCurrentContext(),
+                    static_cast<unsigned long long>(group));
+                pipeline.serial = s_next_legacy_pipeline_serial++;
+                return &pipelines->emplace(key, std::move(pipeline)).first->second;
+            }
+            if (pipeline.sso_pipeline) glDeleteProgramPipelines(1, &pipeline.sso_pipeline);
+            pipeline.sso_pipeline = 0;
+            DiscardPrivateLegacyErrors();
+            LOGE("Legacy SSO pair validation failed vertex=%u fragment=%u; using original monolithic GLSL", vertex_name, fragment_name);
+        }
+    }
+    const GLuint vertex_shader = NativeMonolithicShaderLocked(vertex->second, group);
+    const GLuint fragment_shader = NativeMonolithicShaderLocked(fragment->second, group);
+    if (!vertex_shader || !fragment_shader) return nullptr;
+    const bool warm_hit = pipeline.program != 0;
+    GLint linked = warm_hit ? GL_TRUE : GL_FALSE;
+    if (!warm_hit) {
+        pipeline.program = glCreateProgram();
+        glAttachShader(pipeline.program, vertex_shader);
+        glAttachShader(pipeline.program, fragment_shader);
+        HornPerfScope link_scope(HornPerfCategory::ShaderLink);
+        glLinkProgram(pipeline.program);
+        glGetProgramiv(pipeline.program, GL_LINK_STATUS, &linked);
+    }
+    if (warm_hit) LOGI("BL2 shader warmup program hit vertex=%u fragment=%u",
+                       vertex_name, fragment_name);
     if (linked != GL_TRUE) {
         const std::string log = ProgramInfoLog(pipeline.program);
         LOGE("Legacy GLASM link failed vertex=%u(%s) fragment=%u(%s): %s",
@@ -1457,6 +2312,8 @@ static LegacyAssemblyPipeline* GetLegacyPipelineLocked(GLuint vertex_name,
         return nullptr;
     }
 
+    CaptureLegacyShaderPair(vertex_shader, fragment_shader,
+                           vertex->second.original_source, fragment->second.original_source);
     pipeline.vertex_float = FindLegacyUniformArray(pipeline.program,
                                                     "VConstFloat");
     pipeline.fragment_float = FindLegacyUniformArray(pipeline.program,
@@ -1483,9 +2340,101 @@ static LegacyAssemblyPipeline* GetLegacyPipelineLocked(GLuint vertex_name,
              pipeline.fragment_global.size);
     }
     auto [inserted, unused] =
-        s_legacy_pipelines.emplace(key, std::move(pipeline));
+        pipelines->emplace(key, std::move(pipeline));
     return &inserted->second;
 }
+
+#if !defined(BL2_NATIVE_ARM32)
+// Draws after which an SSO pair is worth one linked program.
+constexpr uint32_t kProgramUpgradeDraws = 32;
+
+static void RequestProgramUpgradeLocked(LegacyAssemblyPipeline& pipeline,
+                                        const LegacyAssemblyStage& vertex,
+                                        const LegacyAssemblyStage& fragment,
+                                        EGLContext context, uint64_t key) {
+    pipeline.upgrade = 2;
+    if (vertex.original_source.empty() || fragment.original_source.empty()) return;
+    Bl2ProgramUpgradeRequest request;
+    request.context = context;
+    request.key = key;
+    request.serial = pipeline.serial;
+    request.vertex_digest = vertex.source_digest;
+    request.fragment_digest = fragment.source_digest;
+    try {
+        request.vertex_source = vertex.original_source;
+        request.fragment_source = fragment.original_source;
+    } catch (...) {
+        return;
+    }
+    if (Bl2ProgramUpgradeSubmit(pipeline.share_group, std::move(request), &s_shader_stage_cache))
+        pipeline.upgrade = 1;
+}
+
+static void ApplyProgramUpgradesLocked(EGLContext context) {
+    // A program's first draw uploads it in the driver: at most 8 swaps per
+    // 16 ms, so a burst of cached binaries never lands in a single frame.
+    constexpr uint64_t kSwapWindowNs = 16'000'000;
+    constexpr uint32_t kSwapsPerWindow = 8;
+    static uint64_t window_start = 0;
+    static uint32_t window_swaps = 0;
+    timespec clock{};
+    clock_gettime(CLOCK_MONOTONIC, &clock);
+    const uint64_t now = static_cast<uint64_t>(clock.tv_sec) * 1'000'000'000ull +
+                         static_cast<uint64_t>(clock.tv_nsec);
+    if (now - window_start >= kSwapWindowNs) {
+        window_start = now;
+        window_swaps = 0;
+    }
+    if (window_swaps >= kSwapsPerWindow) return;
+    const uint64_t worker_group = Bl2ProgramUpgradeGroup();
+    bool changed = false;
+    for (auto& result : Bl2ProgramUpgradeTake(context, kSwapsPerWindow - window_swaps)) {
+        ++window_swaps;
+        LegacyAssemblyPipeline* target = nullptr;
+        if (const auto pipelines = s_native_legacy_pipelines.find(result.context);
+            pipelines != s_native_legacy_pipelines.end()) {
+            if (const auto found = pipelines->second.find(result.key);
+                found != pipelines->second.end() && found->second.serial == result.serial)
+                target = &found->second;
+        }
+        const uint64_t group = target ? target->share_group : worker_group;
+        if (!target || !result.program || !target->sso_pipeline || group != worker_group) {
+            if (result.program) RetireLegacyProgramLocked(group, result.program);
+            if (target) target->upgrade = 2;
+            continue;
+        }
+        // The pipeline object is context-local; the linked program is shared.
+        if (result.context == context) glDeleteProgramPipelines(1, &target->sso_pipeline);
+        else s_retired_legacy_pipelines[result.context].push_back(target->sso_pipeline);
+        target->sso_pipeline = 0;
+        target->vertex_program = 0;
+        target->fragment_program = 0;
+        target->program = result.program;
+        LegacyUniformArray* const arrays[] = {
+            &target->vertex_global, &target->vertex_float, &target->vertex_bones,
+            &target->vertex_int, &target->vertex_bool, &target->fragment_global,
+            &target->fragment_float, &target->fragment_int, &target->fragment_bool};
+        static_assert(std::size(arrays) == std::tuple_size_v<decltype(result.arrays)>);
+        for (size_t i = 0; i < std::size(arrays); ++i) {
+            arrays[i]->location = result.arrays[i].location;
+            arrays[i]->size = result.arrays[i].size;
+        }
+        target->samplers_initialized = false;
+        target->uploaded_counts.fill(0);
+        for (auto& values : target->uploaded_constants) values.clear();
+        target->uniforms_context = EGL_NO_CONTEXT;
+        target->upgrade = 2;
+        changed = true;
+        Bl2HitchCountProgramSwap();
+    }
+    if (changed) {
+        // A deleted bound pipeline reverts to zero; a recycled pipeline name
+        // must not look already bound to the redundant-bind filter.
+        InvalidateLegacyDrawCacheLocked();
+        s_program_cache_valid = false;
+    }
+}
+#endif
 
 static void BindLegacyProgram(GLenum target, GLuint name) {
     if (target == kVertexProgramArb) s_bound_legacy_vertex = name;
@@ -1494,9 +2443,12 @@ static void BindLegacyProgram(GLenum target, GLuint name) {
         if (s_deferred_gl_error == GL_NO_ERROR) s_deferred_gl_error = GL_INVALID_ENUM;
         return;
     }
+    s_explicit_gl_program = false;
 
     if (!s_bound_legacy_vertex || !s_bound_legacy_fragment) {
         glUseProgram(0);
+        glBindProgramPipeline(0);
+        s_current_sso_pipeline = 0;
         s_current_program = 0;
         s_program_cache_valid = false;
         return;
@@ -1514,19 +2466,63 @@ static void RefreshBoundLegacyConstants(GLuint) {
 }
 
 bool RefreshLegacyProgramStateForDraw() {
+    Bl2HitchCountDraw();
     s_current_gfx_text = false;
     s_current_postprocess_blend = false;
-    if (!s_bound_legacy_vertex && !s_bound_legacy_fragment) return true;
+    if (s_explicit_gl_program) return true;
+    const GLuint vertex_name = s_bound_legacy_vertex;
+    const GLuint fragment_name = s_bound_legacy_fragment;
+    if (!vertex_name && !fragment_name) return true;
 
     std::lock_guard<std::mutex> lock(s_legacy_program_mutex);
-    if (SceneAuditEnabled()) SceneAuditLogError("before legacy state");
-    LegacyAssemblyPipeline* pipeline = GetLegacyPipelineLocked(
-        s_bound_legacy_vertex, s_bound_legacy_fragment);
+    const bool scene_audit = SceneAuditEnabled();
+    if (scene_audit) SceneAuditLogError("before legacy state");
+    const EGLContext context = eglGetCurrentContext();
+#if !defined(BL2_NATIVE_ARM32)
+    if (Bl2ProgramUpgradeHasResults()) ApplyProgramUpgradesLocked(context);
+#endif
+    const uint64_t pair_key = LegacyPipelineKey(vertex_name, fragment_name);
+    // Consecutive draws reuse few pairs: resolve stage/pipeline/stage-program
+    // nodes once per pair instead of seven hash lookups on every draw.
+    LegacyDrawCacheEntry& cached =
+        s_legacy_draw_cache[LegacyDrawCacheSlot(pair_key, context)];
+    if (cached.pipeline && cached.key == pair_key && cached.context == context &&
+        cached.generation == s_legacy_object_generation) {
+        if (!s_retired_legacy_pipelines.empty() || !s_retired_legacy_objects.empty())
+            DrainRetiredLegacyObjectsLocked();
+    } else {
+        cached = {};
+        const LegacyAssemblyStage* resolved_vertex = nullptr;
+        const LegacyAssemblyStage* resolved_fragment = nullptr;
+        timespec resolve_start{}, resolve_end{};
+        clock_gettime(CLOCK_MONOTONIC, &resolve_start);
+        LegacyAssemblyPipeline* resolved = GetLegacyPipelineLocked(
+            vertex_name, fragment_name, resolved_vertex, resolved_fragment);
+        clock_gettime(CLOCK_MONOTONIC, &resolve_end);
+        Bl2HitchAddPipelineNs(static_cast<uint64_t>(
+            (resolve_end.tv_sec - resolve_start.tv_sec) * 1'000'000'000ll +
+            (resolve_end.tv_nsec - resolve_start.tv_nsec)));
+        if (resolved) {
+            cached = {pair_key, s_legacy_object_generation, context, resolved,
+                      resolved_vertex, resolved_fragment, nullptr, nullptr};
+            if (resolved->sso_pipeline) {
+                cached.vertex_state =
+                    resolved_vertex->sso_programs.at(resolved->share_group).get();
+                cached.fragment_state =
+                    resolved_fragment->sso_programs.at(resolved->share_group).get();
+            }
+        }
+    }
+    LegacyAssemblyPipeline* pipeline = cached.pipeline;
+    const LegacyAssemblyStage* vertex = cached.vertex;
+    const LegacyAssemblyStage* fragment = cached.fragment;
     if (!pipeline) {
         // Never draw with a previous pipeline after this pair failed. Apart
         // from rendering the wrong effect, the old program's sampler bindings
         // can be incompatible with the new framebuffer/textures on the driver.
         glUseProgram(0);
+        glBindProgramPipeline(0);
+        s_current_sso_pipeline = 0;
         s_current_program = 0;
         s_program_cache_valid = false;
         if (s_deferred_gl_error == GL_NO_ERROR) {
@@ -1536,18 +2532,19 @@ bool RefreshLegacyProgramStateForDraw() {
              s_bound_legacy_vertex, s_bound_legacy_fragment);
         return false;
     }
-    const auto vertex = s_legacy_stages.find(s_bound_legacy_vertex);
-    const auto fragment = s_legacy_stages.find(s_bound_legacy_fragment);
-    if (vertex == s_legacy_stages.end() ||
-        fragment == s_legacy_stages.end()) {
-        return false;
-    }
+#if !defined(BL2_NATIVE_ARM32)
+    if (pipeline->sso_pipeline && pipeline->upgrade == 0 &&
+        ++pipeline->sso_draws >= kProgramUpgradeDraws && Bl2ProgramUpgradeEnabled())
+        RequestProgramUpgradeLocked(*pipeline, *vertex, *fragment, context, pair_key);
+#endif
     bool skip_program = false;
     const bool cache_program = (GlStateCacheMode() & 1) != 0;
     const bool audit_program = GlStateCacheAuditEnabled();
     if (cache_program || audit_program) {
         const bool same_program = s_program_cache_valid &&
-            s_current_program == pipeline->program;
+            s_current_program == pipeline->program
+            && s_current_sso_pipeline == pipeline->sso_pipeline && s_current_sso_context == context
+            ;
         skip_program = cache_program && same_program;
         if (audit_program) {
             s_gl_program_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -1555,32 +2552,54 @@ bool RefreshLegacyProgramStateForDraw() {
             if (skip_program) s_gl_program_skipped.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (!skip_program) glUseProgram(pipeline->program);
+    if (!skip_program) {
+        // Only binds that change state: between two SSO pairs the current
+        // program is already zero, the real current program for SSO.
+        const bool known = cache_program && s_program_cache_valid &&
+                           s_current_sso_context == context;
+        if (!known || s_current_program != pipeline->program)
+            glUseProgram(pipeline->program);
+        if (!known || s_current_sso_pipeline != pipeline->sso_pipeline)
+            glBindProgramPipeline(pipeline->sso_pipeline);
+    }
+    s_current_sso_pipeline = pipeline->sso_pipeline;
+    s_current_sso_context = context;
+    s_current_sso_vertex_program = pipeline->vertex_program;
+    s_current_sso_fragment_program = pipeline->fragment_program;
     s_current_program = pipeline->program;
     s_program_cache_valid = true;
-    const bool gfx_text = vertex->second.name.starts_with("GFxVertexShader") &&
-        vertex->second.name.find("_text") != std::string::npos &&
-        fragment->second.name.starts_with("GFxPixelShaderbase_text");
-    static const bool align_all_gfx = [] {
+    if (pipeline->name_flags < 0) {
+        int8_t flags = 0;
+        const bool gfx_vertex = vertex->name.starts_with("GFxVertexShader");
+        if (gfx_vertex && vertex->name.find("_text") != std::string::npos &&
+            fragment->name.starts_with("GFxPixelShaderbase_text")) flags |= kPipelineGfxText;
+        if (gfx_vertex && fragment->name.starts_with("GFxPixelShader")) flags |= kPipelineGfxAny;
+        if (fragment->name == "UberPostProcessBlendPixelShader") {
+            flags |= kPipelineUberBlendFragment;
+            if (vertex->name == "UberPostProcessVertexShader") flags |= kPipelinePostprocessBlend;
+        }
+        pipeline->name_flags = flags;
+    }
+    const int8_t name_flags = pipeline->name_flags;
+    // Every GFx batch shares the packed index/vertex ring, not only glyphs.
+    // debug.horn.gfx_align_all=0 restricts the repack to text pipelines.
+    static const bool align_text_only = [] {
         char value[PROP_VALUE_MAX] = {};
         return __system_property_get("debug.horn.gfx_align_all", value) > 0 &&
-               value[0] == '1';
+               value[0] == '0';
     }();
-    s_current_gfx_text = gfx_text ||
-        (align_all_gfx && vertex->second.name.starts_with("GFxVertexShader") &&
-         fragment->second.name.starts_with("GFxPixelShader"));
-    s_current_postprocess_blend =
-        vertex->second.name == "UberPostProcessVertexShader" &&
-        fragment->second.name == "UberPostProcessBlendPixelShader";
-    if (SceneAuditEnabled() &&
+    s_current_gfx_text = (name_flags & kPipelineGfxText) ||
+        (!align_text_only && (name_flags & kPipelineGfxAny));
+    s_current_postprocess_blend = (name_flags & kPipelinePostprocessBlend) != 0;
+    if (scene_audit &&
         ((s_bound_legacy_fragment >= 1610612847u &&
           s_bound_legacy_fragment <= 1610612852u) ||
          s_bound_legacy_fragment == 1610612748u)) {
         static std::unordered_set<GLuint> dumped;
         if (dumped.insert(s_bound_legacy_fragment).second) {
             for (const auto& [stage, label] :
-                 {std::pair{&vertex->second, "vertex"},
-                  std::pair{&fragment->second, "fragment"}}) {
+                 {std::pair{vertex, "vertex"},
+                  std::pair{fragment, "fragment"}}) {
                 const std::string path =
                     "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/" +
                     std::string("scene-ground-") +
@@ -1600,28 +2619,26 @@ bool RefreshLegacyProgramStateForDraw() {
             }
         }
     }
-    const EGLContext context = eglGetCurrentContext();
     if (pipeline->uniforms_context != context) {
         // An EGL context change may be a share-group transition or recreation.
         // In either case re-upload once instead of trusting the old GL state.
         pipeline->uploaded_counts.fill(0);
         pipeline->uniforms_context = context;
     }
-    if (SceneAuditEnabled() && vertex->second.name.starts_with("GFx") &&
-        fragment->second.name.starts_with("GFx")) {
-        s_scene_gfx_programs.insert(pipeline->program);
-        if (vertex->second.name.ends_with("Alt0")) {
-            s_scene_gfx_perspective_programs.insert(pipeline->program);
+    if (scene_audit && vertex->name.starts_with("GFx") &&
+        fragment->name.starts_with("GFx")) {
+        s_scene_gfx_programs.insert(CurrentLegacyUniformProgram("V"));
+        if (vertex->name.ends_with("Alt0")) {
+            s_scene_gfx_perspective_programs.insert(CurrentLegacyUniformProgram("V"));
         }
     }
-    if (SceneAuditEnabled() &&
-        fragment->second.name == "UberPostProcessBlendPixelShader") {
-        s_scene_final_program = pipeline->program;
+    if (scene_audit && (name_flags & kPipelineUberBlendFragment)) {
+        s_scene_final_program = CurrentLegacyUniformProgram("P");
     }
-    UploadLegacyPipelineStateLocked(*pipeline, vertex->second,
-                                    fragment->second);
+    UploadLegacyPipelineStateLocked(*pipeline, *vertex, *fragment, context,
+                                    cached.vertex_state, cached.fragment_state);
     if (ModelAuditEnabled()) {
-        const auto& bones = vertex->second.constant_groups[2];
+        const auto& bones = vertex->constant_groups[2];
         if (bones.first_register >= 0 && bones.byte_count >= 16) {
             static std::atomic<uint32_t> model_draws{0};
             const uint32_t index = model_draws.fetch_add(1, std::memory_order_relaxed);
@@ -1632,19 +2649,19 @@ bool RefreshLegacyProgramStateForDraw() {
                      "fbo=%d bone_first=%d bone_bytes=%u local_words=%zu "
                      "uniform_location=%d uniform_size=%d",
                      index + 1, pipeline->program, s_bound_legacy_vertex,
-                     vertex->second.name.c_str(), s_bound_legacy_fragment,
-                     fragment->second.name.c_str(), framebuffer,
+                     vertex->name.c_str(), s_bound_legacy_fragment,
+                     fragment->name.c_str(), framebuffer,
                      bones.first_register, bones.byte_count,
-                     vertex->second.local_parameters.size(),
+                     vertex->local_parameters.size(),
                      pipeline->vertex_bones.location, pipeline->vertex_bones.size);
                 if (index < 12 && pipeline->vertex_bones.location >= 0) {
                     const size_t word = static_cast<size_t>(bones.first_register) * 4;
-                    if (word + 4 <= vertex->second.local_parameters.size()) {
+                    if (word + 4 <= vertex->local_parameters.size()) {
                         float guest[4] = {};
                         GLfloat driver[4] = {};
-                        std::memcpy(guest, vertex->second.local_parameters.data() + word,
+                        std::memcpy(guest, vertex->local_parameters.data() + word,
                                     sizeof(guest));
-                        glGetUniformfv(pipeline->program, pipeline->vertex_bones.location,
+                        glGetUniformfv(LegacyStageUniformProgram(*pipeline, true), pipeline->vertex_bones.location,
                                        driver);
                         LOGI("Model audit bone0 host=%u guest={%.7g,%.7g,%.7g,%.7g} "
                              "driver={%.7g,%.7g,%.7g,%.7g}", pipeline->program,
@@ -1655,7 +2672,7 @@ bool RefreshLegacyProgramStateForDraw() {
             }
         }
     }
-    if (fragment->second.name == "UberPostProcessBlendPixelShader") {
+    if (name_flags & kPipelineUberBlendFragment) {
         static const bool input_readback_probe = [] {
             char value[PROP_VALUE_MAX] = {};
             return __system_property_get("debug.horn.scene_input_readback", value) > 0 &&
@@ -1704,7 +2721,7 @@ bool RefreshLegacyProgramStateForDraw() {
             SceneAuditLogError("final-input readback");
         }
     }
-    if (SceneAuditEnabled()) {
+    if (scene_audit) {
         SceneAuditLogError("legacy state");
         SceneAuditNoteDraw(pipeline->program);
         static thread_local std::unordered_set<GLuint> logged_programs;
@@ -1713,16 +2730,16 @@ bool RefreshLegacyProgramStateForDraw() {
             LOGI("Scene pipeline host=%u vertex=%u(%s) fragment=%u(%s) "
                  "Vglobal=%d Vfloat=%d Pglobal=%d Pfloat=%d",
                  pipeline->program, s_bound_legacy_vertex,
-                 vertex->second.name.c_str(), s_bound_legacy_fragment,
-                 fragment->second.name.c_str(), pipeline->vertex_global.size,
+                 vertex->name.c_str(), s_bound_legacy_fragment,
+                 fragment->name.c_str(), pipeline->vertex_global.size,
                  pipeline->vertex_float.size, pipeline->fragment_global.size,
                  pipeline->fragment_float.size);
-            if (fragment->second.name == "UberPostProcessBlendPixelShader") {
+            if (fragment->name == "UberPostProcessBlendPixelShader") {
                 const GLint sampler_location = glGetUniformLocation(
-                    pipeline->program, "PSampler0");
+                    LegacyStageUniformProgram(*pipeline, false), "PSampler0");
                 GLint sampler_uniform = -1;
                 if (sampler_location >= 0) {
-                    glGetUniformiv(pipeline->program, sampler_location,
+                    glGetUniformiv(LegacyStageUniformProgram(*pipeline, false), sampler_location,
                                    &sampler_uniform);
                 }
                 GLboolean blend = GL_FALSE, depth = GL_FALSE;
@@ -1840,8 +2857,8 @@ bool RefreshLegacyProgramStateForDraw() {
                          actual_texture, width, height, format);
                 }
             };
-            log_samplers(vertex->second, 'V');
-            log_samplers(fragment->second, 'P');
+            log_samplers(*vertex, 'V');
+            log_samplers(*fragment, 'P');
         }
         GLint draw_framebuffer = 0;
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_framebuffer);
@@ -1885,10 +2902,10 @@ bool RefreshLegacyProgramStateForDraw() {
                         const std::string name = std::string(uniform_name) +
                             "[" + std::to_string(item) + "]";
                         const GLint location = glGetUniformLocation(
-                            pipeline->program, name.c_str());
+                            LegacyStageUniformProgram(*pipeline, group_index < 5), name.c_str());
                         if (location < 0) continue;
                         GLfloat actual[4] = {};
-                        glGetUniformfv(pipeline->program, location, actual);
+                        glGetUniformfv(LegacyStageUniformProgram(*pipeline, group_index < 5), location, actual);
                         GLfloat guest[4] = {};
                         if (group.first_register >= 0 &&
                             static_cast<size_t>(item) * 16 < group.byte_count) {
@@ -1907,15 +2924,15 @@ bool RefreshLegacyProgramStateForDraw() {
                              actual[2], actual[3]);
                     }
                 };
-                dump_uniforms(vertex->second, "VConstFloat", 1,
+                dump_uniforms(*vertex, "VConstFloat", 1,
                               pipeline->vertex_float.size);
-                dump_uniforms(fragment->second, "PConstFloat", 6,
+                dump_uniforms(*fragment, "PConstFloat", 6,
                               pipeline->fragment_float.size);
 
                 GLint previous_active = GL_TEXTURE0;
                 glGetIntegerv(GL_ACTIVE_TEXTURE, &previous_active);
                 for (size_t unit = 0; unit < 5; ++unit) {
-                    if (fragment->second.sampler_targets[unit] != GL_TEXTURE_2D) continue;
+                    if (fragment->sampler_targets[unit] != GL_TEXTURE_2D) continue;
                     glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
                     GLint binding = 0;
                     GLint sampler = 0;
@@ -1978,12 +2995,586 @@ bool RefreshLegacyProgramStateForDraw() {
                         begin = end == stage.diagnostic_source.size() ? end : end + 1;
                     }
                 };
-                dump_stage(vertex->second, "vertex");
-                dump_stage(fragment->second, "fragment");
+                dump_stage(*vertex, "vertex");
+                dump_stage(*fragment, "fragment");
             }
         }
     }
     return true;
+}
+
+bool NativeLegacyPipelineSelfCheck(EGLDisplay display, EGLSurface surface,
+                                   EGLContext context, EGLContext sibling,
+                                   DynarmicHost* guest_host = nullptr) {
+    // Only the existing GPU selfcheck calls this with fresh shared 2x2 contexts.
+    if (eglGetCurrentContext() != context || sibling == EGL_NO_CONTEXT ||
+        SceneAuditEnabled() || ModelAuditEnabled() ||
+        GlStateCacheAuditEnabled() || HornPerfEnabled()) return false;
+    char capture[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.bl2.capture_shaders", capture) > 0 &&
+        std::strcmp(capture, "1") == 0) return false;
+    std::unique_lock lock(s_legacy_program_mutex);
+    if (!s_hot_legacy_stages.empty() || !s_hot_legacy_groups.empty()) return false;
+    if (!s_legacy_stages.empty() || !s_legacy_pipelines.empty() ||
+        s_shader_share_groups.contains(context) ||
+        s_shader_share_groups.contains(sibling)) return false;
+    if (!s_native_legacy_pipelines.empty() || !s_retired_legacy_objects.empty() ||
+        !s_retired_legacy_pipelines.empty()) return false;
+    GLint previous_pipeline = 0;
+    glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &previous_pipeline);
+    const GLuint previous_sso_pipeline = s_current_sso_pipeline;
+    const GLuint previous_sso_vertex = s_current_sso_vertex_program;
+    const GLuint previous_sso_fragment = s_current_sso_fragment_program;
+    const EGLContext previous_sso_context = s_current_sso_context;
+    const bool previous_explicit = s_explicit_gl_program;
+    GLint previous_program = 0;
+    std::array<GLint, 4> previous_viewport{};
+    glGetIntegerv(GL_CURRENT_PROGRAM, &previous_program);
+    glGetIntegerv(GL_VIEWPORT, previous_viewport.data());
+    if (glGetError() != GL_NO_ERROR) return false;
+    s_explicit_gl_program = false;
+    const GLuint previous_vertex = s_bound_legacy_vertex;
+    const GLuint previous_fragment = s_bound_legacy_fragment;
+    const GLuint previous_mirror = s_current_program;
+    const bool previous_cache = s_program_cache_valid;
+    const bool previous_gfx = s_current_gfx_text;
+    const bool previous_post = s_current_postprocess_blend;
+    const GLenum previous_error = s_deferred_gl_error;
+    const auto previous_units = s_legacy_unit_bindings;
+    const uint64_t previous_epoch = s_seen_legacy_bindings_epoch;
+    const uint32_t previous_links = s_legacy_link_logs.load(std::memory_order_relaxed);
+    constexpr GLuint vertex_name = 0x7fffe000u, fragment_name = vertex_name + 1;
+    const uint64_t key = LegacyPipelineKey(vertex_name, fragment_name);
+    const std::array<const char*, 4> sources{{
+        "#version 300 es\nuniform vec4 VConstFloat[1];out highp vec4 v_color;"
+        "void main(){const vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));"
+        "gl_Position=vec4(p[gl_VertexID],0,1);v_color=VConstFloat[0];}",
+        "#version 300 es\nprecision highp float;in highp vec4 v_color;"
+        "uniform vec4 PConstFloat[1];out vec4 color;"
+        "void main(){color=vec4(v_color.r,PConstFloat[0].g,0,1);}",
+        "#version 300 es\nprecision highp float;in highp vec4 v_color;"
+        "uniform vec4 PConstFloat[1];out vec4 color;"
+        "void main(){color=vec4(v_color.r,0,PConstFloat[0].g,1);}",
+        "#version 300 es\nprecision highp float;in highp vec3 v_color;"
+        "out vec4 color;void main(){color=vec4(v_color,1);}"
+    }};
+    std::array<GLuint, 4> shaders{};
+    bool good = true;
+    const char* step = "compile";
+    const auto refresh = [&] {
+        lock.unlock(); // The production draw entry acquires this same mutex.
+        const bool result = RefreshLegacyProgramStateForDraw();
+        lock.lock();
+        return result;
+    };
+    const auto bind = [&](GLenum target, GLuint name) {
+#if defined(HORN_GL_SELF_CHECK) && !defined(BL2_NATIVE_ARM32)
+        if (guest_host) {
+            const uint32_t entry = guest_host->GetThunkManager().FindRegisteredSymbol("glBindProgramARB");
+            if (!entry) { good = false; return; }
+            guest_host->RunFunction(entry, {target, name});
+            return;
+        }
+#endif
+        BindLegacyProgram(target, name);
+    };
+    const auto pixels = [&](std::array<uint8_t, 4> expected) {
+        std::array<uint8_t, 16> actual{};
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glReadPixels(0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, actual.data());
+        const GLenum error = glGetError();
+        bool match = error == GL_NO_ERROR;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            match = actual[i] == expected[i % 4] && match;
+        }
+        if (!match) std::fprintf(stderr,
+            "Legacy selfcheck pixels step=%s error=0x%04X expected=%u,%u,%u,%u "
+            "actual=%u,%u,%u,%u;%u,%u,%u,%u;%u,%u,%u,%u;%u,%u,%u,%u\n",
+            step, error, expected[0], expected[1], expected[2], expected[3],
+            actual[0], actual[1], actual[2], actual[3], actual[4], actual[5], actual[6], actual[7],
+            actual[8], actual[9], actual[10], actual[11], actual[12], actual[13], actual[14], actual[15]);
+        return match;
+    };
+    const auto rejected = [&](GLenum deferred = GL_INVALID_OPERATION,
+                               GLenum driver = GL_NO_ERROR) {
+        const bool accepted = refresh();
+        GLint program = -1;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+        const GLenum error = glGetError();
+        const bool result = !accepted && program == 0 && s_current_program == 0 &&
+            !s_program_cache_valid && s_deferred_gl_error == deferred &&
+            error == driver && glGetError() == GL_NO_ERROR;
+        s_deferred_gl_error = GL_NO_ERROR;
+        return result;
+    };
+    do {
+        for (size_t i = 0; i < shaders.size(); ++i) {
+            shaders[i] = glCreateShader(i == 0 ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
+            glShaderSource(shaders[i], 1, &sources[i], nullptr);
+            glCompileShader(shaders[i]);
+            GLint compiled = GL_FALSE;
+            glGetShaderiv(shaders[i], GL_COMPILE_STATUS, &compiled);
+            good = shaders[i] && compiled == GL_TRUE && good;
+        }
+        good = glGetError() == GL_NO_ERROR && good;
+        if (!good) break;
+        LegacyAssemblyStage vertex, fragment;
+        vertex.target = kVertexProgramArb;
+        vertex.shader = shaders[0];
+        vertex.name = "NativeSelfCheckVertex";
+        vertex.constant_groups[1] = {0, 16};
+        vertex.local_parameters = {0x3f800000u, 0, 0, 0x3f800000u};
+        fragment.target = kFragmentProgramArb;
+        fragment.shader = shaders[1];
+        fragment.name = "NativeSelfCheckFragment";
+        fragment.constant_groups[6] = {0, 16};
+        fragment.local_parameters = {0, 0x3f800000u, 0, 0x3f800000u};
+        s_legacy_stages.emplace(vertex_name, std::move(vertex));
+        s_legacy_stages.emplace(fragment_name, std::move(fragment));
+        auto& v = s_legacy_stages.at(vertex_name);
+        auto& f = s_legacy_stages.at(fragment_name);
+        s_deferred_gl_error = GL_NO_ERROR;
+        s_program_cache_valid = false;
+        bind(kVertexProgramArb, vertex_name);
+        bind(kFragmentProgramArb, fragment_name);
+        glViewport(0, 0, 2, 2);
+        step = "link/readback";
+        good = refresh() && pixels({255, 255, 0, 255});
+        if (!good) break;
+        const GLuint program = s_legacy_pipelines.at(key).program;
+        step = "pair cache hit/unchanged constants";
+        good = refresh() && s_legacy_pipelines.at(key).program == program &&
+            s_legacy_link_logs.load(std::memory_order_relaxed) == previous_links + 1;
+        if (!good) break;
+        // Change only the driver value: an unchanged shadow must skip re-upload.
+        glUniform4f(s_legacy_pipelines.at(key).vertex_float.location, 0, 0, 0, 1);
+        good = refresh() && pixels({0, 255, 0, 255});
+        if (!good) break;
+        step = "shared context unchanged-constant reupload";
+        if (!eglMakeCurrent(display, surface, surface, sibling)) { good = false; break; }
+        GLint sibling_program = 0;
+        std::array<GLint, 4> sibling_viewport{};
+        glGetIntegerv(GL_CURRENT_PROGRAM, &sibling_program);
+        glGetIntegerv(GL_VIEWPORT, sibling_viewport.data());
+        glViewport(0, 0, 2, 2);
+        s_program_cache_valid = false;
+        good = refresh() && pixels({255, 255, 0, 255});
+        if (good) {
+            glUniform4f(s_legacy_pipelines.at(key).vertex_float.location, 0, 0, 0, 1);
+            good = pixels({0, 255, 0, 255});
+        }
+        glUseProgram(static_cast<GLuint>(sibling_program));
+        glViewport(sibling_viewport[0], sibling_viewport[1],
+                   sibling_viewport[2], sibling_viewport[3]);
+        good = glGetError() == GL_NO_ERROR && good;
+        if (!eglMakeCurrent(display, surface, surface, context)) { good = false; break; }
+        s_program_cache_valid = false;
+        good = good && refresh() && pixels({255, 255, 0, 255});
+        if (!good) break;
+        step = "missing/wrong-target/shader-zero rejection";
+        bind(kVertexProgramArb, vertex_name + 2);
+        good = rejected();
+        bind(kVertexProgramArb, vertex_name);
+        good = refresh() && good;
+        v.target = kFragmentProgramArb;
+        good = rejected() && good;
+        v.target = kVertexProgramArb;
+        good = refresh() && good;
+        v.shader = 0;
+        good = rejected() && good;
+        v.shader = shaders[0];
+        good = refresh() && good;
+        if (!good) break;
+        step = "preexisting errors preserved";
+        bind(kVertexProgramArb, vertex_name + 2);
+        bind(0xffffffffu, 0);
+        glEnable(0xffffffffu);
+        good = rejected(GL_INVALID_ENUM, GL_INVALID_ENUM);
+        bind(kVertexProgramArb, vertex_name);
+        if (!good) break;
+        step = "link-failure rejection";
+        EraseLegacyPipelinesForStageLocked(fragment_name);
+        f.shader = shaders[3]; // Active varying type vec3 cannot link to vec4.
+        good = rejected() && !s_legacy_pipelines.contains(key);
+        f.shader = shaders[1];
+        if (!good) break;
+        step = "stage replacement/readback";
+        EraseLegacyPipelinesForStageLocked(fragment_name);
+        glDeleteShader(f.shader);
+        shaders[1] = 0;
+        f.shader = shaders[2];
+        good = refresh() && pixels({255, 0, 255, 255}) &&
+            s_legacy_link_logs.load(std::memory_order_relaxed) == previous_links + 2;
+        if (!good) break;
+        step = "bound stage deletion rejection";
+        EraseLegacyPipelinesForStageLocked(vertex_name);
+        glDeleteShader(v.shader);
+        shaders[0] = 0;
+        s_legacy_stages.erase(vertex_name); InvalidateLegacyDrawCacheLocked();
+        s_bound_legacy_vertex = 0;
+        good = rejected() && !s_legacy_pipelines.contains(key);
+    } while (false);
+    const bool primary_current = eglGetCurrentContext() == context;
+    if (primary_current) {
+        glUseProgram(static_cast<GLuint>(previous_program));
+        glViewport(previous_viewport[0], previous_viewport[1],
+                   previous_viewport[2], previous_viewport[3]);
+    } else {
+        good = false; // A failed context transition is a test failure.
+    }
+    EraseLegacyPipelinesForStageLocked(vertex_name);
+    EraseLegacyPipelinesForStageLocked(fragment_name);
+    for (GLuint shader : shaders) if (shader) glDeleteShader(shader);
+    good = glGetError() == GL_NO_ERROR && good;
+    s_legacy_stages.erase(vertex_name); InvalidateLegacyDrawCacheLocked();
+    s_legacy_stages.erase(fragment_name); InvalidateLegacyDrawCacheLocked();
+    // Preload actual caller-owned separable programs here, rather than invoking
+    // the all-game VFS preparer in this standalone 2x2 GPU check. The production
+    // pair lookup, binding, sampler and per-program constant uploads are used.
+    if (good) {
+        constexpr GLuint sso_v = vertex_name + 16, sso_f = sso_v + 1;
+        constexpr GLuint sso_b = sso_v + 2, sso_duplicate_v = sso_v + 3;
+        const uint64_t group = s_next_shader_share_group++;
+        s_shader_share_groups.emplace(context, ShaderShareGroup{display, group});
+        s_shader_share_groups.emplace(sibling, ShaderShareGroup{display, group});
+        const std::string head = "#version 320 es\nprecision highp float;\n"
+            "#define ENABLE_UNIFORM_BUFFER_OBJECTS 0\n#define ENABLE_MULTIDRAW_INDIRECT 0\n";
+        const std::array<std::string, 3> original{{
+            head + "out gl_PerVertex {\nvec4 gl_Position;\n};\n"
+            "layout(location=0) out vec4 UnTexcoord0;\nuniform vec4 VConstFloat[1];\n"
+            "void main(){const vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));"
+            "gl_Position=vec4(p[gl_VertexID],0,1);UnTexcoord0=VConstFloat[0];}\n",
+            head + "layout(location=0) in vec4 UnTexcoord0;\n"
+            "layout(location=0) out vec4 color;\nuniform vec4 PConstFloat[1];\n"
+            "uniform sampler2D PSampler3;\nvoid main(){color=vec4(UnTexcoord0.r,"
+            "PConstFloat[0].g,texelFetch(PSampler3,ivec2(0),0).b,1);}\n",
+            head + "layout(location=0) in vec4 UnTexcoord0;\n"
+            "layout(location=0) out vec4 color;\nuniform vec4 PConstFloat[1];\n"
+            "uniform sampler2D PSampler3;\nvoid main(){color=vec4(UnTexcoord0.r,"
+            "texelFetch(PSampler3,ivec2(0),0).g,PConstFloat[0].g,1);}\n"
+        }};
+        std::array<GLuint, 4> sso_programs{};
+        std::array<GLuint, 2> mono_shaders{};
+        GLuint mono_program = 0, unlinked_program = 0, texture = 0;
+        std::array<GLint, 2> active_texture{}, texture_binding{}, sampler_binding{};
+        std::array<GLint, 4> sibling_viewport{};
+        GLint sibling_program = 0, sibling_pipeline = 0;
+        constexpr uint64_t handle = 0x484f524efff00001ull;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture[0]);
+        glActiveTexture(GL_TEXTURE3);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture_binding[0]);
+        glGetIntegerv(GL_SAMPLER_BINDING, &sampler_binding[0]);
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        const std::array<uint8_t, 4> black{0, 0, 0, 255};
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, black.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindSampler(3, 0);
+        glActiveTexture(static_cast<GLenum>(active_texture[0]));
+        s_legacy_texture_handles.emplace(handle, LegacyTextureHandle{texture, 0, true});
+        bool sibling_saved = false;
+        do {
+            step = "SSO actual single-stage compile";
+            for (size_t i = 0; i < sso_programs.size(); ++i) {
+                const bool is_vertex = i == 0 || i == 3;
+                const auto& source = original[is_vertex ? 0 : i];
+                std::string padded;
+                if (!legacy_glsl::CompleteSsoInterface(source, is_vertex, &padded)) { good = false; break; }
+                const GLuint shader = glCreateShader(is_vertex ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
+                const char* bytes = padded.c_str();
+                glShaderSource(shader, 1, &bytes, nullptr);
+                glCompileShader(shader);
+                GLint compiled = GL_FALSE, linked = GL_FALSE;
+                glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+                sso_programs[i] = glCreateProgram();
+                glProgramParameteri(sso_programs[i], GL_PROGRAM_SEPARABLE, GL_TRUE);
+                glAttachShader(sso_programs[i], shader);
+                glLinkProgram(sso_programs[i]);
+                glGetProgramiv(sso_programs[i], GL_LINK_STATUS, &linked);
+                glDeleteShader(shader);
+                if (!shader || !sso_programs[i] || compiled != GL_TRUE || linked != GL_TRUE) { good = false; break; }
+                LegacyAssemblyStage stage;
+                stage.target = is_vertex ? kVertexProgramArb : kFragmentProgramArb;
+                stage.name = "NativeSsoSelfCheck";
+                stage.original_source = source;
+                stage.source_digest = Bl2ShaderWarmup::Hash(source);
+                stage.sso_source = std::move(padded);
+                stage.constant_groups[is_vertex ? 1 : 6] = {0, 16};
+                stage.local_parameters = is_vertex
+                    ? std::vector<uint32_t>{i == 3 ? 0u : 0x3f800000u, 0, 0, 0x3f800000u}
+                    : std::vector<uint32_t>{0, 0x3f800000u, 0, 0x3f800000u,
+                        static_cast<uint32_t>(handle), static_cast<uint32_t>(handle >> 32), 0, 0};
+                if (!is_vertex) { stage.sampler_registers[3] = 1; stage.sampler_targets[3] = GL_TEXTURE_2D; }
+                auto state = std::make_unique<LegacyAssemblyPipeline>();
+                state->program = sso_programs[i];state->share_group = group;
+                PopulateLegacyUniformArrays(*state, state->program, state->program);
+                ConfigureLegacySamplers(state->program, true);
+                state->samplers_initialized = true;
+                if (i < 2) {
+                    step = "SSO hot stage exact identity and ownership transfer";
+                    LegacyAssemblyStage hot;
+                    hot.target = stage.target;
+                    hot.original_source = stage.original_source;
+                    hot.sso_source = stage.sso_source;
+                    hot.source_digest = stage.source_digest;
+                    const auto* prepared = state.get();
+                    const auto location = state->vertex_float.location;
+                    hot.sso_programs.emplace(group, std::move(state));
+                    s_hot_legacy_stages.push_back(std::move(hot));
+                    LegacyAssemblyStage different;
+                    different.target = stage.target;
+                    different.original_source = stage.original_source + " ";
+                    different.sso_source = stage.sso_source;
+                    different.source_digest = stage.source_digest; // Also check bytes after a hash match.
+                    good = !TakeHotLegacyStageLocked(stage, group + 1) &&
+                           !TakeHotLegacyStageLocked(different, group) && good;
+                    different.original_source = stage.original_source;
+                    different.target = i == 0 ? kFragmentProgramArb : kVertexProgramArb;
+                    good = !TakeHotLegacyStageLocked(different, group) && good;
+                    different.target = stage.target;
+                    different.sso_source += " ";
+                    good = !TakeHotLegacyStageLocked(different, group) && good;
+                    const auto padded = stage.sso_source;
+                    stage.sso_source.clear();
+                    state = TakeHotLegacyStageLocked(stage, group);
+                    good = state && state.get() == prepared && state->program == sso_programs[i] &&
+                           stage.sso_source == padded &&
+                           state->share_group == group && state->vertex_float.location == location &&
+                           state->samplers_initialized && state->uniforms_context == EGL_NO_CONTEXT &&
+                           !TakeHotLegacyStageLocked(stage, group) && good;
+                    s_hot_legacy_stages.clear();
+                    if (!good) break;
+                }
+                stage.sso_programs.emplace(group, std::move(state));
+                s_legacy_stages.emplace(i == 3 ? sso_duplicate_v : sso_v + static_cast<GLuint>(i), std::move(stage));
+            }
+            if (!good) break;
+            auto& vertex = s_legacy_stages.at(sso_v);
+            bind(kVertexProgramArb, sso_v);bind(kFragmentProgramArb, sso_f);
+            s_program_cache_valid = false;
+            step = "SSO real pipeline/current-program/sampler";
+            good = refresh() && pixels({255, 255, 0, 255});
+            if (!good) break;
+            const auto& pair = s_native_legacy_pipelines.at(context).at(LegacyPipelineKey(sso_v, sso_f));
+            GLint actual_program = -1, actual_pipeline = 0, sampler = -1;
+            glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
+            glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &actual_pipeline);
+            glGetUniformiv(sso_programs[1], glGetUniformLocation(sso_programs[1], "PSampler3"), &sampler);
+            good = good && pair.sso_pipeline && pair.program == 0 && actual_program == 0 &&
+                actual_pipeline == static_cast<GLint>(pair.sso_pipeline) && s_current_program == 0 &&
+                pair.vertex_program == sso_programs[0] && pair.fragment_program == sso_programs[1] &&
+                pair.vertex_program != pair.fragment_program && sampler == 3;
+            if (!good) break;
+            step = "SSO shared-stage A/B/A uniform ownership";
+            vertex.local_parameters[0] = 0;
+            bind(kFragmentProgramArb, sso_b);
+            good = refresh() && pixels({0, 0, 255, 255});
+            vertex.local_parameters[0] = 0x3f800000u;
+            bind(kFragmentProgramArb, sso_f);
+            good = refresh() && pixels({255, 255, 0, 255}) && good;
+            if (!good) break;
+            step = "SSO identical-source guest ownership/prior error";
+            glEnable(0xffffffffu);
+            bind(kVertexProgramArb, sso_duplicate_v);
+            good = refresh() && pixels({0, 255, 0, 255}) &&
+                sso_programs[0] != sso_programs[3] && s_deferred_gl_error == GL_INVALID_ENUM;
+            s_deferred_gl_error = GL_NO_ERROR;
+            bind(kVertexProgramArb, sso_v);
+            good = refresh() && pixels({255, 255, 0, 255}) && good;
+            if (!good) break;
+            step = "SSO invalid/unlinked ordinary override keeps selection";
+            unlinked_program = glCreateProgram();
+            for (GLuint rejected_program : {0xffffffffu, unlinked_program}) {
+                const GLuint before_pipeline = s_current_sso_pipeline;
+                const GLuint before_vertex = s_current_sso_vertex_program;
+                const GLuint before_fragment = s_current_sso_fragment_program;
+                const bool before_cache = s_program_cache_valid;
+                SelectExplicitGlProgram(rejected_program);
+                glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
+                glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &actual_pipeline);
+                const GLenum expected = rejected_program == 0xffffffffu ? GL_INVALID_VALUE : GL_INVALID_OPERATION;
+                good = unlinked_program && glGetError() == expected && actual_program == 0 &&
+                    static_cast<GLuint>(actual_pipeline) == before_pipeline &&
+                    s_current_sso_pipeline == before_pipeline && s_current_program == 0 &&
+                    s_current_sso_vertex_program == before_vertex &&
+                    s_current_sso_fragment_program == before_fragment &&
+                    s_program_cache_valid == before_cache && !s_explicit_gl_program && good;
+                good = refresh() && pixels({255, 255, 0, 255}) && good;
+            }
+            if (!good) break;
+            step = "SSO ordinary source compile";
+            for (size_t i = 0; i < mono_shaders.size(); ++i) {
+                mono_shaders[i] = glCreateShader(i ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+                const char* bytes = original[i].c_str();
+                glShaderSource(mono_shaders[i], 1, &bytes, nullptr);glCompileShader(mono_shaders[i]);
+                GLint compiled = GL_FALSE;
+                glGetShaderiv(mono_shaders[i], GL_COMPILE_STATUS, &compiled);
+                if (compiled != GL_TRUE) {
+                    std::array<char, 1024> info{};
+                    glGetShaderInfoLog(mono_shaders[i], info.size(), nullptr, info.data());
+                    std::fprintf(stderr, "Legacy selfcheck mono stage=%zu compiled=%d info=%s\n", i, compiled, info.data());
+                    good = false;
+                    break;
+                }
+            }
+            if (!good) break;
+            step = "SSO ordinary program link";
+            mono_program = glCreateProgram();
+            glAttachShader(mono_program, mono_shaders[0]);glAttachShader(mono_program, mono_shaders[1]);
+            glLinkProgram(mono_program);
+            GLint linked = GL_FALSE;glGetProgramiv(mono_program, GL_LINK_STATUS, &linked);
+            if (linked != GL_TRUE) {
+                std::array<char, 1024> info{};
+                glGetProgramInfoLog(mono_program, info.size(), nullptr, info.data());
+                std::fprintf(stderr, "Legacy selfcheck mono linked=%d info=%s\n", linked, info.data());
+                good = false;
+                break;
+            }
+            step = "SSO ordinary accepted binding/prior error";
+            glEnable(0xffffffffu);
+            SelectExplicitGlProgram(mono_program);
+            glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
+            glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &actual_pipeline);
+            const GLenum override_error = glGetError();
+            good = override_error == GL_INVALID_ENUM &&
+                actual_program == static_cast<GLint>(mono_program) &&
+                !s_current_sso_pipeline && !s_current_sso_vertex_program &&
+                !s_current_sso_fragment_program && s_explicit_gl_program && good;
+            if (!good) {
+                std::fprintf(stderr, "Legacy selfcheck mono requested=%u actual=%d pipeline=%d "
+                    "error=0x%04X mirrors=%u,%u,%u,%u explicit=%d\n", mono_program,
+                    actual_program, actual_pipeline, override_error, s_current_program,
+                    s_current_sso_pipeline, s_current_sso_vertex_program, s_current_sso_fragment_program,
+                    s_explicit_gl_program);
+                break;
+            }
+            step = "SSO ordinary unbind exposed under raw use0";
+            // Adreno reports an internal mono pipeline while CURRENT_PROGRAM is
+            // nonzero. Expose the public binding without a second selection or
+            // pipeline bind: omitting the original unbind must leave old SSO here.
+            glUseProgram(0);
+            glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
+            glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &actual_pipeline);
+            const GLenum public_binding_error = glGetError();
+            good = actual_program == 0 && actual_pipeline == 0 &&
+                public_binding_error == GL_NO_ERROR && good;
+            if (!good) {
+                std::fprintf(stderr, "Legacy selfcheck mono exposed program=%d pipeline=%d error=0x%04X\n",
+                    actual_program, actual_pipeline, public_binding_error);
+                break;
+            }
+            glUseProgram(mono_program);
+            glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
+            const GLenum mono_restore_error = glGetError();
+            good = actual_program == static_cast<GLint>(mono_program) &&
+                mono_restore_error == GL_NO_ERROR && good;
+            if (!good) break;
+            step = "SSO ordinary uniform/sampler upload";
+            glUniform4f(glGetUniformLocation(mono_program, "VConstFloat[0]"), 0, 0, 0, 1);
+            glUniform4f(glGetUniformLocation(mono_program, "PConstFloat[0]"), 0, 1, 0, 1);
+            ConfigureLegacySamplers(mono_program);
+            const GLenum upload_error = glGetError();
+            if (upload_error != GL_NO_ERROR) {
+                std::fprintf(stderr, "Legacy selfcheck mono upload error=0x%04X\n", upload_error);
+                good = false;
+                break;
+            }
+            step = "SSO ordinary green draw";
+            good = refresh() && pixels({0, 255, 0, 255}) && s_current_program == mono_program;
+            if (!good) break;
+            step = "SSO ordinary release0/prior error";
+            glEnable(0xffffffffu);
+            SelectExplicitGlProgram(0);
+            glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
+            glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &actual_pipeline);
+            const GLenum release_error = glGetError();
+            good = release_error == GL_INVALID_ENUM && actual_program == 0 && actual_pipeline == 0 &&
+                !s_explicit_gl_program && good;
+            if (!good) {
+                std::fprintf(stderr, "Legacy selfcheck mono release error=0x%04X actual=%d pipeline=%d mirror=%u explicit=%d\n",
+                    release_error, actual_program, actual_pipeline, s_current_program, s_explicit_gl_program);
+                break;
+            }
+            step = "SSO ordinary restored SSO yellow draw";
+            good = refresh() && pixels({255, 255, 0, 255}) && good;
+            if (!good) break;
+            step = "SSO shared context/private pipeline/constant reupload";
+            if (!eglMakeCurrent(display, surface, surface, sibling)) { good = false; break; }
+            glGetIntegerv(GL_CURRENT_PROGRAM, &sibling_program);
+            glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &sibling_pipeline);
+            glGetIntegerv(GL_VIEWPORT, sibling_viewport.data());
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture[1]);
+            glActiveTexture(GL_TEXTURE3);
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture_binding[1]);
+            glGetIntegerv(GL_SAMPLER_BINDING, &sampler_binding[1]);
+            glActiveTexture(static_cast<GLenum>(active_texture[1]));
+            sibling_saved = true;
+            glViewport(0, 0, 2, 2);InvalidateGlStateCaches();s_explicit_gl_program = false;
+            good = refresh() && pixels({255, 255, 0, 255});
+            good = good && s_native_legacy_pipelines.contains(sibling) &&
+                s_native_legacy_pipelines.at(sibling).at(LegacyPipelineKey(sso_v, sso_f)).vertex_program == sso_programs[0];
+            glProgramUniform4f(sso_programs[0], glGetUniformLocation(sso_programs[0], "VConstFloat[0]"), 0, 0, 0, 1);
+            good = pixels({0, 255, 0, 255}) && good;
+            if (!eglMakeCurrent(display, surface, surface, context)) { good = false; break; }
+            InvalidateGlStateCaches();s_explicit_gl_program = false;
+            good = refresh() && pixels({255, 255, 0, 255}) && good;
+        } while (false);
+        if (eglGetCurrentContext() != context && !eglMakeCurrent(display, surface, surface, context)) good = false;
+        for (GLuint name : {sso_v, sso_f, sso_b, sso_duplicate_v}) EraseLegacyPipelinesForStageLocked(name);
+        if (eglMakeCurrent(display, surface, surface, sibling)) {
+            DrainRetiredLegacyObjectsLocked();
+            if (sibling_saved) {
+                glUseProgram(static_cast<GLuint>(sibling_program));glBindProgramPipeline(static_cast<GLuint>(sibling_pipeline));
+                glViewport(sibling_viewport[0], sibling_viewport[1], sibling_viewport[2], sibling_viewport[3]);
+                glActiveTexture(GL_TEXTURE3);glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture_binding[1]));
+                glBindSampler(3, static_cast<GLuint>(sampler_binding[1]));glActiveTexture(static_cast<GLenum>(active_texture[1]));
+            }
+        } else good = false;
+        if (eglMakeCurrent(display, surface, surface, context)) {
+            glUseProgram(0);glBindProgramPipeline(0);DrainRetiredLegacyObjectsLocked();
+            glActiveTexture(GL_TEXTURE3);glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture_binding[0]));
+            glBindSampler(3, static_cast<GLuint>(sampler_binding[0]));glActiveTexture(static_cast<GLenum>(active_texture[0]));
+            if (mono_program) glDeleteProgram(mono_program);
+            if (unlinked_program) glDeleteProgram(unlinked_program);
+            for (const GLuint shader : mono_shaders) if (shader) glDeleteShader(shader);
+            for (const GLuint program : sso_programs) if (program) glDeleteProgram(program);
+            if (texture) glDeleteTextures(1, &texture);
+            good = glGetError() == GL_NO_ERROR && good;
+        } else good = false;
+        for (GLuint name : {sso_v, sso_f, sso_b, sso_duplicate_v}) s_legacy_stages.erase(name); InvalidateLegacyDrawCacheLocked();
+        s_legacy_texture_handles.erase(handle);
+        s_native_legacy_pipelines.erase(context);s_native_legacy_pipelines.erase(sibling); InvalidateLegacyDrawCacheLocked();
+        s_shader_share_groups.erase(context);s_shader_share_groups.erase(sibling);
+        AbandonDeadNativeShaderObjectsLocked();
+    }
+
+    if (eglGetCurrentContext() == context) {
+        glUseProgram(static_cast<GLuint>(previous_program));
+        glBindProgramPipeline(static_cast<GLuint>(previous_pipeline));
+        glViewport(previous_viewport[0], previous_viewport[1], previous_viewport[2], previous_viewport[3]);
+    } else good = false;
+    s_current_sso_pipeline = previous_sso_pipeline;
+    s_current_sso_vertex_program = previous_sso_vertex;
+    s_current_sso_fragment_program = previous_sso_fragment;
+    s_current_sso_context = previous_sso_context;
+    s_explicit_gl_program = previous_explicit;
+    s_bound_legacy_vertex = previous_vertex;
+    s_bound_legacy_fragment = previous_fragment;
+    s_current_program = previous_mirror;
+    s_program_cache_valid = previous_cache;
+    s_current_gfx_text = previous_gfx;
+    s_current_postprocess_blend = previous_post;
+    s_deferred_gl_error = previous_error;
+    s_legacy_unit_bindings = previous_units;
+    s_seen_legacy_bindings_epoch = previous_epoch;
+    s_legacy_link_logs.store(previous_links, std::memory_order_relaxed);
+    good = s_legacy_stages.empty() && s_legacy_pipelines.empty() && good;
+    __android_log_print(ANDROID_LOG_INFO, "BL2NativeSelfCheck",
+        "Legacy pipeline mode=%d step=%s result=%s",
+        GlStateCacheMode(), step, good ? "PASS" : "FAIL");
+    if (!good) std::fprintf(stderr, "Legacy pipeline failed: %s\n", step);
+    return good;
 }
 
 bool CurrentLegacyPipelineIsGfxText() {
@@ -2087,13 +3678,17 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &actual_framebuffer);
     const uint64_t draw_key = (static_cast<uint64_t>(actual_framebuffer) << 32) | draw;
     if (target_mode) {
-        if (vertex->second.target != kVertexProgramArb || !vertex->second.shader ||
-            fragment->second.target != kFragmentProgramArb || !fragment->second.shader ||
+        if (vertex->second.target != kVertexProgramArb ||
+            fragment->second.target != kFragmentProgramArb ||
             actual_framebuffer <= 2 || (expected_framebuffer &&
             expected_framebuffer != static_cast<GLuint>(actual_framebuffer))) return;
-        const auto pipeline = s_legacy_pipelines.find(
-            LegacyPipelineKey(s_bound_legacy_vertex, s_bound_legacy_fragment));
-        if (pipeline == s_legacy_pipelines.end() || !pipeline->second.program ||
+        const uint64_t key = LegacyPipelineKey(s_bound_legacy_vertex, s_bound_legacy_fragment);
+        auto* pipelines = &s_legacy_pipelines;
+        if (const auto found = s_native_legacy_pipelines.find(eglGetCurrentContext());
+            found != s_native_legacy_pipelines.end()) pipelines = &found->second;
+        const auto pipeline = pipelines->find(key);
+        if (pipeline == pipelines->end() ||
+            (!pipeline->second.program && !pipeline->second.sso_pipeline) ||
             pipeline->second.program != s_current_program ||
             (expected_program && expected_program != s_current_program)) return;
         GLint previous_active = 0;
@@ -2117,17 +3712,22 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
             const int target = SceneTextureTargetIndex(fingerprint.sha256.data(),
                                                       fingerprint.width, fingerprint.height);
             if (target < 0 || captured_targets.contains(
-                (static_cast<uint64_t>(s_current_program) << 32) | target)) continue;
+                (static_cast<uint64_t>(CurrentLegacyUniformProgram("P")) << 32) | target)) continue;
             if (!checked_program) {
                 GLint actual_program = 0;
                 glGetIntegerv(GL_CURRENT_PROGRAM, &actual_program);
                 if (static_cast<GLuint>(actual_program) != s_current_program) return;
+                if (pipeline->second.sso_pipeline) {
+                    GLint actual_pipeline = 0;
+                    glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &actual_pipeline);
+                    if (static_cast<GLuint>(actual_pipeline) != pipeline->second.sso_pipeline) return;
+                }
                 checked_program = true;
             }
             const std::string name = "PSampler" + std::to_string(unit);
-            const GLint location = glGetUniformLocation(s_current_program, name.c_str());
+            const GLint location = glGetUniformLocation(CurrentLegacyUniformProgram(name), name.c_str());
             GLint actual_unit = -1;
-            if (location >= 0) glGetUniformiv(s_current_program, location, &actual_unit);
+            if (location >= 0) glGetUniformiv(CurrentLegacyUniformProgram(name), location, &actual_unit);
             if (location < 0 || actual_unit != static_cast<GLint>(unit)) continue;
             if (!changed_active) {
                 glGetIntegerv(GL_ACTIVE_TEXTURE, &previous_active);
@@ -2175,9 +3775,9 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
         if (captured_fog_draws.size() >= 4 ||
             !captured_fog_draws.insert(draw_key).second) return;
     } else if (captured_draws.size() >= 24 ||
-               (point < 9 && captured_programs.contains(s_current_program)) ||
+               (point < 9 && captured_programs.contains(CurrentLegacyUniformProgram("P"))) ||
                !captured_draws.insert(draw_key).second) return;
-    captured_programs.insert(s_current_program);
+    captured_programs.insert(CurrentLegacyUniformProgram("P"));
     const std::string prefix =
         "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/scene-lighting-" +
         (target_mode ? "fbo" + std::to_string(actual_framebuffer) + "-" : "") +
@@ -2282,6 +3882,7 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
          {std::pair{&vertex->second, "vertex"}, std::pair{&fragment->second, "fragment"}}) {
         const std::string base = prefix + "-" + label;
         std::string source = stage->diagnostic_source;
+        if (source.empty()) source = stage->original_source;
         if (source.empty() && stage->shader) {
             GLint length = 0;
             glGetShaderiv(stage->shader, GL_SHADER_SOURCE_LENGTH, &length);
@@ -2323,16 +3924,16 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
                 const size_t word = (static_cast<size_t>(constant.first_register) + index) * 4;
                 if (word + 4 > stage->local_parameters.size()) break;
                 const std::string name = std::string(banks[g]) + "[" + std::to_string(index) + "]";
-                const GLint location = glGetUniformLocation(s_current_program, name.c_str());
+                const GLint location = glGetUniformLocation(CurrentLegacyUniformProgram(name), name.c_str());
                 if (location < 0) continue;
                 uint32_t actual[4] = {};
                 if (g == 3 || g == 7) {
                     GLint values[4] = {};
-                    glGetUniformiv(s_current_program, location, values);
+                    glGetUniformiv(CurrentLegacyUniformProgram(name), location, values);
                     std::memcpy(actual, values, sizeof(actual));
                 } else {
                     GLfloat values[4] = {};
-                    glGetUniformfv(s_current_program, location, values);
+                    glGetUniformfv(CurrentLegacyUniformProgram(name), location, values);
                     std::memcpy(actual, values, sizeof(actual));
                 }
                 const uint32_t* expected = stage->local_parameters.data() + word;
@@ -2356,10 +3957,10 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
                 const size_t word = (static_cast<size_t>(group.first_register) + index) * 4;
                 if (word + 4 > stage->local_parameters.size()) break;
                 const std::string name = std::string(bank) + "[" + std::to_string(index) + "]";
-                const GLint location = glGetUniformLocation(s_current_program, name.c_str());
+                const GLint location = glGetUniformLocation(CurrentLegacyUniformProgram(name), name.c_str());
                 if (location < 0) continue;
                 GLint actual = 0;
-                glGetUniformiv(s_current_program, location, &actual);
+                glGetUniformiv(CurrentLegacyUniformProgram(name), location, &actual);
                 const uint32_t* values = stage->local_parameters.data() + word;
                 LOGI("Scene lighting bool draw=%u host=%u stage=%s index=%zu "
                      "register=%zu raw={%08X,%08X,%08X,%08X} gpu=%d",
@@ -2378,8 +3979,8 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
         GLint sampler = 0, min_filter = 0, mag_filter = 0;
         GLint base_level = 0, max_level = 0, actual_unit = -1;
         const std::string sampler_name = "PSampler" + std::to_string(unit);
-        const GLint sampler_location = glGetUniformLocation(s_current_program, sampler_name.c_str());
-        if (sampler_location >= 0) glGetUniformiv(s_current_program, sampler_location, &actual_unit);
+        const GLint sampler_location = glGetUniformLocation(CurrentLegacyUniformProgram(sampler_name), sampler_name.c_str());
+        if (sampler_location >= 0) glGetUniformiv(CurrentLegacyUniformProgram(sampler_name), sampler_location, &actual_unit);
         if (target_mode && (sampler_location < 0 || actual_unit != static_cast<GLint>(unit))) continue;
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
         glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
@@ -2442,7 +4043,7 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
         if (complete) {
             for (int target = 0; target < 6; ++target) {
                 if (pending_targets & (1u << target)) captured_targets.insert(
-                    (static_cast<uint64_t>(s_current_program) << 32) | target);
+                    (static_cast<uint64_t>(CurrentLegacyUniformProgram("P")) << 32) | target);
             }
         }
         LOGI("Scene lighting target result draw=%u host=%u fbo=%d status=%s "
@@ -2469,11 +4070,11 @@ static void SceneAuditLogFinalQuadVertices(const char* operation,
     if (!SceneAuditEnabled() ||
         (s_current_program != 258 &&
          (!s_scene_final_program ||
-          s_current_program != s_scene_final_program))) return;
+          CurrentLegacyUniformProgram("P") != s_scene_final_program))) return;
     static thread_local std::unordered_set<GLuint> logged_programs;
-    if (logged_programs.contains(s_current_program) ||
+    if (logged_programs.contains(CurrentLegacyUniformProgram("P")) ||
         logged_programs.size() >= 4) return;
-    logged_programs.insert(s_current_program);
+    logged_programs.insert(CurrentLegacyUniformProgram("P"));
     LOGI("Scene final draw operation=%s program=%u vertices={%d,%d,%d,%d} "
          "count=%d instances=%d", operation, s_current_program,
          vertices[0], vertices[1], vertices[2], vertices[3],
@@ -2520,7 +4121,7 @@ void SceneAuditLogFinalQuadDraw(const char* operation, GLint first,
     if (!SceneAuditEnabled() ||
         (s_current_program != 258 &&
          (!s_scene_final_program ||
-          s_current_program != s_scene_final_program)) || first < 0 ||
+          CurrentLegacyUniformProgram("P") != s_scene_final_program)) || first < 0 ||
         count <= 0) return;
     GLint vertices[4] = {first, first, first, first};
     for (GLsizei i = 1; i < std::min(count, 4); ++i) {
@@ -2563,19 +4164,19 @@ static void SceneAuditLogGfxIndexedBounds(GLsizei count, GLenum type,
     GLfloat rows[4][4] = {};
     for (unsigned row = 0; row < 4; ++row) {
         const std::string name = "VConstFloat[" + std::to_string(row) + "]";
-        const GLint location = glGetUniformLocation(s_current_program, name.c_str());
+        const GLint location = glGetUniformLocation(CurrentLegacyUniformProgram(name), name.c_str());
         if (location < 0) {
             if (row < 2) {
                 LOGI("GFx bounds unavailable program=%u uniform=%s",
-                     s_current_program, name.c_str());
+                     CurrentLegacyUniformProgram(name), name.c_str());
                 return;
             }
             continue;
         }
-        glGetUniformfv(s_current_program, location, rows[row]);
+        glGetUniformfv(CurrentLegacyUniformProgram(name), location, rows[row]);
     }
     const bool perspective =
-        s_scene_gfx_perspective_programs.contains(s_current_program);
+        s_scene_gfx_perspective_programs.contains(CurrentLegacyUniformProgram("V"));
     const size_t component_size = element_type == GL_FLOAT ? 4 : 2;
     const size_t element_stride = stride ? static_cast<size_t>(stride) :
         2 * component_size;
@@ -2786,10 +4387,10 @@ static void SceneAuditCompareGfxGpuBuffers(GLsizei count, GLenum type,
         ++text_samples;
         label = "text";
     } else if (element_type == GL_FLOAT && screen_text_samples < 2) {
-        const GLint location = glGetUniformLocation(s_current_program,
+        const GLint location = glGetUniformLocation(CurrentLegacyUniformProgram("V"),
                                                     "VConstFloat[0]");
         GLfloat row[4] = {};
-        if (location >= 0) glGetUniformfv(s_current_program, location, row);
+        if (location >= 0) glGetUniformfv(CurrentLegacyUniformProgram("V"), location, row);
         if (row[0] > 0 && row[0] < 0.001f) {
             ++screen_text_samples;
             label = "screen-text";
@@ -2912,10 +4513,10 @@ static void SceneAuditCompareGfxGpuBuffers(GLsizei count, GLenum type,
                 const std::string name =
                     "VConstFloat[" + std::to_string(row) + "]";
                 const GLint location = glGetUniformLocation(
-                    s_current_program, name.c_str());
+                    CurrentLegacyUniformProgram(name), name.c_str());
                 GLfloat values[4] = {};
                 if (location >= 0) {
-                    glGetUniformfv(s_current_program, location, values);
+                    glGetUniformfv(CurrentLegacyUniformProgram(name), location, values);
                 }
                 std::fprintf(meta, "%s=%.9g,%.9g,%.9g,%.9g\n",
                              name.c_str(), values[0], values[1], values[2],
@@ -3109,9 +4710,9 @@ void SceneAuditLogFinalInvocation(const char* operation, GLint first,
                                      "PConstFloat[2]", "PConstFloat[3]",
                                      "PConstFloat[4]", "PConstFloat[5]",
                                      "PConstFloat[6]", "PConstFloat[7]"}) {
-                const GLint location = glGetUniformLocation(s_current_program, name);
+                const GLint location = glGetUniformLocation(CurrentLegacyUniformProgram(name), name);
                 GLfloat values[4] = {};
-                if (location >= 0) glGetUniformfv(s_current_program, location, values);
+                if (location >= 0) glGetUniformfv(CurrentLegacyUniformProgram(name), location, values);
                 LOGI("Scene ground uniform draw=%u name=%s location=%d "
                      "values={%.7g,%.7g,%.7g,%.7g}", draw, name, location,
                      values[0], values[1], values[2], values[3]);
@@ -3172,7 +4773,7 @@ void SceneAuditLogFinalInvocation(const char* operation, GLint first,
             glActiveTexture(static_cast<GLenum>(previous_active));
         }
     }
-    if (s_scene_gfx_programs.contains(s_current_program)) {
+    if (s_scene_gfx_programs.contains(CurrentLegacyUniformProgram("V"))) {
         static thread_local std::unordered_map<GLuint, uint32_t> gfx_draws;
         static thread_local uint32_t total_gfx_draws = 0;
         static thread_local unsigned gfx_stream_session = 0;
@@ -3182,8 +4783,8 @@ void SceneAuditLogFinalInvocation(const char* operation, GLint first,
             gfx_draws.clear();
             total_gfx_draws = 0;
         }
-        if (gfx_draws[s_current_program] < 16 && total_gfx_draws < 160) {
-            ++gfx_draws[s_current_program];
+        if (gfx_draws[CurrentLegacyUniformProgram("V")] < 16 && total_gfx_draws < 160) {
+            ++gfx_draws[CurrentLegacyUniformProgram("V")];
             ++total_gfx_draws;
             GLint framebuffer = 0, vao = 0;
             GLint viewport[4] = {}, scissor_box[4] = {};
@@ -3284,18 +4885,18 @@ void SceneAuditLogFinalInvocation(const char* operation, GLint first,
             for (unsigned row = 0; row < 4; ++row) {
                 const std::string name = "VConstFloat[" + std::to_string(row) + "]";
                 const GLint location = glGetUniformLocation(
-                    s_current_program, name.c_str());
+                    CurrentLegacyUniformProgram(name), name.c_str());
                 GLfloat values[4] = {};
-                if (location >= 0) glGetUniformfv(s_current_program, location, values);
+                if (location >= 0) glGetUniformfv(CurrentLegacyUniformProgram(name), location, values);
                 LOGI("GFx geometry uniform=%s location=%d values={%.7g,%.7g,%.7g,%.7g}",
                      name.c_str(), location, values[0], values[1], values[2],
                      values[3]);
             }
             const GLint fragment_location = glGetUniformLocation(
-                s_current_program, "PConstFloat[0]");
+                CurrentLegacyUniformProgram("P"), "PConstFloat[0]");
             GLfloat fragment_constant[4] = {};
             if (fragment_location >= 0) {
-                glGetUniformfv(s_current_program, fragment_location,
+                glGetUniformfv(CurrentLegacyUniformProgram("P"), fragment_location,
                                fragment_constant);
             }
             GLint blend_src_rgb = 0, blend_dst_rgb = 0;
@@ -3378,9 +4979,9 @@ void SceneAuditLogFinalInvocation(const char* operation, GLint first,
     }
     if (s_current_program != 258 &&
         (!s_scene_final_program ||
-         s_current_program != s_scene_final_program)) return;
+         CurrentLegacyUniformProgram("P") != s_scene_final_program)) return;
     static thread_local std::unordered_map<GLuint, uint32_t> logged;
-    if (logged[s_current_program]++ >= 4) return;
+    if (logged[CurrentLegacyUniformProgram("P")]++ >= 4) return;
     LOGI("Scene final invocation operation=%s program=%u first=%d "
          "count=%d type=0x%04X indices=0x%08X base=%d instances=%d",
          operation, s_current_program, first, count, type,
@@ -3393,12 +4994,12 @@ void SceneAuditLogFinalIndexedDraw(const char* operation, GLsizei count,
     if (!SceneAuditEnabled() ||
         (s_current_program != 258 &&
          (!s_scene_final_program ||
-          s_current_program != s_scene_final_program)) || count <= 0 ||
+          CurrentLegacyUniformProgram("P") != s_scene_final_program)) || count <= 0 ||
         instances <= 0) return;
     static thread_local std::unordered_set<GLuint> attempted_programs;
-    if (attempted_programs.contains(s_current_program) ||
+    if (attempted_programs.contains(CurrentLegacyUniformProgram("P")) ||
         attempted_programs.size() >= 4) return;
-    attempted_programs.insert(s_current_program);
+    attempted_programs.insert(CurrentLegacyUniformProgram("P"));
     const size_t element_size = type == GL_UNSIGNED_BYTE ? 1 :
                                 type == GL_UNSIGNED_SHORT ? 2 :
                                 type == GL_UNSIGNED_INT ? 4 : 0;
@@ -3650,7 +5251,7 @@ static EGLDisplay ResolveEglDisplay(uint32_t handle) {
 }
 
 void ThunkManager::RegisterGLThunks() {
-    uint8_t* mem = m_host.GetGuestMemoryBase();
+    [[maybe_unused]] uint8_t* mem = m_host.GetGuestMemoryBase();
 
     RegisterThunk("glActiveTexture", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         glActiveTexture(static_cast<GLenum>(jit.Regs()[0]));
@@ -3768,8 +5369,9 @@ void ThunkManager::RegisterGLThunks() {
             auto stage = s_legacy_stages.find(name);
             if (stage == s_legacy_stages.end()) continue;
             EraseLegacyPipelinesForStageLocked(name);
-            if (stage->second.shader) glDeleteShader(stage->second.shader);
+            RetireNativeStageObjectsLocked(stage->second);
             s_legacy_stages.erase(stage);
+            InvalidateLegacyDrawCacheLocked();
             if (s_bound_legacy_vertex == name) s_bound_legacy_vertex = 0;
             if (s_bound_legacy_fragment == name) s_bound_legacy_fragment = 0;
         }
@@ -3922,15 +5524,25 @@ void ThunkManager::RegisterGLThunks() {
                 break;
             }
         }
-        const GLuint shader = glCreateShader(LegacyShaderType(target));
-        const GLchar* source_pointer = source.c_str();
-        const GLint source_length = static_cast<GLint>(source.size());
-        glShaderSource(shader, 1, &source_pointer, &source_length);
-        glCompileShader(shader);
+        GLuint shader = 0;
+        LegacyAssemblyStage prepared_stage;
+        prepared_stage.target = target;
+        prepared_stage.name = shader_name;
+        prepared_stage.original_source = source;
+        prepared_stage.source_digest = Bl2ShaderWarmup::Hash(source);
         GLint compiled = GL_FALSE;
-        glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+        {
+            std::lock_guard lock(s_legacy_program_mutex);
+            const auto group = CurrentShaderShareGroupLocked();
+            DrainRetiredLegacyObjectsLocked();
+            if (NativeSsoStageProgramLocked(prepared_stage, group)) compiled = GL_TRUE;
+            else {
+                shader = NativeMonolithicShaderLocked(prepared_stage, group);
+                compiled = shader ? GL_TRUE : GL_FALSE;
+            }
+        }
         if (compiled != GL_TRUE) {
-            const std::string log = ShaderInfoLog(shader);
+            const std::string log = shader ? ShaderInfoLog(shader) : std::string{};
             LOGE("Legacy GLASM compile failed program=%u target=0x%04X "
                  "shader=%s GLSL=%zu NV=%d: %s",
                  name, target, shader_name.c_str(), source.size(), length,
@@ -3966,9 +5578,14 @@ void ThunkManager::RegisterGLThunks() {
             std::lock_guard<std::mutex> lock(s_legacy_program_mutex);
             LegacyAssemblyStage& stage = s_legacy_stages[name];
             EraseLegacyPipelinesForStageLocked(name);
-            if (stage.shader) glDeleteShader(stage.shader);
+            RetireNativeStageObjectsLocked(stage);
+            stage.original_source = std::move(prepared_stage.original_source);
+            stage.sso_source = std::move(prepared_stage.sso_source);
+            stage.sso_programs = std::move(prepared_stage.sso_programs);
+            stage.mono_shaders = std::move(prepared_stage.mono_shaders);
             stage.target = target;
-            stage.shader = shader;
+            stage.shader = 0;
+            stage.source_digest = prepared_stage.source_digest;
             stage.name = shader_name;
             stage.diagnostic_source =
                 SceneAuditEnabled() ||
@@ -4026,9 +5643,8 @@ void ThunkManager::RegisterGLThunks() {
         }
 
         std::lock_guard<std::mutex> lock(s_legacy_program_mutex);
-        auto stage = s_legacy_stages.find(name);
-        if (stage == s_legacy_stages.end() ||
-            (stage->second.target && stage->second.target != target)) {
+        LegacyAssemblyStage* const found_stage = FindLegacyStageLocked(name);
+        if (!found_stage || (found_stage->target && found_stage->target != target)) {
             if (s_deferred_gl_error == GL_NO_ERROR) {
                 s_deferred_gl_error = GL_INVALID_OPERATION;
             }
@@ -4036,7 +5652,7 @@ void ThunkManager::RegisterGLThunks() {
         }
         if (count > 0) {
             if (name == 1610612847u) {
-                const auto& group = stage->second.constant_groups[5];
+                const auto& group = found_stage->constant_groups[5];
                 const uint32_t target_register =
                     group.first_register >= 0 ?
                     static_cast<uint32_t>(group.first_register + 4) : UINT32_MAX;
@@ -4055,7 +5671,7 @@ void ThunkManager::RegisterGLThunks() {
                     }
                 }
             }
-            if (PresentAuditEnabled() && stage->second.name == "BinkShaders") {
+            if (PresentAuditEnabled() && found_stage->name == "BinkShaders") {
                 static std::atomic<uint32_t> logs{0};
                 const uint32_t log_index =
                     logs.fetch_add(1, std::memory_order_relaxed);
@@ -4080,10 +5696,10 @@ void ThunkManager::RegisterGLThunks() {
             }
             // A subrange write must not truncate higher registers: globals
             // and bindless handles frequently survive a lower float update.
-            if (stage->second.local_parameters.size() < static_cast<size_t>(end) * 4) {
-                stage->second.local_parameters.resize(static_cast<size_t>(end) * 4, 0);
+            if (found_stage->local_parameters.size() < static_cast<size_t>(end) * 4) {
+                found_stage->local_parameters.resize(static_cast<size_t>(end) * 4, 0);
             }
-            std::memcpy(stage->second.local_parameters.data() +
+            std::memcpy(found_stage->local_parameters.data() +
                             static_cast<size_t>(first) * 4,
                         host.GetGuestMemoryBase() + values_address, bytes);
         }
@@ -4128,6 +5744,7 @@ void ThunkManager::RegisterGLThunks() {
 
     RegisterThunk("glBindTexture", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         glBindTexture(static_cast<GLenum>(jit.Regs()[0]), jit.Regs()[1]);
+        ApplyTextureFiltering(static_cast<GLenum>(jit.Regs()[0]),jit.Regs()[1]);
         InvalidateLegacyTextureCache();
     });
 
@@ -4160,6 +5777,7 @@ void ThunkManager::RegisterGLThunks() {
         const GLuint buffer = BoundBufferForTarget(target);
         HornPerfScope perf(HornPerfCategory::BufferUpload,
                            size > 0 ? static_cast<uint64_t>(size) : 0);
+        if (data && size > 0) Bl2HitchAddBufferUpload(static_cast<uint64_t>(size));
         glBufferData(target, size, data, usage);
         if (buffer != 0 && size >= 0) {
             std::lock_guard<std::mutex> lock(s_buffer_mapping_mutex);
@@ -4180,18 +5798,31 @@ void ThunkManager::RegisterGLThunks() {
             static_cast<GLsizeiptr>(static_cast<int32_t>(jit.Regs()[1]));
         const void* data = GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[2]);
         const GLbitfield flags = static_cast<GLbitfield>(jit.Regs()[3]);
+#if defined(BL2_NATIVE_ARM32)
+        constexpr GLbitfield coherent_write = GL_MAP_WRITE_BIT | 0x0040 | 0x0080;
+        const GLbitfield native_flags = NativeDirectGlMappingsRequested() &&
+            (flags & coherent_write) == coherent_write ? flags | GL_MAP_READ_BIT : flags;
+#else
+        const GLbitfield native_flags = flags;
+#endif
         const GLuint buffer = BoundBufferForTarget(target);
         static const auto buffer_storage_ext =
             reinterpret_cast<PFNGLBUFFERSTORAGEEXTPROC>(
                 eglGetProcAddress("glBufferStorageEXT"));
         static std::atomic<bool> logged_path{false};
+        if (auto* call = bl2::gl::LastStorageCallDiagnostic(target)) {
+            *call = {.seen = true, .pc = jit.Regs()[15], .lr = jit.Regs()[14],
+                     .buffer = buffer, .data = jit.Regs()[2], .flags = flags,
+                     .native_flags = native_flags, .size = size,
+                     .native_ext = buffer_storage_ext != nullptr};
+        }
         HornPerfScope perf(HornPerfCategory::BufferUpload,
                            size > 0 ? static_cast<uint64_t>(size) : 0);
         if (buffer_storage_ext) {
             if (!logged_path.exchange(true, std::memory_order_relaxed)) {
                 LOGI("glBufferStorage compatibility: using native glBufferStorageEXT");
             }
-            buffer_storage_ext(target, size, data, flags);
+            buffer_storage_ext(target, size, data, native_flags);
         } else {
             if (!logged_path.exchange(true, std::memory_order_relaxed)) {
                 LOGE("glBufferStorage compatibility: GL_EXT_buffer_storage unavailable; "
@@ -4233,6 +5864,7 @@ void ThunkManager::RegisterGLThunks() {
         const GLuint buffer = BoundBufferForTarget(target);
         HornPerfScope perf(HornPerfCategory::BufferUpload,
                            size > 0 ? static_cast<uint64_t>(size) : 0);
+        if (size > 0) Bl2HitchAddBufferUpload(static_cast<uint64_t>(size));
         glBufferSubData(target, offset, size, data);
         if (buffer != 0 && data && offset >= 0 && size >= 0) {
             std::lock_guard<std::mutex> lock(s_buffer_mapping_mutex);
@@ -4373,6 +6005,7 @@ void ThunkManager::RegisterGLThunks() {
         HornPerfScope perf(HornPerfCategory::TextureUpload,
                            image_size > 0 ? static_cast<uint64_t>(image_size) : 0);
         if (image_size < 0) return;
+        Bl2HitchAddTextureUpload(static_cast<uint64_t>(image_size));
 
         const bool remap = DxtBlockBytes(guest_format) != 0;
         size_t required = static_cast<size_t>(image_size);
@@ -4431,6 +6064,7 @@ void ThunkManager::RegisterGLThunks() {
         const GLsizei image_size = args.I32();
         const uint32_t data_address = args.Ptr();
         if (image_size < 0) return;
+        Bl2HitchAddTextureUpload(static_cast<uint64_t>(image_size));
 
         const bool remap = DxtBlockBytes(guest_format) != 0;
         size_t required = static_cast<size_t>(image_size);
@@ -4586,6 +6220,7 @@ void ThunkManager::RegisterGLThunks() {
         const GLsizei count = static_cast<GLsizei>(jit.Regs()[0]);
         const auto* buffers = reinterpret_cast<const GLuint*>(
             GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]));
+        if (!ForgetGuestGlMappings(host, count, buffers)) return;
         glDeleteBuffers(count, buffers);
         InvalidateGlAttribCache();
         if (count > 0 && buffers) {
@@ -4631,6 +6266,9 @@ void ThunkManager::RegisterGLThunks() {
         const GLsizei count = static_cast<GLsizei>(jit.Regs()[0]);
         const auto* textures = reinterpret_cast<const GLuint*>(
             GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]));
+        if(count>0 && textures)for(auto& [context,filters]:textureFiltering) {
+            (void)context;for(GLsizei i=0;i<count;++i)filters.erase(textures[i]);
+        }
         if (SceneTextureHashEnabled() && count > 0 && textures) {
             std::lock_guard<std::mutex> lock(s_scene_texture_fingerprints_mutex);
             for (GLsizei index = 0; index < count; ++index) {
@@ -5098,7 +6736,13 @@ void ThunkManager::RegisterGLThunks() {
         uint32_t sp = jit.Regs()[13];
         GLenum format = host.MemoryRead32(sp);
         GLenum type = host.MemoryRead32(sp + 4);
-        void* pixels = GuestToHost(host.GetGuestMemoryBase(), host.MemoryRead32(sp + 8));
+        const uint32_t pixels_gaddr = host.MemoryRead32(sp + 8);
+        // A bound PIXEL_PACK_BUFFER receives an offset, never a host pointer.
+        GLint pack_buffer = 0;
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
+        void* pixels = pack_buffer != 0
+            ? reinterpret_cast<void*>(static_cast<uintptr_t>(pixels_gaddr))
+            : GuestToHost(host.GetGuestMemoryBase(), pixels_gaddr);
         HornPerfScope perf(
             HornPerfCategory::GpuSync,
             EstimatedPixelBytes(static_cast<GLsizei>(jit.Regs()[2]),
@@ -5208,11 +6852,29 @@ void ThunkManager::RegisterGLThunks() {
             LOGI("GL telemetry: glTexImage2D #%u internal=0x%04X %dx%d format=0x%04X type=0x%04X pixels=0x%08X",
                  index, internalformat, width, height, format, type, pixels_gaddr);
         }
-        const void* pixels = (pixels_gaddr < 0x10000) ?
-            reinterpret_cast<const void*>(static_cast<uintptr_t>(pixels_gaddr)) :
-            GuestToHost(host.GetGuestMemoryBase(), pixels_gaddr);
+        // Desktop packed 8_8_8_8_REV is the RGBA/BGRA byte order on LE hosts.
+        constexpr GLenum kUnsignedInt8888Rev = 0x8367;
+        if (type == kUnsignedInt8888Rev && (format == GL_RGBA || format == GL_BGRA_EXT))
+            type = GL_UNSIGNED_BYTE;
+        // Only a bound PIXEL_UNPACK_BUFFER turns the argument into an offset;
+        // a former "below 64 KiB" guess turned larger PBO offsets into host
+        // pointers. Pending persistent-map writes must reach that buffer first.
+        GLint unpack_buffer = 0;
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack_buffer);
+        const void* pixels = nullptr;
+        if (unpack_buffer != 0) {
+            SyncGuestMappedBuffersForGpuRead(host);
+            pixels = reinterpret_cast<const void*>(static_cast<uintptr_t>(pixels_gaddr));
+        } else if (pixels_gaddr != 0 &&
+                   !ResolveGlPixels(host, width, height, 1, format, type,
+                                    pixels_gaddr, &pixels, false)) {
+            // Formats outside the checked table keep the previous direct view.
+            pixels = GuestRangeValid(host.GetGuestMemorySize(), pixels_gaddr, 1)
+                ? GuestToHost(host.GetGuestMemoryBase(), pixels_gaddr) : nullptr;
+        }
         HornPerfScope perf(HornPerfCategory::TextureUpload,
                            EstimatedPixelBytes(width, height, format, type));
+        Bl2HitchAddTextureUpload(EstimatedPixelBytes(width, height, format, type));
         GLint host_internalformat = internalformat;
         const LegacyTextureChannels legacy_channels =
             TranslateLegacyGlInternalFormat(internalformat,
@@ -5224,8 +6886,6 @@ void ThunkManager::RegisterGLThunks() {
         if (format == GL_BGRA_EXT && type == GL_UNSIGNED_BYTE &&
             (host_internalformat == GL_RGBA8 ||
              host_internalformat == GL_SRGB8_ALPHA8)) {
-            GLint unpack_buffer = 0;
-            glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack_buffer);
             if (pixels_gaddr != 0 || unpack_buffer != 0) {
                 if (!UploadBgraPixels2D(host, target, level, host_internalformat,
                                         width, height, border, 0, 0,
@@ -5271,30 +6931,27 @@ void ThunkManager::RegisterGLThunks() {
         GLenum target = jit.Regs()[0];
         GLenum pname = jit.Regs()[1];
         const GLfloat requested = *reinterpret_cast<float*>(&jit.Regs()[2]);
-        const GLfloat upgraded =
-            pname == GL_TEXTURE_MIN_FILTER &&
-                    requested == static_cast<GLfloat>(GL_LINEAR_MIPMAP_NEAREST)
-                ? static_cast<GLfloat>(GL_LINEAR_MIPMAP_LINEAR)
-                : requested;
-        if (upgraded != requested && !s_logged_trilinear_upgrade) {
+        const GLfloat upgraded = pname==GL_TEXTURE_MIN_FILTER ?
+            static_cast<GLfloat>(GraphicsMinFilter(static_cast<GLint>(requested))) : requested;
+        if (!(Bl2GraphicsFiltering()&0x100u) && upgraded != requested && !s_logged_trilinear_upgrade) {
             LOGI("Trilinear filtering: GL_LINEAR_MIPMAP_NEAREST -> GL_LINEAR_MIPMAP_LINEAR");
             s_logged_trilinear_upgrade = true;
         }
         glTexParameterf(target, pname, upgraded);
-        if (pname == GL_TEXTURE_MIN_FILTER) ForceAnisotropy(target);
+        if (pname == GL_TEXTURE_MIN_FILTER) RememberTextureMinFilter(target,static_cast<GLint>(requested));
     });
 
     RegisterThunk("glTexParameteri", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         GLenum target = jit.Regs()[0];
         GLenum pname = jit.Regs()[1];
         const GLint requested = static_cast<GLint>(jit.Regs()[2]);
-        const GLint upgraded = UpgradeMinFilter(pname, requested);
-        if (upgraded != requested && !s_logged_trilinear_upgrade) {
+        const GLint upgraded = pname==GL_TEXTURE_MIN_FILTER ? GraphicsMinFilter(requested) : requested;
+        if (!(Bl2GraphicsFiltering()&0x100u) && upgraded != requested && !s_logged_trilinear_upgrade) {
             LOGI("Trilinear filtering: GL_LINEAR_MIPMAP_NEAREST -> GL_LINEAR_MIPMAP_LINEAR");
             s_logged_trilinear_upgrade = true;
         }
         glTexParameteri(target, pname, upgraded);
-        if (pname == GL_TEXTURE_MIN_FILTER) ForceAnisotropy(target);
+        if (pname == GL_TEXTURE_MIN_FILTER) RememberTextureMinFilter(target,requested);
     });
 
     RegisterThunk("glUniform1f", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -5448,14 +7105,12 @@ void ThunkManager::RegisterGLThunks() {
     });
 
     RegisterThunk("glUseProgram", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
-        s_current_program = jit.Regs()[0];
-        s_program_cache_valid = false;
         static std::atomic<uint32_t> calls{0};
         uint32_t index = 0;
         if (ShouldLogTelemetry(calls, 32, "glUseProgram", &index)) {
-            LOGI("GL telemetry: glUseProgram #%u program=%u", index, s_current_program);
+            LOGI("GL telemetry: glUseProgram #%u program=%u", index, jit.Regs()[0]);
         }
-        glUseProgram(s_current_program);
+        SelectExplicitGlProgram(jit.Regs()[0]);
     });
 
     RegisterThunk("glVertexAttribPointer", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -5466,6 +7121,8 @@ void ThunkManager::RegisterGLThunks() {
         uint32_t sp = jit.Regs()[13];
         GLsizei stride = host.MemoryRead32(sp);
         uint32_t ptr_gaddr = host.MemoryRead32(sp + 4);
+        if (index == 0)
+            s_attr0_alignment = s_bound_array_buffer != 0 && (ptr_gaddr & 3u) != 0;
         
         AuditBufferBinding(
             "glVertexAttribPointer", GL_ARRAY_BUFFER_BINDING,

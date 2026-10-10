@@ -1,0 +1,40 @@
+--- a/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+@@ -715,15 +715,28 @@
+ // VMOV<c>.F64 <Dd>, <Dm>
+ // VMOV<c>.F32 <Sd>, <Sm>
+ bool TranslatorVisitor::vfp_VMOV_reg(Cond cond, bool D, size_t Vd, bool sz, bool M, size_t Vm) {
+-    if (!VFPConditionPassed(cond)) {
+-        return true;
+-    }
+-
+-    const auto d = ToExtReg(sz, Vd, D);
+-    const auto m = ToExtReg(sz, Vm, M);
+-
+-    return EmitVfpVectorOperation(sz, d, m, [this](ExtReg d, ExtReg m) {
+-        ir.SetExtendedRegister(d, ir.GetExtendedRegister(m));
++    // Scalar register moves cannot raise FP exceptions or access memory. Keep
++    // their ARM predicate in IR rather than splitting at every conditional
++    // move. Other conditional states and Thumb IT retain the existing path.
++    // Invalid vector controls must also retain condition-before-validation.
++    const bool select = !ir.current_location.TFlag() &&
++                        cond != Cond::AL && cond != Cond::NV &&
++                        cond_state == ConditionalState::None &&
++                        ir.current_location.FPSCR().Len() == 1 &&
++                        ir.current_location.FPSCR().Stride() == 1;
++    if (!select && !VFPConditionPassed(cond)) {
++        return true;
++    }
++
++    const auto d = ToExtReg(sz, Vd, D);
++    const auto m = ToExtReg(sz, Vm, M);
++
++    return EmitVfpVectorOperation(sz, d, m, [this, cond, select](ExtReg d, ExtReg m) {
++        const auto source = ir.GetExtendedRegister(m);
++        const auto value = select
++                         ? ir.ConditionalSelect(cond, source, ir.GetExtendedRegister(d))
++                         : source;
++        ir.SetExtendedRegister(d, value);
+     });
+ }
+ 

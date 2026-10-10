@@ -13,9 +13,10 @@ struct WidgetTarget {
     WidgetKind kind = WidgetKind::Unsupported;
     bool enabled = false, visible = false;
     std::string caption, rendererType;
-    GfxIdentity renderer, data, inner, slider;
-    GfxRect stageBounds, bounds, sliderBounds;
-    WidgetPoint sliderStart, sliderEnd;
+    GfxIdentity renderer, data, inner, slider, choices;
+    GfxRect stageBounds, bounds, sliderBounds, valueBounds;
+    std::vector<std::string> choiceLabels;
+    WidgetPoint origin, sliderStart, sliderEnd;
     double minimum = 0, maximum = 0, increment = 0, value = 0;
 };
 struct WidgetRegistry {
@@ -26,7 +27,7 @@ struct WidgetRegistry {
     GfxRect frame, listStageBounds, listBounds;
     GfxViewport viewport;
     std::uint32_t surfaceWidth = 0, surfaceHeight = 0;
-    std::int32_t scrollPosition = 0, totalRenderers = 0, rowCount = 0;
+    std::int32_t scrollPosition = 0, totalRenderers = 0, rowCount = 0, selectedIndex = -1;
     std::vector<WidgetTarget> rows;
 };
 

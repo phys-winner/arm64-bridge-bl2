@@ -5,11 +5,11 @@
 namespace bl2_locale_payload {
 struct File { const char* asset; uint64_t bytes; const char* sha256; };
 struct Binding { const char* path; size_t file; };
-inline constexpr char kDescriptorSha256[] = "C9E41892F66A236687BCF646FD046C29C5B4C7F559F4067F494462E85E5DCFB0";
-inline constexpr uint64_t kDescriptorBytes = 3034;
+inline constexpr char kDescriptorSha256[] = "1D84AD6C1F31B2B1E02FD00DCE298B5C0EDB0E0206D6DA0405FD658BD34A7F17";
+inline constexpr uint64_t kDescriptorBytes = 3038;
 inline constexpr char kCompatiblePatchSha256[] = "5AF9364A4DF8C38D2CAD281EAB57E3A5B875AD1A3C77597322ECFC2303B81FB8";
 inline constexpr File kFiles[] = {
-    {"assets/bl2_locale/ru_text/payload/Coalesced_INT.bin", 5656278, "74F372C835219468A598CA1C1431F9565C961A3D1F5C322B32B3867B1193F504"},
+    {"assets/bl2_locale/ru_text/payload/Coalesced_INT.bin", 5676447, "74D1057DB9DE6452904E5B39C83F54FCE5C8F399769EB276AE22823E6AD1B96E"},
     {"assets/bl2_locale/ru_text/payload/packages/Startup.xxx", 25511602, "721438F4736D2B45B1C51EDE28122333B44312E5F5F639C0CC8C19D9833C4F4D"},
     {"assets/bl2_locale/ru_text/payload/packages/Startup.xxx.uncompressed_size", 11, "A52123F4DA5F01BC00FB304C4B037FAEA8339ABB1FD656A3AAF75212521B46E5"},
     {"assets/bl2_locale/ru_text/payload/packages/Startup_LOC_INT.xxx", 1210106, "A0A05272AA0839577F48306EA070A3DC2AA95506F6189780D34723A95DF3D422"},

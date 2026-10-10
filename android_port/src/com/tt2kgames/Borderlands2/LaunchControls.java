@@ -14,6 +14,7 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.InputDevice;
+import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -39,8 +40,11 @@ public final class LaunchControls extends FrameLayout
     private static final long MIN_TRIGGER_PRESS_MS = 150L;
     private static final long STICK_REPEAT_MS = 50L;
     private static volatile WeakReference<LaunchControls> active = new WeakReference<>(null);
+    private static WeakReference<Activity> backOwner = new WeakReference<>(null);
+    private static volatile long shaderPreparationProgress;
     private static final AtomicInteger loggedPresence = new AtomicInteger();
     private final Activity activity;
+    private final boolean russian;
     private final Method keyEvent;
     private final Method motionEvent;
     private final Method deviceEvent;
@@ -55,6 +59,7 @@ public final class LaunchControls extends FrameLayout
     private boolean nativeTouchOwns;
     private boolean focused;
     private boolean disposed;
+    private TextView shaderPreparation;
     private int loggedKeys;
     private int loggedTouches;
     private int loggedMotions;
@@ -68,6 +73,7 @@ public final class LaunchControls extends FrameLayout
     private LaunchControls(Activity owner) throws ReflectiveOperationException {
         super(owner);
         activity = owner;
+        russian = "ru".equals(GameStorage.appLanguage(owner));
         keyEvent = owner.getClass().getMethod("NativeCallback_KeyEvent",
                 int.class, int.class, int.class, int.class, long.class);
         motionEvent = owner.getClass().getMethod("NativeCallback_MotionEvent",
@@ -84,10 +90,10 @@ public final class LaunchControls extends FrameLayout
 
         FrameLayout dpad = new FrameLayout(owner);
         dpad.setMotionEventSplittingEnabled(true);
-        addButton(dpad, "UP", KeyEvent.KEYCODE_DPAD_UP, 52, 0, 52);
-        addButton(dpad, "LEFT", KeyEvent.KEYCODE_DPAD_LEFT, 0, 52, 52);
-        addButton(dpad, "RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT, 104, 52, 52);
-        addButton(dpad, "DOWN", KeyEvent.KEYCODE_DPAD_DOWN, 52, 104, 52);
+        addButton(dpad, label("UP", "ВВЕРХ"), KeyEvent.KEYCODE_DPAD_UP, 52, 0, 52);
+        addButton(dpad, label("LEFT", "ВЛЕВО"), KeyEvent.KEYCODE_DPAD_LEFT, 0, 52, 52);
+        addButton(dpad, label("RIGHT", "ВПРАВО"), KeyEvent.KEYCODE_DPAD_RIGHT, 104, 52, 52);
+        addButton(dpad, label("DOWN", "ВНИЗ"), KeyEvent.KEYCODE_DPAD_DOWN, 52, 104, 52);
         LayoutParams left = new LayoutParams(dp(156), dp(156), Gravity.LEFT | Gravity.BOTTOM);
         left.setMargins(dp(12), dp(12), dp(12), dp(12));
         addView(dpad, left);
@@ -106,10 +112,10 @@ public final class LaunchControls extends FrameLayout
 
         FrameLayout actions = new FrameLayout(owner);
         actions.setMotionEventSplittingEnabled(true);
-        addButton(actions, "BACK", KeyEvent.KEYCODE_BACK, 0, 0, 76);
+        addButton(actions, label("BACK", "НАЗАД"), KeyEvent.KEYCODE_BACK, 0, 0, 76);
         addButton(actions, "X", KeyEvent.KEYCODE_BUTTON_X, 80, 0, 56);
         addButton(actions, "Y", KeyEvent.KEYCODE_BUTTON_Y, 140, 0, 56);
-        addButton(actions, "START", KeyEvent.KEYCODE_BUTTON_START, 0, 60, 76);
+        addButton(actions, label("START", "СТАРТ"), KeyEvent.KEYCODE_BUTTON_START, 0, 60, 76);
         addButton(actions, "B", KeyEvent.KEYCODE_BUTTON_B, 80, 60, 56);
         addButton(actions, "A", KeyEvent.KEYCODE_BUTTON_A, 140, 60, 56);
         LayoutParams right = new LayoutParams(dp(196), dp(112), Gravity.RIGHT | Gravity.BOTTOM);
@@ -176,6 +182,7 @@ public final class LaunchControls extends FrameLayout
             controls.inputManager.registerInputDeviceListener(controls, new Handler(Looper.getMainLooper()));
             controls.refreshOwnership();
             controls.requestApplyInsets();
+            if (shaderPreparationProgress != 0) postShaderPreparation();
             Log.i(TAG, "Attached provisional dual-stick controls, controller=" +
                     CONTROLLER);
             if (android.os.Build.VERSION.SDK_INT >= 37 &&
@@ -191,6 +198,56 @@ public final class LaunchControls extends FrameLayout
         attach(owner);
         NativeTouchControls.attach(owner, surface);
         NativeTouchControls.setRouteListener(owner, owns -> setNativeTouchOwns(owner, owns));
+        if (android.os.Build.VERSION.SDK_INT >= 33 && backOwner.get() != owner) {
+            SystemBack.register(owner);
+            backOwner = new WeakReference<>(owner);
+        }
+    }
+
+    /**
+     * Target SDK 36+ on Android 16+ delivers Back only to OnBackInvokedCallback;
+     * without one the system closes the game. Replays it through the activity's
+     * own key path, which keeps the keyboard and movie semantics of the original.
+     */
+    private static final class SystemBack {
+        static void register(Activity owner) {
+            owner.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, () -> {
+                        long now = SystemClock.uptimeMillis();
+                        KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN,
+                                KeyEvent.KEYCODE_BACK, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
+                                KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+                        owner.onKeyDown(KeyEvent.KEYCODE_BACK, down);
+                        owner.onKeyUp(KeyEvent.KEYCODE_BACK,
+                                KeyEvent.changeAction(down, KeyEvent.ACTION_UP));
+                    });
+        }
+    }
+
+    /**
+     * UE3JavaApp key hook. Android Back acts like the on-screen Back/Pause; a
+     * controller's own Back button keeps the game's binding (false = original path).
+     */
+    public static boolean backKey(Activity owner, int keyCode, KeyEvent event) {
+        if (keyCode != KeyEvent.KEYCODE_BACK || event == null
+                || event.isFromSource(InputDevice.SOURCE_GAMEPAD)
+                || event.isFromSource(InputDevice.SOURCE_JOYSTICK)) return false;
+        if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()
+                && !NativeTouchControls.systemBack(owner)) platformBack(owner);
+        return true;
+    }
+
+    /** No touch route decided: the game receives Back as Android before 16 sent it. */
+    private static void platformBack(Activity owner) {
+        try {
+            Method key = owner.getClass().getMethod("NativeCallback_KeyEvent",
+                    int.class, int.class, int.class, int.class, long.class);
+            long now = SystemClock.uptimeMillis();
+            key.invoke(owner, 0, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0, now);
+            key.invoke(owner, 0, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK, 0, now);
+        } catch (ReflectiveOperationException | RuntimeException error) {
+            Log.e(TAG, "Back key failed", error);
+        }
     }
 
     public static void setNativeTouchOwns(Activity owner, boolean owns) {
@@ -198,7 +255,81 @@ public final class LaunchControls extends FrameLayout
         if (controls == null || controls.activity != owner || controls.disposed) return;
         if (owns && !controls.nativeTouchOwns) controls.releaseAll();
         controls.nativeTouchOwns = owns;
-        controls.setVisibility(controls.virtualConnected && !owns ? View.VISIBLE : View.GONE);
+        controls.setVisibility(View.GONE);
+    }
+
+    /** Render-thread progress uses the existing activity's UI handler. */
+    public static void showShaderPreparation(int completed, int total) {
+        shaderPreparationProgress = total > 0 && completed < total
+                ? ((long) total << 32) | Math.max(0, completed) : 0;
+        postShaderPreparation();
+    }
+
+    private static void postShaderPreparation() {
+        LaunchControls controls = active.get();
+        if (controls == null) return;
+        controls.uiHandler.post(() -> {
+            if (controls.disposed || active.get() != controls) return;
+            long progress = shaderPreparationProgress;
+            int completed = (int) progress, total = (int) (progress >>> 32);
+            if (total <= 0 || completed >= total) {
+                controls.removeShaderPreparation();
+                return;
+            }
+            if (controls.shaderPreparation == null) {
+                View decor = controls.activity.getWindow().getDecorView();
+                if (!(decor instanceof ViewGroup)) return;
+                TextView text = new TextView(controls.activity);
+                text.setGravity(Gravity.CENTER);
+                text.setTextSize(20);
+                text.setTextColor(Color.WHITE);
+                text.setBackgroundColor(Color.BLACK);
+                text.setClickable(true);
+                controls.shaderPreparation = text;
+                ((ViewGroup) decor).addView(text, new ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            }
+            int ready = Math.max(0, completed);
+            int percent = (int) (100L * ready / total);
+            controls.shaderPreparation.setText(controls.russian
+                    ? "ПОДГОТОВКА ГРАФИКИ: " + percent + "%\n" + ready + " / " + total
+                            + "\nВЫПОЛНЯЕТСЯ ОДИН РАЗ ДЛЯ ЭТОГО УСТРОЙСТВА"
+                    : "PREPARING GRAPHICS: " + percent + "%\n" + ready + " / " + total
+                            + "\nONCE FOR THIS DEVICE");
+        });
+    }
+
+    private void removeShaderPreparation() {
+        if (shaderPreparation != null && shaderPreparation.getParent() instanceof ViewGroup)
+            ((ViewGroup) shaderPreparation.getParent()).removeView(shaderPreparation);
+        shaderPreparation = null;
+    }
+
+    /** The compact touch view reuses the game's stock controller callbacks. */
+    public static boolean available(Activity owner) {
+        LaunchControls c=active.get();
+        return c!=null && c.activity==owner && c.virtualConnected && c.focused && !c.disposed;
+    }
+    public static void key(Activity owner, int key, boolean down) {
+        LaunchControls c=active.get();
+        if(c==null || c.activity!=owner || !available(owner)) return;
+        for(KeyButton b:c.buttons) if(b.key==key) {
+            if(down) {
+                if(b.pendingRelease!=null) { c.uiHandler.removeCallbacks(b.pendingRelease); b.pendingRelease=null; }
+                if(!b.held) { b.held=true; b.pressedAt=SystemClock.uptimeMillis(); b.sendButtonState(true); }
+            } else b.releaseAfterTap();
+            return;
+        }
+    }
+    public static void axes(Activity owner,float x,float y,float yaw,float pitch) {
+        LaunchControls c=active.get();
+        if(c==null || c.activity!=owner || !available(owner)) return;
+        c.stick.x=x; c.stick.y=-y; c.cameraStick.x=yaw; c.cameraStick.y=-pitch;
+        c.sendMotionState(-1);
+    }
+    public static void cancel(Activity owner) {
+        LaunchControls c=active.get();
+        if(c!=null && c.activity==owner) c.releaseAll();
     }
 
     public static void focus(Activity owner, boolean focused) {
@@ -253,7 +384,7 @@ public final class LaunchControls extends FrameLayout
             if (next) sendDevice(true);
             Log.i(TAG, "Virtual controller presence=" + next + " physicalSlot1=" + physicalOwnsSlot);
         }
-        setVisibility(next && !nativeTouchOwns ? View.VISIBLE : View.GONE);
+        setVisibility(View.GONE);
     }
 
     private void sendDevice(boolean connected) {
@@ -314,10 +445,12 @@ public final class LaunchControls extends FrameLayout
         for (KeyButton button : buttons) button.release();
         stick.release();
         cameraStick.release();
+        if(virtualConnected) sendMotionState(-1);
     }
 
     private void dispose() {
         if (disposed) return;
+        removeShaderPreparation();
         releaseAll();
         disposed = true;
         virtualConnected = false;
@@ -393,6 +526,7 @@ public final class LaunchControls extends FrameLayout
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+    private String label(String english, String ru) { return russian ? ru : english; }
 
     private void addButton(FrameLayout parent, String label, int key, int x, int y, int width) {
         KeyButton button = new KeyButton(label, key);
@@ -414,7 +548,7 @@ public final class LaunchControls extends FrameLayout
         StickView(Context context, boolean isLeft) {
             super(context);
             left = isLeft;
-            setContentDescription(left ? "Game left stick" : "Game right stick");
+            setContentDescription(left ? label("Game left stick", "Левый джойстик игры") : label("Game right stick", "Правый джойстик игры"));
             setFocusable(false);
             setClickable(true);
         }
@@ -526,7 +660,7 @@ public final class LaunchControls extends FrameLayout
             super(activity);
             key = keyCode;
             setText(label);
-            setContentDescription("Game " + label);
+            setContentDescription((russian ? "Игра " : "Game ") + label);
             setTextSize(14);
             setTextColor(Color.WHITE);
             setGravity(Gravity.CENTER);

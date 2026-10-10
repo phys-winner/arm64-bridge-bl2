@@ -1,0 +1,84 @@
+--- a/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
+@@ -2,6 +2,8 @@
+  * Copyright (c) 2022 MerryMage
+  * SPDX-License-Identifier: 0BSD
+  */
++
++#include <iterator>
+ 
+ #include <mcl/bit_cast.hpp>
+ #include <mcl/mp/metavalue/lift_value.hpp>
+@@ -46,14 +48,49 @@
+ template<typename T>
+ using VectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T>>;
+ 
++static bool NativeStandardFPVectorMath(const IR::Inst& inst) {
++    size_t control_arg;
++    switch (inst.GetOpcode()) {
++    case IR::Opcode::FPVectorAdd32:
++    case IR::Opcode::FPVectorAdd64:
++    case IR::Opcode::FPVectorSub32:
++    case IR::Opcode::FPVectorSub64:
++    case IR::Opcode::FPVectorMul32:
++    case IR::Opcode::FPVectorMul64:
++        control_arg = 2;
++        break;
++    case IR::Opcode::FPVectorMulAdd32:
++    case IR::Opcode::FPVectorMulAdd64:
++        control_arg = 3;
++        break;
++    default:
++        return false;
++    }
++    return inst.GetArg(control_arg).IsImmediate() && !inst.GetArg(control_arg).GetU1();
++}
++
+ template<typename EmitFn>
+-static void MaybeStandardFPSCRValue(oaknut::CodeGenerator& code, EmitContext& ctx, bool fpcr_controlled, EmitFn emit) {
++static void MaybeStandardFPSCRValue(oaknut::CodeGenerator& code, EmitContext& ctx, bool fpcr_controlled, EmitFn emit, IR::Inst* inst = nullptr) {
+     if (ctx.FPCR(fpcr_controlled) != ctx.FPCR()) {
+-        code.MOV(Wscratch0, ctx.FPCR(fpcr_controlled).Value());
+-        code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++        bool enter_standard = true;
++        bool restore_guest = true;
++        if (!ctx.conf.very_verbose_debugging_output && inst && NativeStandardFPVectorMath(*inst)) {
++            // Only these immediately adjacent native math operations may keep
++            // standard FPCR. Every other IR node remains a restore boundary.
++            const IR::Block::iterator here{inst};
++            const auto next = std::next(here);
++            enter_standard = here == ctx.block.begin() || !NativeStandardFPVectorMath(*std::prev(here));
++            restore_guest = next == ctx.block.end() || !NativeStandardFPVectorMath(*next);
++        }
++        if (enter_standard) {
++            code.MOV(Wscratch0, ctx.FPCR(fpcr_controlled).Value());
++            code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++        }
+         emit();
+-        code.MOV(Wscratch0, ctx.FPCR().Value());
+-        code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++        if (restore_guest) {
++            code.MOV(Wscratch0, ctx.FPCR().Value());
++            code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++        }
+     } else {
+         emit();
+     }
+@@ -96,7 +133,7 @@
+     RegAlloc::Realize(Qresult, Qa, Qb);
+     ctx.fpsr.Load();
+ 
+-    MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] { emit(Qresult, Qa, Qb); });
++    MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] { emit(Qresult, Qa, Qb); }, inst);
+ }
+ 
+ template<size_t size, typename EmitFn>
+@@ -134,7 +171,7 @@
+         } else {
+             static_assert(Common::always_false_v<mcl::mp::lift_value<size>>);
+         }
+-    });
++    }, inst);
+ }
+ 
+ template<size_t size, typename EmitFn>

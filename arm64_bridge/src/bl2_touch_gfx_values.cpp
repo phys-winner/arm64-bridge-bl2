@@ -40,8 +40,12 @@ bool GfxSession::verifyAbi(GfxTransport& vm, std::uint32_t base) {
         {0x01CC80DC,{0xE3120040,0xE1A00004,0x159D3018,0x059D1018,0x15931000}},
         {0x01CC53F8,{0xE5901034,0xE1A00004,0xE5913000,0xE593304C,0xE12FFF33}},
         {0x01CC535C,{0xE59E3000,0xE5933038,0xE12FFF33}},
+        {0x02979FF0,{0xEEF37A04,0xE1A0200A,0xE3A03000,0xE58D3040}},
+        {0x0297A014,{0xE1A0000B,0xEEB77BE0,0xEE677A27,0xEDCD7A0F,0xEBFC606A}},
+        {0x028921D4,{0xE92D4FF0,0xED2D8B04,0xE28DB030,0xE24DD044}},
         {0x01CE0AF8,{0xE24B604C,0xE58D3000,0xE1A01006,0xE1A0300A,0xE79FC00C,0xE12FFF3C}},
         {0x027628B4,{0xE590000C,0xE52DE004,0xE24DD00C,0xE590C000,0xE59DE010,0xE58DE000,0xE59CC0A4,0xE12FFF3C}},
+        {0x02762738,{0xE590000C,0xE92D4008,0xE5903000,0xE59330B4,0xE12FFF33,0xE8BD8008}},
     };
     for (const auto& span : spans) {
         auto p = base + span.rva;
@@ -175,6 +179,13 @@ GfxHandle GfxSession::pin(std::uint32_t p) {
     }
     return {s->id};
 }
+GfxHandle GfxSession::variable(const char* path) {
+    if (!good() || !name(path)) return {};
+    auto* slot = allocate(); if (!slot) return {};
+    std::uint32_t success = 0;
+    const bool ran = run(base_ + kGetVariable,{movie_,address(*slot),scratch_ + kName},success);
+    return result(*slot,ran,success);
+}
 GfxHandle GfxSession::number(double value) {
     if (!std::isfinite(value)) return {};
     auto* s = allocate(); if (!s) return {};
@@ -183,6 +194,30 @@ GfxHandle GfxSession::number(double value) {
     return {s->id};
 }
 GfxHandle GfxSession::undefined() { auto* s = allocate(); return s ? GfxHandle{s->id} : GfxHandle{}; }
+GfxHandle GfxSession::boolean(bool value) {
+    auto* s = allocate(); if (!s) return {};
+    s->raw[3] = 2; s->raw[4] = value ? 1 : 0;
+    if (!vm_.write(address(*s),s->raw.data(),32)) { retire(*s); return {}; }
+    return {s->id};
+}
+GfxHandle GfxSession::stringValue(const std::string& value) {
+    if (value.size() >= 256 || value.find('\0') != std::string::npos) return {};
+    auto* s = allocate(); if (!s) return {};
+    s->raw[3] = 6;
+    s->raw[4] = scratch_ + 1536 + static_cast<std::uint32_t>(s - slots_.data()) * 256;
+    if (!vm_.write(s->raw[4],value.c_str(),value.size() + 1) ||
+        !vm_.write(address(*s),s->raw.data(),32)) { retire(*s); return {}; }
+    return {s->id};
+}
+GfxHandle GfxSession::array() {
+    if (!good() || !name("Array")) return {};
+    auto* s = allocate(); if (!s) return {};
+    std::uint32_t ignored = 0;
+    const bool ran = run(base_ + kCreateObject,{movie_,address(*s),scratch_ + kName,0,0},ignored);
+    const auto h = result(*s,ran,1);
+    if (!h || type(h) != 9) { release(h); return {}; }
+    return h;
+}
 GfxHandle GfxSession::point(double x, double y) {
     if (!good() || !std::isfinite(x) || !std::isfinite(y) || !name("Object")) return {};
     auto* s = allocate(); if (!s) return {};
@@ -297,8 +332,10 @@ bool GfxSession::number(GfxHandle h, double& out) const {
     }
     return std::isfinite(out);
 }
-bool GfxSession::boolean(GfxHandle h, bool& out) const {
-    const auto* s = find(h); if (!s || !good() || type(h) != 2 || (s->raw[4] & 255) > 1) return false;
+bool GfxSession::boolean(GfxHandle h, bool& out, bool undefinedIsFalse) const {
+    const auto* s = find(h); if (!s || !good()) return false;
+    if(undefinedIsFalse && type(h)==0) {out=false;return true;}
+    if(type(h) != 2 || (s->raw[4] & 255) > 1) return false;
     out = (s->raw[4] & 255) != 0; return true;
 }
 bool GfxSession::string(GfxHandle h, std::string& out, std::size_t limit) const {
@@ -335,5 +372,120 @@ bool GfxSession::viewport(GfxViewport& out) {
     std::uint32_t ignored = 0;
     return run(method(movie_,0x38),{movie_,scratch_ + kTemp},ignored) && good() &&
         read(scratch_ + kTemp,out.words.data(),52);
+}
+bool GfxSession::projectedBounds(GfxHandle clip, GfxRect& out) {
+    out = {};
+    if (type(clip) != 10 || !good()) return false;
+    const auto getNumber = [this](GfxHandle object, const char* property, double& value) {
+        const auto n = member(object,property);
+        const bool okay = n && number(n,value);
+        release(n); return okay;
+    };
+    const auto bound = invoke(clip,"getBounds",{clip});
+    GfxRect local;
+    const bool valid = bound && object(bound) && getNumber(bound,"xMin",local.left) &&
+        getNumber(bound,"yMin",local.top) && getNumber(bound,"xMax",local.right) &&
+        getNumber(bound,"yMax",local.bottom) && rectValid(local);
+    release(bound);
+    if (!valid) return false;
+    return projectedRect(clip,local,out);
+}
+bool GfxSession::projectedRect(GfxHandle clip, const GfxRect& local, GfxRect& out) {
+    out={};
+    if (type(clip)!=10 || !good() || !rectValid(local)) return false;
+    const auto getNumber=[this](GfxHandle object,const char* property,double& value) {
+        const auto n=member(object,property);
+        const bool okay=n && number(n,value);
+        release(n);return okay;
+    };
+    out = {std::numeric_limits<double>::infinity(),std::numeric_limits<double>::infinity(),
+           -std::numeric_limits<double>::infinity(),-std::numeric_limits<double>::infinity()};
+    for (const double x : {local.left,local.right}) for (const double y : {local.top,local.bottom}) {
+        const auto p = point(x,y);
+        const auto returned = p ? invoke(clip,"localToGlobal",{p}) : GfxHandle{};
+        double globalX = 0, globalY = 0;
+        const bool projected = returned && getNumber(p,"x",globalX) && getNumber(p,"y",globalY) &&
+            std::abs(globalX) < 1000000 && std::abs(globalY) < 1000000;
+        release(returned); release(p);
+        if (!projected) { out={}; return false; }
+        out.left=std::min(out.left,globalX);out.top=std::min(out.top,globalY);
+        out.right=std::max(out.right,globalX);out.bottom=std::max(out.bottom,globalY);
+    }
+    return good() && rectValid(out);
+}
+
+HudObjectiveBounds ObserveBl2HudObjectives(GfxSession& session, GfxHandle mission) {
+    const auto unknown=[](const char* reason) {
+        return HudObjectiveBounds{HudObjectiveState::Unknown,{},reason};
+    };
+    const auto visible=[&](GfxHandle clip,bool& out) {
+        if (session.type(clip)!=10) return false;
+        const auto v=session.member(clip,"_visible"),a=session.member(clip,"_alpha");
+        bool enabled=false;double alpha=0;
+        const bool okay=v && a && session.boolean(v,enabled) && session.number(a,alpha) &&
+            alpha>=0 && alpha<=1000;
+        session.release(v);session.release(a);
+        out=okay && enabled && alpha>0;
+        return okay;
+    };
+    bool missionVisible=false;
+    if (!visible(mission,missionVisible)) return unknown("objective-mission-visibility");
+    HudObjectiveBounds result{HudObjectiveState::Empty,{},"objective-empty"};
+    const auto include=[&](const GfxRect& r) {
+        if (result.state!=HudObjectiveState::Projected) result.stage=r;
+        else {
+            result.stage.left=std::min(result.stage.left,r.left);
+            result.stage.top=std::min(result.stage.top,r.top);
+            result.stage.right=std::max(result.stage.right,r.right);
+            result.stage.bottom=std::max(result.stage.bottom,r.bottom);
+        }
+        result.state=HudObjectiveState::Projected;result.reason="objective-observed";
+    };
+    constexpr const char* names[]{"Module1","Module2","Module3","Module4","Module5","Module6"};
+    for (const auto name:names) {
+        const auto module=session.member(mission,name),inner=session.member(module,"inner");
+        bool moduleVisible=false,innerVisible=false;
+        const char* rejection=nullptr;
+        if (!visible(module,moduleVisible)) rejection="objective-module-visibility";
+        else if (!visible(inner,innerVisible)) rejection="objective-inner-visibility";
+        else if (missionVisible && moduleVisible && innerVisible) {
+            // Off hides inner. Each active inner frame sizes this background to
+            // text.textWidth+75. Full inner/getBounds includes a 435px text box
+            // and art from other timeline states, so it is not an occupancy.
+            const auto background=session.member(inner,"textbkgd");
+            const auto frameValue=session.member(inner,"_currentframe");
+            bool backgroundVisible=false;double frame=0;GfxRect stage;
+            if (!visible(background,backgroundVisible) || !backgroundVisible)
+                rejection="objective-background-visibility";
+            else if (!frameValue || !session.number(frameValue,frame) || frame<1 ||
+                frame>100000 || frame!=std::floor(frame)) rejection="objective-frame";
+            else if (!session.projectedBounds(background,stage)) rejection="objective-background-projection";
+            else include(stage);
+            session.release(frameValue);session.release(background);
+            if (!rejection && frame==29) {
+                // MissionName's unnamed shape144 replaces depth3 at frame29.
+                // The Timer state replaces it; no invented member is queried.
+                if (!session.projectedRect(inner,{61.3,21.9,305.1,22.9},stage))
+                    rejection="objective-underline-projection";
+                else include(stage);
+            }
+            if (!rejection && frame==57) {
+                const auto health=session.member(inner,"healthBar");
+                bool healthVisible=false;
+                if (!visible(health,healthVisible)) rejection="objective-health-visibility";
+                else if (healthVisible) {
+                    // Sprite156 contains only its persistent 116.05x7.05px
+                    // background and bounded 1..100 bar animation, no text or
+                    // invisible prototype children.
+                    if (!session.projectedBounds(health,stage)) rejection="objective-health-projection";
+                    else include(stage);
+                }
+                session.release(health);
+            }
+        }
+        session.release(inner);session.release(module);
+        if (rejection) return unknown(rejection);
+    }
+    return session.good() ? result : unknown("objective-scene-or-budget");
 }
 } // namespace bl2::touch

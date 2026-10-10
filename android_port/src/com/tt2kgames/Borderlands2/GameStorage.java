@@ -1,6 +1,7 @@
 package com.tt2kgames.Borderlands2;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.util.Log;
 
@@ -24,6 +25,12 @@ public final class GameStorage {
     private static File readyRoot;
 
     private GameStorage() {}
+
+    /** Android's per-app configuration is authoritative, including system fallback. */
+    public static String appLanguage(Context context) {
+        return "ru".equals(context.getResources().getConfiguration()
+                .getLocales().get(0).getLanguage()) ? "ru" : "en";
+    }
 
     public static synchronized File root(Activity activity) {
         if (readyRoot != null && readyRoot.isDirectory()) return readyRoot;
@@ -111,6 +118,10 @@ public final class GameStorage {
             throw new IOException("Cannot create external data directory: " + target);
         }
         for (File child : children) {
+            // Old builds stored this disposable driver cache among player files.
+            // Recompiling it must not redirect saves to the legacy data root.
+            if (relative.isEmpty() && (child.getName().equals("bl2-program-cache.bin")
+                    || child.getName().startsWith("bl2-program-cache.bin.tmp."))) continue;
             File destination = new File(target, child.getName());
             String childRelative = relative + child.getName();
             if (!source.getCanonicalFile().equals(child.getCanonicalFile().getParentFile())) {
@@ -137,7 +148,11 @@ public final class GameStorage {
         if (destination.exists()) {
             if (!destination.isFile()) throw new IOException("External data type conflict: " + destination);
             if (!Arrays.equals(sourceHash, sha256(destination))) {
-                if (!sourceHex.equals(previous.getProperty(relative))) {
+                // These settings are already owned by the external Java store;
+                // a legacy fallback must not replace the user's current choice.
+                boolean currentSetting = relative.equals("language.txt")
+                        || relative.equals("touch-controls.properties");
+                if (!currentSetting && !sourceHex.equals(previous.getProperty(relative))) {
                     throw new IOException("Unresolved legacy data conflict: " + relative);
                 }
             }

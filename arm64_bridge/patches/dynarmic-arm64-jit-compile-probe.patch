@@ -1,0 +1,124 @@
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -10,6 +10,7 @@
+ #include "dynarmic/backend/arm64/a64_address_space.h"
+ #include "dynarmic/backend/arm64/a64_jitstate.h"
+ #include "dynarmic/backend/arm64/abi.h"
++#include "dynarmic/backend/arm64/bl2_jit_compile_probe.h"
+ #include "dynarmic/backend/arm64/devirtualize.h"
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+ #include "dynarmic/backend/arm64/stack_layout.h"
+@@ -72,8 +73,11 @@
+         return block_entry;
+     }
+ 
++    const auto compile_start = Bl2JitCompileStart();
+     IR::Block ir_block = GenerateIR(descriptor);
+     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
++    Bl2JitCompileRecord(compile_start, descriptor.Value(),
++                        reinterpret_cast<std::uintptr_t>(block_info.entry_point), block_info.size);
+     fast_entry.code_ptr = block_info.entry_point;
+     fast_entry.descriptor = descriptor.Value();
+     return block_info.entry_point;
+--- /dev/null
++++ b/src/dynarmic/backend/arm64/bl2_jit_compile_probe.h
+@@ -0,0 +1,99 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++#if defined(__ANDROID__) && defined(HORN_ENABLE_JIT_COMPILE_PROBE)
++#include <cstdio>
++#include <mutex>
++#include <sys/stat.h>
++#include <sys/system_properties.h>
++#include <time.h>
++#include <unistd.h>
++#endif
++
++namespace Dynarmic::Backend::Arm64 {
++
++// Called only after both cache lookups miss. jit_map is fixed at startup;
++// jit_compile is read dynamically so root can capture only after the HUD loads.
++// Quiet builds omit HORN_ENABLE_JIT_COMPILE_PROBE and erase both inline calls.
++inline std::uint64_t Bl2JitCompileStart() {
++#if defined(__ANDROID__) && defined(HORN_ENABLE_JIT_COMPILE_PROBE)
++    static const bool enabled = [] {
++        char property[PROP_VALUE_MAX] = {};
++        return __system_property_get("debug.bl2.jit_map", property) > 0 &&
++               property[0] == '1';
++    }();
++    if (!enabled) return 0;
++    char capture[PROP_VALUE_MAX] = {};
++    if (__system_property_get("debug.bl2.jit_compile", capture) <= 0 ||
++        capture[0] != '1') return 0;
++    timespec now{};
++    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
++    return static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL +
++           static_cast<std::uint64_t>(now.tv_nsec);
++#else
++    return 0;
++#endif
++}
++
++inline void Bl2JitCompileRecord(std::uint64_t start_ns, std::uint64_t descriptor,
++                               std::uintptr_t host_start, std::size_t host_size) {
++#if defined(__ANDROID__) && defined(HORN_ENABLE_JIT_COMPILE_PROBE)
++    if (!start_ns) return;
++    timespec now{};
++    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
++    const std::uint64_t end_ns = static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL +
++                                 static_cast<std::uint64_t>(now.tv_nsec);
++    if (end_ns < start_ns) return;
++    char row[256];
++    const int length = std::snprintf(row, sizeof(row),
++        "%llu,%llu,%d,0x%016llx,%llu,0x%016llx,%zu\n",
++        static_cast<unsigned long long>(start_ns),
++        static_cast<unsigned long long>(end_ns), gettid(),
++        static_cast<unsigned long long>(descriptor),
++        static_cast<unsigned long long>(end_ns - start_ns),
++        static_cast<unsigned long long>(host_start), host_size);
++    if (length <= 0 || static_cast<std::size_t>(length) >= sizeof(row)) return;
++
++    static std::mutex output_mutex;
++    static FILE* output = nullptr;
++    static std::size_t written = 0;
++    static unsigned pending = 0;
++    static bool stopped = false;
++    constexpr std::size_t kMaxBytes = 32u * 1024u * 1024u;
++    std::lock_guard lock(output_mutex);
++    if (stopped) return;
++    if (!output) {
++        char path[192];
++        std::snprintf(path, sizeof(path),
++            "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/jit-compile-%d.csv",
++            getpid());
++        output = std::fopen(path, "wb");
++        if (!output) return;
++        fchmod(fileno(output), 0660);
++        std::setvbuf(output, nullptr, _IOFBF, 256 * 1024);
++        constexpr char header[] = "start_ns,end_ns,tid,descriptor,elapsed_ns,host_start,host_size\n";
++        written = std::fwrite(header, 1, sizeof(header) - 1, output);
++        if (written != sizeof(header) - 1) {
++            std::fclose(output); output = nullptr; stopped = true; return;
++        }
++    }
++    const auto bytes = static_cast<std::size_t>(length);
++    if (bytes > kMaxBytes - written || std::fwrite(row, 1, bytes, output) != bytes) {
++        std::fclose(output); output = nullptr; stopped = true; return;
++    }
++    written += bytes;
++    if (++pending == 32) {
++        std::fflush(output);
++        pending = 0;
++    }
++#else
++    (void)start_ns;
++    (void)descriptor;
++    (void)host_start;
++    (void)host_size;
++#endif
++}
++
++}  // namespace Dynarmic::Backend::Arm64

@@ -13,7 +13,7 @@ using namespace bl2::touch;
 namespace {
 constexpr std::uint32_t base = 0x10000000, movie = 0x21000000, iface = 0x21001000;
 constexpr std::uint32_t movieTable = 0x21002000, valueTable = 0x21003000;
-constexpr std::uint32_t scratch = 0x21004000, native = 0x21005000, data = 0x21006000;
+constexpr std::uint32_t scratch = 0x21004000, native = 0x21008000, data = 0x21009000;
 constexpr std::uint32_t add = base + 0x02010000, release = add + 4, member = add + 8;
 constexpr std::uint32_t invoke = add + 12, set = add + 16, element = add + 20;
 constexpr std::uint32_t frame = add + 24, viewport = add + 28;
@@ -182,6 +182,17 @@ int main(int argc, char** argv) {
         { GfxSession session(vm,base,movie,scratch); assert(session.pin(native));
           assert(!session.member(previous,"stale")); }
         assert(vm.movieRefs == 1 && vm.valueRefs == 0);
+    }
+    {
+        Mock vm(argv[1]); GfxSession session(vm,base,movie,scratch);
+        const auto root = session.pin(native); assert(root);
+        for (int boundary = 0; boundary < 5000; ++boundary) {
+            session.beginInputBoundary();
+            const auto child = session.member(root,"child");
+            assert(child && session.good() && session.bytesRead() < 128 * 1024);
+            session.release(child); assert(vm.valueRefs == 1);
+        }
+        session.close(); assert(session.cleanupOkay() && vm.movieRefs == 1 && vm.valueRefs == 0);
     }
     std::cout << "PASS: GFx ownership, exact release order, stale scene cleanup, budgets, UTF-8 and handles\n";
 }

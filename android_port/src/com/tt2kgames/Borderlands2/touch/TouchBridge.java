@@ -8,6 +8,7 @@ public final class TouchBridge implements TouchInput.Sink {
     private static native void nativeReset();
     private static native void nativeUiPointer(long epoch, int pointerId, int phase,
             float surfaceNormalizedX, float surfaceNormalizedY);
+    private static native int[] nativeSettingsExchange(int[] hostValues);
 
     public TouchContract.Context snapshot() {
         return TouchContract.Context.decode(nativeSnapshot());
@@ -19,4 +20,5 @@ public final class TouchBridge implements TouchInput.Sink {
     public void uiPointer(long epoch, int id, int phase, float x, float y) {
         nativeUiPointer(epoch, id, phase, x, y);
     }
+    public int[] settingsExchange(int[] hostValues) { return nativeSettingsExchange(hostValues); }
 }

@@ -11,6 +11,20 @@ static_assert(InspectObbSplitEntry(kMain).main);
 static_assert(InspectObbSplitEntry(kMain).data_offset == 32843ULL);
 static_assert(InspectObbSplitEntry(kMain).size == kMainObbSize);
 
+constexpr auto kSlimMain = [] {
+    auto entry = kMain;
+    entry.compressed_size = entry.uncompressed_size = bl2_cache_payload::kMainBytes;
+    return entry;
+}();
+static_assert(InspectObbSplitEntry(kSlimMain).status == ObbSplitEntryStatus::NeedsContentVerification);
+static_assert(InspectObbSplitEntry(kSlimMain).size == bl2_cache_payload::kMainBytes);
+constexpr auto kSlimTruncated = [] {
+    auto entry = kSlimMain;
+    --entry.compressed_size;
+    return entry;
+}();
+static_assert(InspectObbSplitEntry(kSlimTruncated).status == ObbSplitEntryStatus::Rejected);
+
 constexpr ObbSplitEntryMetadata kPatch{
     "assets/patch.31.com.tt2kgames.Borderlands2.obb",
     "assets/patch.31.com.tt2kgames.Borderlands2.obb",

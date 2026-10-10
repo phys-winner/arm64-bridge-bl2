@@ -1,13 +1,23 @@
+#include "guest_software_write_watch.h"
 #include "dynarmic_host.h"
 #include "elf_loader.h"
 #include "perf_probe.h"
 #include "thunk_manager.h"
 #include "bridge_log.h"
+#include "bl2_hitch_report.h"
 #include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <chrono>
+#include <condition_variable>
+#include <pthread.h>
+#include <time.h>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <sys/system_properties.h>
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -61,6 +71,35 @@ static thread_local std::uint64_t s_ticks_remaining = 0;
 constexpr std::uint64_t kGuestSampleTickBudget = 200'000;
 constexpr std::uint64_t kGuestExitTraceTickBudget = 10'000;
 constexpr size_t kGuestExitTracePcCount = 64;
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+static thread_local Bl2PhysxCookieWatch* s_physx_cookie = nullptr;
+static thread_local bool s_physx_native_svc = false;
+struct PhysxSvcScope {
+    bool previous = s_physx_native_svc;
+    PhysxSvcScope() { s_physx_native_svc = true; }
+    ~PhysxSvcScope() { s_physx_native_svc = previous; }
+};
+struct PhysxCookieScope {
+    Bl2PhysxCookieWatch* previous = s_physx_cookie;
+    explicit PhysxCookieScope(Bl2PhysxCookieWatch* current) { s_physx_cookie = current; }
+    ~PhysxCookieScope() { s_physx_cookie = previous; }
+};
+template<class T>
+static bool ObservePhysxGuestWrite(DynarmicHost& host, uint32_t address, T value) {
+    auto* watch = s_physx_cookie;
+    const bool trip = watch && s_active_host == &host && s_active_jit == watch->owner &&
+        uint64_t{address} + sizeof(T) <= host.GetGuestMemorySize() && watch->Overlaps(address, sizeof(T)) &&
+        watch->Observe(address, sizeof(T), value, host.MemoryRead32(watch->slot));
+    if (trip && s_physx_native_svc) {
+        // MemoryWrite* may also be called by a native thunk. Its SVC boundary
+        // is an interval witness, not an IR memory instruction's precise PC.
+        watch->event.source = Bl2PhysxCookieWatch::Source::NativeCallback;
+        watch->event.pc = s_active_jit->Regs()[15] - 4;
+        watch->event.lr = s_active_jit->Regs()[14];
+    }
+    return trip;
+}
+#endif
 
 DynarmicHost::DynarmicHost() = default;
 
@@ -114,16 +153,26 @@ bool DynarmicHost::Initialize() {
         }
     }
 
+#if defined(__ANDROID__) && defined(__aarch64__)
+    char software_watch_value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.horn.software_write_watch", software_watch_value) > 0 &&
+        software_watch_value[0] == '1' &&
+        !InitializeGuestSoftwareWriteWatch(m_memory_size)) {
+        LOGE("Could not initialize software write watch; refusing requested mode");
+        return false;
+    }
+#endif
+
     if (!HeapSelfCheck()) {
         LOGE("HeapSelfCheck failed; refusing to initialize guest host");
         return false;
     }
 
     // ARM exit trap at 0x00000004: SVC 0 (0xEF000000)
-    *reinterpret_cast<uint32_t*>(m_memory + EXIT_TRAP_ARM) = 0xEF000000;
+    MemoryWrite32(EXIT_TRAP_ARM, 0xEF000000);
 
     // Thumb exit trap at 0x00000008: SVC 0 (0xDF00, 0xDF00)
-    *reinterpret_cast<uint32_t*>(m_memory + EXIT_TRAP_THUMB) = 0xDF00DF00;
+    MemoryWrite32(EXIT_TRAP_THUMB, 0xDF00DF00);
 
     LOGI("ARM kuser helpers enabled: memory_barrier=0xFFFF0FA0, cmpxchg=0xFFFF0FC0");
 
@@ -133,14 +182,15 @@ bool DynarmicHost::Initialize() {
         m_thunk_manager.reset();
         return false;
     }
+    if (fastmem) ProtectLowGuard();
 
     // Horn starts UE3GameThread from NativeCallback_Initialize and may add render,
-    // streaming and audio pthreads. Each native host thread receives two processor
-    // IDs: one normal A32 core and one synchronous nested-callback core.
+    // streaming and audio pthreads. Keep the two existing processor IDs per
+    // context; reserve one additional ID for lazy synchronous UI reentry.
     m_contexts.reserve(kMaxThreadContexts);
     m_free_context_slots.reserve(kMaxThreadContexts);
     m_context_by_thread.reserve(kMaxThreadContexts);
-    m_monitor = std::make_unique<Dynarmic::ExclusiveMonitor>(kMaxThreadContexts * 2);
+    m_monitor = std::make_unique<Dynarmic::ExclusiveMonitor>(kMaxThreadContexts * 3);
 
     if (!GetOrCreateThreadContext()) {
         LOGE("Failed to create initial per-thread Dynarmic JIT context");
@@ -151,9 +201,15 @@ bool DynarmicHost::Initialize() {
     return true;
 }
 
-std::unique_ptr<Dynarmic::A32::Jit> DynarmicHost::CreateJit(size_t processor_id) {
+std::unique_ptr<Dynarmic::A32::Jit> DynarmicHost::CreateJit(size_t processor_id
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+        , Bl2PhysxPageTable* physx_table
+#endif
+        ) {
     Dynarmic::A32::UserConfig config;
     config.callbacks = this;
+    config.write_watch = GuestSoftwareWriteWatchFlags();
+    config.write_watch_page_bits = GuestSoftwareWriteWatchPageShift();
     config.processor_id = processor_id;
     config.global_monitor = m_monitor.get();
     config.arch_version = Dynarmic::A32::ArchVersion::v7;  // guest libs are ARMv7-A + NEON
@@ -166,6 +222,20 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicHost::CreateJit(size_t processor_id)
     if (m_memory_size == GUEST_ADDRESS_SPACE) {
         config.fastmem_pointer = reinterpret_cast<uintptr_t>(m_memory);
     }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    if (physx_table) {
+        // All-NULL private table: every access uses callbacks and their software
+        // dirty publication, while the existing table fallback supplies exact PC.
+        config.fastmem_pointer = std::nullopt;
+        // The x24 software instrumentation requires page_table==nullptr.
+        // This owner instead publishes through the original callbacks.
+        config.write_watch = nullptr;
+        config.page_table = physx_table;
+        config.check_halt_on_memory_access = true;
+        config.detect_misaligned_access_via_page_table = 8 | 16 | 32 | 64;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = true;
+    }
+#endif
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }
 
@@ -258,10 +328,18 @@ DynarmicHost::ThreadContext* DynarmicHost::GetOrCreateThreadContext(
         if (still_bound == m_context_by_thread.end() || still_bound->second != context) {
             return nullptr;
         }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+        RetirePhysxCookieCore(*context);
+#endif
         m_monitor->ClearProcessor(context->primary_processor_id);
         m_monitor->ClearProcessor(context->callback_processor_id);
         context->jit->Reset();
         context->callback_jit->Reset();
+        if (context->sync_jit) {
+            m_monitor->ClearProcessor(kMaxThreadContexts * 2 + context->slot);
+            context->sync_jit->Reset();
+        }
+        context->warmed_roles = 0;
         context->deferred.clear();
         m_context_failure_logged.store(false, std::memory_order_release);
         LOGI("Reattached Dynarmic thread context %zu (stack=%u)",
@@ -294,6 +372,9 @@ DynarmicHost::ThreadContext* DynarmicHost::GetOrCreateThreadContext(
         }
         const size_t slot = m_free_context_slots[free_index];
         ThreadContext* context = m_contexts[slot].get();
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+        RetirePhysxCookieCore(*context);
+#endif
         if (!EnsureThreadStackCapacity(*context, wanted)) {
             return nullptr; // slot remains free and its previous stack remains valid
         }
@@ -301,8 +382,13 @@ DynarmicHost::ThreadContext* DynarmicHost::GetOrCreateThreadContext(
         m_monitor->ClearProcessor(context->callback_processor_id);
         context->jit->Reset();
         context->callback_jit->Reset();
+        if (context->sync_jit) {
+            m_monitor->ClearProcessor(kMaxThreadContexts * 2 + context->slot);
+            context->sync_jit->Reset();
+        }
         context->is_running_jit = false;
         context->is_running_callback_jit = false;
+        context->warmed_roles = 0;
         context->deferred.clear();
         auto inserted = m_context_by_thread.emplace(thread_id, context);
         if (!inserted.second) return nullptr;
@@ -339,7 +425,7 @@ DynarmicHost::ThreadContext* DynarmicHost::GetOrCreateThreadContext(
             GuestFree(context->stack_base);
             return nullptr;
         }
-        // Both JIT pointers become immutable before the context is published. This
+        // Both JIT pointers are immutable in ordinary mode after publication. This
         // lets InvalidateGuestCode safely wake a foreign long-running core without
         // racing lazy callback-core construction.
         context->callback_jit = CreateJit(context->callback_processor_id);
@@ -410,6 +496,10 @@ void DynarmicHost::ReleaseCurrentThreadContext() {
     m_monitor->ClearProcessor(context->callback_processor_id);
     context->jit->Reset();
     context->callback_jit->Reset();
+    if (context->sync_jit) {
+        m_monitor->ClearProcessor(kMaxThreadContexts * 2 + context->slot);
+        context->sync_jit->Reset();
+    }
     context->deferred.clear();
     m_context_by_thread.erase(it);
     m_free_context_slots.push_back(context->slot);
@@ -422,6 +512,7 @@ void DynarmicHost::HaltCurrentThreadExecution(Dynarmic::HaltReason reason) {
     std::lock_guard<std::recursive_mutex> lock(context->mutex);
     context->jit->HaltExecution(reason);
     context->callback_jit->HaltExecution(reason);
+    if (context->sync_jit) context->sync_jit->HaltExecution(reason);
 }
 
 bool DynarmicHost::IsJitRunning() const {
@@ -669,6 +760,387 @@ uint32_t DynarmicHost::RunFunction(uint32_t target_pc, const std::vector<uint32_
     return static_cast<uint32_t>(RunFunction64(target_pc, args));
 }
 
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+namespace {
+constexpr uint32_t kPhysxEntry = 0x42573280;
+constexpr uint32_t kPhysxExit = kPhysxEntry + 0x418;
+constexpr uint32_t kPhysxThread = 0x424AA9E8;
+constexpr uint32_t kPhysxGuardGot = 0x42F366E8;
+}
+
+bool DynarmicHost::InstallPhysxCookieWatch(bool verified_original) {
+    if (m_physx_cookie_installed) return true;
+#if defined(__ANDROID__)
+    char enabled[PROP_VALUE_MAX]{};
+    if (__system_property_get("debug.bl2.physx_cookie_watch", enabled) != 1 || enabled[0] != '1')
+        return false;
+#else
+    return false;
+#endif
+    // The caller supplies the existing full-file SHA verification result and
+    // calls at quiescent startup, before JNI_OnLoad/guest worker entry.
+    if (!verified_original || !m_elf_loader || !m_thunk_manager || IsJitRunning() ||
+        m_elf_loader->GetBaseAddress() != 0x40000000 ||
+        FindSymbol("_ZN7PxScene15generateIslandsEb") != kPhysxEntry ||
+        FindSymbol("_Z13NxThreadStartPv") != kPhysxThread ||
+        !m_elf_loader->IsReadOnlyRange(kPhysxEntry, 0x5E8) ||
+        MemoryRead32(kPhysxEntry) != 0xE59F35B8 ||
+        MemoryRead32(kPhysxExit) != 0xE24BD020 ||
+        MemoryRead32(kPhysxExit + 4) != 0xE8BD8FF0 ||
+        MemoryRead32(kPhysxEntry + 0x5C0) != 0xFFFFC9E8 ||
+        MemoryRead32(kPhysxEntry + 0x5C4) != 0x009C6A5C) return false;
+    auto& thunks = *m_thunk_manager;
+    const uint32_t entry_stub = thunks.RegisterThunk("__bl2_physx_cookie_entry",
+        [this](Dynarmic::A32::Jit& jit, DynarmicHost&) { PhysxCookieEntry(jit); });
+    const uint32_t exit_stub = thunks.RegisterThunk("__bl2_physx_cookie_exit",
+        [this](Dynarmic::A32::Jit& jit, DynarmicHost&) { PhysxCookieExit(jit); });
+    if (!entry_stub || !exit_stub) return false;
+    const uint32_t entry_svc = MemoryRead32(entry_stub), exit_svc = MemoryRead32(exit_stub);
+    if ((entry_svc & 0xFF000000) != 0xEF000000 || !(entry_svc & 0x00FFFFFF) ||
+        (exit_svc & 0xFF000000) != 0xEF000000 || !(exit_svc & 0x00FFFFFF)) return false;
+    // Only one original instruction is replaced at each site. Original PUSH,
+    // comparison, failure path, POP and saved LR remain guest instructions.
+    MemoryWrite32(kPhysxEntry, entry_svc);
+    MemoryWrite32(kPhysxExit, exit_svc);
+    InvalidateGuestCode(kPhysxEntry, 4);
+    InvalidateGuestCode(kPhysxExit, 4);
+    m_physx_cookie_installed = true;
+    LOGI("PhysX cookie watch installed; NxThreadStart primary only, all-NULL private table; "
+         "foreign cores and unguarded native/CAS writes remain uncovered");
+    return true;
+}
+
+void DynarmicHost::PreparePhysxCookieCore(ThreadContext& context, uint32_t target_pc) {
+    // RunFunction64 holds this owner's mutex before marking either core active.
+    if (!m_physx_cookie_installed || target_pc != kPhysxThread || context.physx_table ||
+        context.is_running_jit || context.is_running_callback_jit) return;
+    try {
+        auto table = std::make_unique<Bl2PhysxPageTable>(); // all entries NULL, never mutated
+        auto replacement = CreateJit(context.primary_processor_id, table.get());
+        replacement->Regs() = context.jit->Regs();
+        replacement->ExtRegs() = context.jit->ExtRegs();
+        replacement->SetCpsr(context.jit->Cpsr());
+        replacement->SetFpscr(context.jit->Fpscr());
+        // Foreign InvalidateGuestCode also holds this lock when visiting Jits.
+        std::lock_guard<std::mutex> contexts_lock(m_contexts_mutex);
+        m_monitor->ClearProcessor(context.primary_processor_id);
+        context.jit = std::move(replacement);
+        context.physx_table = std::move(table);
+        auto& watch = context.physx_cookie;
+        watch = {};
+        watch.owner = context.jit.get();
+        watch.context_slot = context.slot;
+        watch.stack_low = context.stack_base;
+        watch.stack_top = context.stack_top;
+        LOGI("PhysX cookie owner context=%zu stack=%08X..%08X; callback core unchanged",
+             context.slot, watch.stack_low, watch.stack_top);
+    } catch (...) {
+        LOGE("PhysX cookie owner unavailable context=%zu; ordinary core retained, no coverage",
+             context.slot);
+    }
+}
+
+void DynarmicHost::RetirePhysxCookieCore(ThreadContext& context) {
+    if (!context.physx_table) return;
+    // Caller holds owner and collection locks (or owns a free, unpublished
+    // context). Destroy the old Jit while its immutable table is still alive.
+    auto replacement = CreateJit(context.primary_processor_id);
+    context.jit = std::move(replacement);
+    context.physx_table.reset();
+    context.physx_cookie = {};
+}
+
+void DynarmicHost::PhysxCookieEntry(Dynarmic::A32::Jit& jit) {
+    auto& regs = jit.Regs();
+    regs[3] = MemoryRead32(kPhysxEntry + 0x5C0); // exact original LDR r3 literal
+    auto* watch = s_physx_cookie;
+    if (!watch || watch->owner != &jit || s_active_host != this) return;
+    const uint32_t sp = regs[13];
+    const uint32_t got = kPhysxEntry + 0x24 + MemoryRead32(kPhysxEntry + 0x5C4);
+    const uint32_t got_slot = got + regs[3];
+    if (got_slot != kPhysxGuardGot || uint64_t{got_slot} + 4 > m_memory_size ||
+        sp < 44 || sp > watch->stack_top || sp - 44 < watch->stack_low) {
+        LOGE("PhysX cookie entry outside pinned guard/owner stack; no arm SP=%08X", sp);
+        return;
+    }
+    const uint32_t guard_pointer = MemoryRead32(got_slot);
+    if (uint64_t{guard_pointer} + 4 > m_memory_size) {
+        LOGE("PhysX cookie guard pointer outside guest memory; no arm ptr=%08X", guard_pointer);
+        return;
+    }
+    if (!watch->Arm(sp - 44, MemoryRead32(guard_pointer))) {
+        if (watch->Trip(Bl2PhysxCookieWatch::Cause::Reentry,
+                        Bl2PhysxCookieWatch::Source::Observation, watch->slot, 4, 0,
+                        MemoryRead32(watch->slot), MemoryRead32(watch->slot)))
+            watch->event.pc = kPhysxEntry;
+        jit.HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+        return;
+    }
+    watch->entry_sp = sp;
+    watch->guard_pointer = guard_pointer;
+    watch->scene = regs[0];
+    if (watch->sequence == 1) {
+        LOGI("PhysX cookie first arm context=%zu owner=%p entry_sp=%08X slot=%08X guard_ptr=%08X guard=%08X scene=%08X",
+             watch->context_slot, static_cast<void*>(&jit), sp, watch->slot,
+             guard_pointer, watch->expected, watch->scene);
+    }
+}
+
+void DynarmicHost::PhysxCookieExit(Dynarmic::A32::Jit& jit) {
+    jit.Regs()[13] = jit.Regs()[11] - 32; // exact original SUB sp,fp,#32, no flags
+    auto* watch = s_physx_cookie;
+    if (!watch || watch->owner != &jit || s_active_host != this) return;
+    if (watch->phase == Bl2PhysxCookieWatch::Phase::Idle) return; // unarmed/out-of-range entry
+    const uint32_t cookie = MemoryRead32(watch->slot);
+    if (!watch->Disarm(cookie)) {
+        watch->event.pc = kPhysxExit;
+        jit.HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+    } else if (watch->successful_exits == 1) {
+        LOGI("PhysX cookie first disarm context=%zu owner=%p slot=%08X sequence=%llu initial_stores=%u overlaps=%u cookie=%08X",
+             watch->context_slot, static_cast<void*>(&jit), watch->slot,
+             static_cast<unsigned long long>(watch->sequence), watch->initial_stores,
+             watch->overlaps, cookie);
+    }
+}
+
+Bl2PhysxCookieWatch::NativeToken DynarmicHost::BeginPhysxNativeWrite(uint32_t address, size_t bytes) {
+    auto* watch = s_physx_cookie;
+    if (!watch || !s_active_host || s_active_jit != watch->owner ||
+        watch->phase != Bl2PhysxCookieWatch::Phase::Initialized || !watch->Overlaps(address, bytes) ||
+        uint64_t{address} > s_active_host->m_memory_size ||
+        bytes > s_active_host->m_memory_size - address) return {};
+    return {watch, watch->sequence, watch->slot, s_active_host->MemoryRead32(watch->slot),
+            address, s_active_jit->Regs()[15] - 4, s_active_jit->Regs()[14], bytes};
+}
+
+void DynarmicHost::EndPhysxNativeWrite(const Bl2PhysxCookieWatch::NativeToken& token) {
+    auto* watch = token.watch;
+    if (!watch || watch != s_physx_cookie || !s_active_host || s_active_jit != watch->owner ||
+        token.sequence != watch->sequence || token.slot != watch->slot ||
+        watch->phase != Bl2PhysxCookieWatch::Phase::Initialized) return;
+    const uint32_t after = s_active_host->MemoryRead32(token.slot);
+    if (token.before == watch->expected && after == watch->expected) return;
+    if (watch->Trip(token.before != watch->expected ? Bl2PhysxCookieWatch::Cause::AlreadyCorrupt :
+                    Bl2PhysxCookieWatch::Cause::Writer, Bl2PhysxCookieWatch::Source::NativeInterval,
+                    token.address, static_cast<uint32_t>(std::min<size_t>(token.bytes, UINT32_MAX)),
+                    0, token.before, after)) {
+        watch->event.pc = token.pc;
+        watch->event.lr = token.lr;
+        s_active_jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+    }
+}
+
+void DynarmicHost::ReportPhysxCookie(Dynarmic::A32::Jit& jit) {
+    auto* watch = s_physx_cookie;
+    if (!watch || watch->owner != &jit || watch->phase != Bl2PhysxCookieWatch::Phase::Tripped ||
+        watch->reported) return;
+    watch->reported = true;
+    auto& event = watch->event;
+    const bool precise_access = event.source == Bl2PhysxCookieWatch::Source::GuestStore;
+    if (precise_access) event.pc = jit.Regs()[15]; // existing IR MemoryAbort current_location
+    // Other aborted guest registers can be stale after GetSetElimination.
+    // Only entry metadata, memory and the emitter's explicit abort PC are used.
+    LOGE("PHYSX_COOKIE cause=%u source=%u precise_access=%u context=%zu slot=%08X "
+         "entry_sp=%08X scene=%08X guard_got=%08X guard_ptr=%08X entry_guard=%08X current_guard=%08X "
+         "PC=%08X native_LR=%08X instruction=%08X address=%08X bytes=%u value=%016llX "
+         "before=%08X predicted_after=%08X current_cookie=%08X initial_stores=%u overlaps=%u",
+         static_cast<unsigned>(event.cause), static_cast<unsigned>(event.source), static_cast<unsigned>(precise_access),
+         watch->context_slot, watch->slot, watch->entry_sp, watch->scene, kPhysxGuardGot,
+         watch->guard_pointer, watch->expected, MemoryRead32(watch->guard_pointer),
+         event.pc, event.lr, MemoryRead32(event.pc), event.address, event.bytes,
+         static_cast<unsigned long long>(event.value), event.before, event.after,
+         MemoryRead32(watch->slot), watch->initial_stores, watch->overlaps);
+}
+#endif
+
+
+bool DynarmicHost::InstallJitWarmupTable(std::span<const uint8_t> bytes) {
+#if defined(__ANDROID__)
+    char enabled[PROP_VALUE_MAX]{};
+    if (__system_property_get("debug.bl2.jit_warmup", enabled) > 0 && enabled[0] == '0')
+        return false;
+#endif
+    if (!m_elf_loader || m_elf_loader->GetBaseAddress() != 0x40000000 ||
+        !m_jit_warmup.Parse(bytes, [this](uint32_t pc) {
+            return m_elf_loader->IsReadOnlyRange(pc, 4);
+        })) return false;
+    m_warm_native_render = FindSymbol("_Z21NativeCallback_RenderPv");
+    m_warm_thread_proc = FindSymbol("_ZN22FRunnableThreadAndroid11_ThreadProcEPv");
+    const uint32_t vtable = FindSymbol("_ZTV16FRenderingThread");
+    m_warm_render_vtable = vtable && vtable <= UINT32_MAX - 8 ? vtable + 8 : 0;
+    LOGI("JIT warmup catalog ready main=%zu callback=%zu renderer=%zu",
+         m_jit_warmup.PCs(Bl2JitWarmup::Main).size(),
+         m_jit_warmup.PCs(Bl2JitWarmup::Callback).size(),
+         m_jit_warmup.PCs(Bl2JitWarmup::Renderer).size());
+    return m_warm_native_render != 0;
+}
+
+namespace {
+// Learned warmup state of the current guest thread: its warmed cores by role,
+// and how far the role's loaded list has been translated.
+thread_local std::array<Dynarmic::A32::Jit*, bl2::jit::kRoleCount> s_learn_jits{};
+thread_local std::array<size_t, bl2::jit::kRoleCount> s_learn_cursor{};
+thread_local std::array<bool, bl2::jit::kRoleCount> s_learn_exhausted{};
+// Runtime translations must always fit: warm only while this much is free.
+constexpr size_t kLearnedMinFreeCode = 32u * 1024u * 1024u;
+constexpr uint64_t kLearnedEntryBudgetNs = 150'000'000;
+// The saver thread writes every 45 s and on request (onPause): the UI thread
+// never writes and fsyncs the multi-megabyte list itself.
+std::mutex s_learn_save_mutex;
+std::condition_variable s_learn_save_cv;
+bool s_learn_save_requested = false;
+
+uint64_t LearnedNowNs() {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ull +
+           static_cast<uint64_t>(now.tv_nsec);
+}
+
+void OnBlockEmitted(std::uint64_t descriptor) {
+    Bl2HitchCountJitBlock();
+    DynarmicHost* const host = s_active_host;
+    Dynarmic::A32::Jit* const jit = s_active_jit;
+    if (!host || !jit) return;
+    for (size_t role = 0; role < s_learn_jits.size(); ++role) {
+        if (s_learn_jits[role] == jit) {
+            host->RecordLearnedBlock(role, descriptor);
+            return;
+        }
+    }
+}
+}  // namespace
+
+void DynarmicHost::LoadLearnedJitProfile(const std::string& directory) {
+    // The observer also feeds the frame black box when learning is disabled.
+    Dynarmic::A32::Jit::SetBlockEmittedHook(&OnBlockEmitted);
+#if defined(__ANDROID__)
+    char enabled[PROP_VALUE_MAX]{};
+    if (__system_property_get("debug.bl2.jit_learn", enabled) > 0 && enabled[0] == '0')
+        return;
+#endif
+    if (m_learned_jit || directory.empty() || !m_elf_loader ||
+        m_elf_loader->GetBaseAddress() != 0x40000000) return;
+    auto* profile = new bl2::jit::LearnedProfile;
+    ElfLoader* const loader = m_elf_loader.get();
+    profile->Load(directory + "/bl2_jit_learned.bin", Bl2JitWarmup::kGuestBytes,
+                  Bl2JitWarmup::kGuestSha,
+                  [loader](uint32_t pc) { return loader->IsReadOnlyRange(pc, 4); });
+    m_learned_jit = profile;
+    __android_log_print(ANDROID_LOG_INFO, "BL2JitLearn", "profile main=%zu callback=%zu renderer=%zu",
+         profile->Loaded(bl2::jit::kMain).size(), profile->Loaded(bl2::jit::kCallback).size(),
+         profile->Loaded(bl2::jit::kRenderer).size());
+    // Periodic persistence off the game threads; onPause requests one more.
+    std::thread([profile] {
+        pthread_setname_np(pthread_self(), "BL2JitLearn");
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(s_learn_save_mutex);
+                s_learn_save_cv.wait_for(lock, std::chrono::seconds(45),
+                                         [] { return s_learn_save_requested; });
+                s_learn_save_requested = false;
+            }
+            profile->Save();
+        }
+    }).detach();
+}
+
+void DynarmicHost::RequestLearnedJitSave() {
+    if (!m_learned_jit) return;
+    {
+        std::lock_guard<std::mutex> lock(s_learn_save_mutex);
+        s_learn_save_requested = true;
+    }
+    s_learn_save_cv.notify_one();
+}
+
+void DynarmicHost::RecordLearnedBlock(size_t role, uint64_t descriptor) {
+    if (m_learned_jit && role < bl2::jit::kRoleCount)
+        m_learned_jit->Record(static_cast<bl2::jit::Role>(role), descriptor);
+}
+
+void DynarmicHost::WarmLearnedAtEntry(Dynarmic::A32::Jit& jit, size_t role) {
+    s_learn_jits[role] = &jit;
+    if (!m_learned_jit) return;
+    const auto& list = m_learned_jit->Loaded(static_cast<bl2::jit::Role>(role));
+    const uint64_t deadline = LearnedNowNs() + kLearnedEntryBudgetNs;
+    size_t& cursor = s_learn_cursor[role];
+    const size_t first = cursor;
+    try {
+        while (cursor < list.size()) {
+            if (!jit.Precompile(list[cursor])) break;
+            ++cursor;
+            if ((cursor & 15u) == 0 && LearnedNowNs() >= deadline) break;
+        }
+    } catch (...) {
+        s_learn_exhausted[role] = true;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "BL2JitLearn", "entry role=%zu compiled=%zu/%zu",
+                        role, cursor - first, list.size());
+}
+
+void DynarmicHost::WarmLearnedBlocksInCallback(Dynarmic::A32::Jit& jit, uint64_t budget_ns) {
+    if (!m_learned_jit || !budget_ns) return;
+    size_t role = 0;
+    while (role < s_learn_jits.size() && s_learn_jits[role] != &jit) ++role;
+    if (role == s_learn_jits.size() || s_learn_exhausted[role]) return;
+    const auto& list = m_learned_jit->Loaded(static_cast<bl2::jit::Role>(role));
+    size_t& cursor = s_learn_cursor[role];
+    if (cursor >= list.size()) return;
+    const uint64_t deadline = LearnedNowNs() + budget_ns;
+    try {
+        while (cursor < list.size()) {
+            if (!jit.PrecompileInCallback(list[cursor], kLearnedMinFreeCode)) {
+                s_learn_exhausted[role] = true;
+                break;
+            }
+            ++cursor;
+            if ((cursor & 7u) == 0 && LearnedNowNs() >= deadline) break;
+        }
+    } catch (...) {
+        s_learn_exhausted[role] = true;
+    }
+    if (cursor >= list.size() || s_learn_exhausted[role])
+        __android_log_print(ANDROID_LOG_INFO, "BL2JitLearn", "idle role=%zu done=%zu/%zu exhausted=%d",
+             role, cursor, list.size(), s_learn_exhausted[role]);
+}
+
+void DynarmicHost::WarmupForEntry(ThreadContext& context, uint32_t target_pc,
+                                const std::vector<uint32_t>& args) {
+    // The caller holds the owner context lock, before either core enters Run.
+    if (context.is_running_jit || context.is_running_callback_jit) return;
+    auto warm = [&](Dynarmic::A32::Jit& jit, Bl2JitWarmup::Role role) {
+        const uint8_t bit = uint8_t{1} << role;
+        if (context.warmed_roles & bit) return;
+        context.warmed_roles |= bit;
+        size_t compiled = 0;
+        try {
+            for (uint32_t pc : m_jit_warmup.PCs(role)) {
+                if (!jit.Precompile(pc)) break;
+                ++compiled;
+            }
+        } catch (...) {
+            LOGE("JIT warmup role=%zu interrupted after=%zu; retaining ordinary misses",
+                 static_cast<size_t>(role), compiled);
+        }
+        LOGI("JIT warmup role=%zu compiled=%zu/%zu",
+             static_cast<size_t>(role), compiled, m_jit_warmup.PCs(role).size());
+        WarmLearnedAtEntry(jit, static_cast<size_t>(role));
+    };
+    if (m_warm_native_render && target_pc == m_warm_native_render) {
+        warm(*context.jit, Bl2JitWarmup::Main);
+        warm(*context.callback_jit, Bl2JitWarmup::Callback);
+    } else if (m_warm_thread_proc && target_pc == m_warm_thread_proc &&
+               m_warm_render_vtable && !args.empty() && args[0] &&
+               uint64_t{args[0]} + 0x10 <= m_memory_size) {
+        // _ThreadProc serves streaming/audio workers too. Its Runnable is +0xC.
+        const uint32_t runnable = MemoryRead32(args[0] + 0xC);
+        if (runnable && uint64_t{runnable} + 4 <= m_memory_size &&
+            MemoryRead32(runnable) == m_warm_render_vtable)
+            warm(*context.jit, Bl2JitWarmup::Renderer);
+    }
+}
+
 uint64_t DynarmicHost::RunFunction64(uint32_t target_pc, const std::vector<uint32_t>& args) {
     ThreadContext* context = GetOrCreateThreadContext();
     if (!context || !context->jit) return 0;
@@ -681,6 +1153,12 @@ uint64_t DynarmicHost::RunFunction64(uint32_t target_pc, const std::vector<uint3
         return RunGuestCallback64(target_pc, args);
     }
 
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    if (context->physx_cookie.phase == Bl2PhysxCookieWatch::Phase::Tripped) return 0;
+    PreparePhysxCookieCore(*context, target_pc);
+    PhysxCookieScope cookie_scope(context->physx_table ? &context->physx_cookie : nullptr);
+#endif
+    WarmupForEntry(*context, target_pc, args);
     context->is_running_jit = true;
     struct JitRunningGuard {
         bool& flag;
@@ -718,13 +1196,79 @@ uint64_t DynarmicHost::RunGuestCallback64(uint32_t target_pc,
         bool& flag;
         ~CallbackGuard() { flag = false; }
     } callback_guard{context->is_running_callback_jit};
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    // The callback core remains an explicitly uncovered core.
+    PhysxCookieScope cookie_scope(nullptr);
+#endif
     return ExecuteFunction(*context->callback_jit, target_pc, args,
                            context->callback_stack_top, kCallbackStackSize);
 }
 
+bool DynarmicHost::CallGuest(uint32_t target_pc, const std::vector<uint32_t>& args, uint32_t& result) {
+    ThreadContext* context = GetOrCreateThreadContext();
+    if (!context || !context->jit || !context->callback_jit || !target_pc || args.size() > 7) return false;
+    std::lock_guard<std::recursive_mutex> lock(context->mutex);
+    if (s_active_host != this || !s_active_jit) return false;
+    Dynarmic::A32::Jit* selected = nullptr;
+    bool* running = nullptr;
+    uint32_t stack_top = 0;
+    if (context->is_running_jit && s_active_jit == context->jit.get() && !context->is_running_callback_jit) {
+        selected = context->callback_jit.get(); running = &context->is_running_callback_jit;
+        stack_top = context->callback_stack_top;
+    } else if (context->is_running_callback_jit && s_active_jit == context->callback_jit.get() && !context->is_running_sync_jit) {
+        // A callback can itself hit a reviewed UI hook. Its required return
+        // uses one separate core/stack; neither suspended JIT is re-entered.
+        if (!context->sync_jit) {
+            const uint32_t stack = GuestAlloc(kCallbackStackSize,16);
+            if (!stack || uint64_t{stack} + kCallbackStackSize > m_memory_size ||
+                uint64_t{stack} + kCallbackStackSize > UINT32_MAX) {
+                if (stack) GuestFree(stack);
+                return false;
+            }
+            std::unique_ptr<Dynarmic::A32::Jit> sync;
+            try { sync = CreateJit(kMaxThreadContexts * 2 + context->slot); }
+            catch (...) { GuestFree(stack); throw; }
+            if (!sync) { GuestFree(stack); return false; }
+            // InvalidateGuestCode takes this same lock: publication cannot
+            // race a foreign cache invalidation or expose a half-built core.
+            std::lock_guard<std::mutex> publish(m_contexts_mutex);
+            context->sync_stack_top = stack + kCallbackStackSize;
+            context->sync_jit = std::move(sync);
+        }
+        selected = context->sync_jit.get(); running = &context->is_running_sync_jit;
+        stack_top = context->sync_stack_top;
+    } else return false; // Unsupported depth fails before execution, never defers.
+    auto& jit = *selected;
+    const auto regs = jit.Regs();
+    const auto ext = jit.ExtRegs();
+    const auto cpsr = jit.Cpsr(), fpscr = jit.Fpscr();
+    struct CallbackState {
+        Dynarmic::A32::Jit& jit;
+        const std::array<uint32_t,16>& regs;
+        const std::array<uint32_t,64>& ext;
+        uint32_t cpsr, fpscr;
+        bool& running;
+        ~CallbackState() {
+            jit.Regs() = regs; jit.ExtRegs() = ext;
+            jit.SetCpsr(cpsr); jit.SetFpscr(fpscr); running = false;
+        }
+    } restore{jit,regs,ext,cpsr,fpscr,*running};
+    jit.SetCpsr(s_active_jit->Cpsr());
+    jit.SetFpscr(s_active_jit->Fpscr());
+    *running = true;
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    PhysxCookieScope cookie_scope(nullptr);
+#endif
+    bool returned = false;
+    const auto value = ExecuteFunction(jit,target_pc,args,stack_top,kCallbackStackSize,&returned);
+    if (returned) result = static_cast<uint32_t>(value);
+    return returned;
+}
+
 uint64_t DynarmicHost::ExecuteFunction(Dynarmic::A32::Jit& jit, uint32_t target_pc,
                                        const std::vector<uint32_t>& args,
-                                       uint32_t stack_top, uint32_t stack_capacity) {
+                                       uint32_t stack_top, uint32_t stack_capacity, bool* returned) {
+    if (returned) *returned = false;
     Dynarmic::A32::Jit* previous_active_jit = s_active_jit;
     DynarmicHost* previous_active_host = s_active_host;
     s_active_jit = &jit;
@@ -813,7 +1357,7 @@ uint64_t DynarmicHost::ExecuteFunction(Dynarmic::A32::Jit& jit, uint32_t target_
         const uint32_t sp = stack_top - static_cast<uint32_t>(stack_bytes);
         jit.Regs()[13] = sp;
         for (size_t i = 0; i < extra_args; ++i) {
-            *reinterpret_cast<uint32_t*>(m_memory + sp + i * 4) = args[4 + i];
+            MemoryWrite32(sp + static_cast<uint32_t>(i * 4), args[4 + i]);
         }
     }
 
@@ -963,6 +1507,9 @@ uint64_t DynarmicHost::ExecuteFunction(Dynarmic::A32::Jit& jit, uint32_t target_
         }
         break;
     }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    ReportPhysxCookie(jit); // MemoryAbort is never resumed; preserve its first event.
+#endif
     uint32_t final_pc = jit.Regs()[15];
     const bool expected_thread_exit = Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2);
     if (trace_guest_exit) {
@@ -1005,10 +1552,22 @@ uint64_t DynarmicHost::ExecuteFunction(Dynarmic::A32::Jit& jit, uint32_t target_
     if (guest_exception || (!expected_thread_exit &&
         final_pc != EXIT_TRAP_ARM && final_pc != (EXIT_TRAP_ARM + 4) &&
         final_pc != (EXIT_TRAP_THUMB & ~1u) && final_pc != ((EXIT_TRAP_THUMB & ~1u) + 2))) {
+#if defined(__ANDROID__)
+        static std::atomic<unsigned> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+                "Guest halt target=%08X reason=%X PC=%08X LR=%08X SP=%08X CPSR=%08X R0=%08X R1=%08X",
+                target_pc, static_cast<unsigned>(hr), final_pc, jit.Regs()[14],
+                jit.Regs()[13], jit.Cpsr(), jit.Regs()[0], jit.Regs()[1]);
+#endif
         LOGI("RunFunction(0x%08X) unexpected halt with reason=0x%X, PC=0x%08X, LR=0x%08X, R0=0x%08X, SP=0x%08X",
              target_pc, static_cast<unsigned>(hr), final_pc, jit.Regs()[14], jit.Regs()[0], jit.Regs()[13]);
     }
 
+    if (returned) *returned = !expected_thread_exit && !guest_exception &&
+        hr == Dynarmic::HaltReason::UserDefined1 &&
+        (final_pc == EXIT_TRAP_ARM || final_pc == EXIT_TRAP_ARM + 4 ||
+         final_pc == EXIT_TRAP_THUMB || final_pc == EXIT_TRAP_THUMB + 2);
     return (static_cast<uint64_t>(jit.Regs()[1]) << 32) | jit.Regs()[0];
 }
 
@@ -1016,12 +1575,13 @@ void DynarmicHost::InvalidateGuestCode(uint32_t addr, size_t size) {
     if (size == 0) return;
     // Dynarmic's invalidation API is cross-thread aware: it queues the range,
     // atomically raises CacheInvalidation and wakes a core already in Run().
-    // Context/JIT pointers never change after publication, and the collection
-    // lock prevents teardown or publication while we visit every core.
+    // The collection lock prevents teardown, publication, or optional
+    // diagnostic idle-core replacement while we visit every core.
     std::lock_guard<std::mutex> contexts_lock(m_contexts_mutex);
     for (const auto& context : m_contexts) {
         context->jit->InvalidateCacheRange(addr, size);
         context->callback_jit->InvalidateCacheRange(addr, size);
+        if (context->sync_jit) context->sync_jit->InvalidateCacheRange(addr, size);
     }
 }
 
@@ -1079,7 +1639,12 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
 
     uint32_t base = 0, capacity = 0;
     bool recycled = false;
-    if (need <= kMaxClassSize) {
+    // BL2: blocks above the largest class come from the coalescing large range;
+    // the shared heap below stays the fallback when that range is exhausted.
+    const bool large = need > kMaxClassSize && m_large_enabled.load(std::memory_order_acquire) &&
+                       LargeAlloc(rounded_need, base, capacity, recycled);
+    if (large) {
+    } else if (need <= kMaxClassSize) {
         int cls = 0;
         while ((1u << (cls + kMinClassShift)) < need) ++cls;
         capacity = 1u << (cls + kMinClassShift);
@@ -1101,7 +1666,7 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
             }
         }
     }
-    if (!recycled) {
+    if (!large && !recycled) {
         std::lock_guard<std::mutex> lock(m_free_huge_mutex);
         auto fit = m_free_huge.end();
         // ponytail: scan reusable spans on an exact-class miss; order the map only if this scan becomes measurable.
@@ -1119,7 +1684,7 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
             recycled = true;
         }
     }
-    if (!recycled) {
+    if (!large && !recycled) {
         // Lock-free bump allocation. Free-list reuse remains synchronized per
         // size class, while fresh allocations from unrelated guest threads no
         // longer contend on one process-wide mutex.
@@ -1157,6 +1722,17 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
                          static_cast<unsigned long long>(free_huge),
                          static_cast<unsigned long long>(reserved > free_bytes ? reserved - free_bytes : 0),
                          fit_count, static_cast<unsigned long long>(fit_bytes), largest_huge);
+#if defined(__ANDROID__)
+                    __android_log_print(ANDROID_LOG_ERROR, "BL2GuestHeap",
+                        "snapshot reserved=%lluMiB free_small=%lluMiB free_huge=%lluMiB "
+                        "largest_huge=%uKiB huge_fit=%zu map_used=%lluMiB",
+                        static_cast<unsigned long long>(reserved >> 20),
+                        static_cast<unsigned long long>(free_small >> 20),
+                        static_cast<unsigned long long>(free_huge >> 20), largest_huge >> 10,
+                        fit_count,
+                        static_cast<unsigned long long>(
+                            (m_map_current.load(std::memory_order_relaxed) - kMapBase) >> 20));
+#endif
                     if (s_active_jit) {
                         const auto& registers = s_active_jit->Regs();
                         LOGE("Guest heap failure args r0..r3={%08X,%08X,%08X,%08X}",
@@ -1176,6 +1752,14 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
                 LOGE("GuestAlloc out of guest heap: at 0x%08X, want %u, limit 0x%08X caller_rva=0x%llX guest_pc=0x%08X guest_lr=0x%08X",
                      current, capacity, kHeapLimit,
                      static_cast<unsigned long long>(caller_rva), guest_pc, guest_lr);
+#if defined(__ANDROID__)
+                // Quiet builds too: a NULL here becomes a NULL-based guest copy.
+                static std::atomic<uint32_t> oom_reports{0};
+                if (oom_reports.fetch_add(1, std::memory_order_relaxed) < 16)
+                    __android_log_print(ANDROID_LOG_ERROR, "BL2GuestHeap",
+                        "out of guest heap: want %u at 0x%08X (limit 0x%08X) guest_pc=%08X guest_lr=%08X",
+                        capacity, current, kHeapLimit, guest_pc, guest_lr);
+#endif
                 return 0;
             }
             if (m_heap_current.compare_exchange_weak(
@@ -1194,12 +1778,14 @@ uint32_t DynarmicHost::GuestAlloc(size_t size, size_t alignment) {
         // that would break in confusing ways the first time it saw a recycled
         // block. Cheap insurance at the observed churn.
         memset(m_memory + payload, 0, size);
+        NotifyGuestMemoryWritten(payload, size);
     }
     MemoryWrite32(payload - 12, base);
     MemoryWrite32(payload - 8, capacity);
     MemoryWrite32(payload - 4, static_cast<uint32_t>(size));
     __atomic_store_n(reinterpret_cast<uint32_t*>(m_memory + payload - 16),
                      kBlockMagic, __ATOMIC_RELEASE);
+    NotifyGuestMemoryWritten(payload - 16, sizeof(uint32_t));
     return payload;
 }
 
@@ -1212,9 +1798,14 @@ void DynarmicHost::GuestFree(uint32_t addr) {
             kFreedMagic, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         return; // foreign pointer, already freed, or a concurrent double free
     }
+    NotifyGuestMemoryWritten(addr - 16, sizeof(uint32_t));
     uint32_t base = MemoryRead32(addr - 12);
     uint32_t capacity = MemoryRead32(addr - 8);
 
+    if (base >= kLargeBase && base < kLargeLimit) {
+        LargeFree(base, capacity);
+        return;
+    }
     if (capacity <= kMaxClassSize) {
         int cls = 0;
         while ((1u << (cls + kMinClassShift)) < capacity) ++cls;
@@ -1225,6 +1816,89 @@ void DynarmicHost::GuestFree(uint32_t addr) {
         std::lock_guard<std::mutex> lk(m_free_huge_mutex);
         m_free_huge[capacity].push_back(base);
     }
+}
+
+bool DynarmicHost::LargeAlloc(uint64_t need, uint32_t& base, uint32_t& capacity, bool& dirty) {
+    const uint64_t bytes = (need + kLargeGranule - 1) & ~uint64_t{kLargeGranule - 1};
+    if (bytes > kLargeLimit - kLargeBase) return false;
+    std::lock_guard<std::mutex> lock(m_large_mutex);
+    // Best fit over coalesced spans; ties keep the lowest address.
+    auto fit = m_large_free.end();
+    for (auto it = m_large_free.begin(); it != m_large_free.end(); ++it)
+        if (it->second >= bytes && (fit == m_large_free.end() || it->second < fit->second)) fit = it;
+    if (fit != m_large_free.end()) {
+        base = fit->first;
+        const uint32_t rest = fit->second - static_cast<uint32_t>(bytes);
+        m_large_free.erase(fit);
+        if (rest) m_large_free.emplace(base + static_cast<uint32_t>(bytes), rest);
+        capacity = static_cast<uint32_t>(bytes);
+        dirty = true;
+        return true;
+    }
+    if (uint64_t{m_large_top} + bytes > kLargeLimit) {
+#if defined(__ANDROID__)
+        static std::atomic<uint32_t> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+            __android_log_print(ANDROID_LOG_WARN, "BL2GuestHeap",
+                "large range full: want %llu KiB, top 0x%08X, %zu free spans; shared heap",
+                static_cast<unsigned long long>(bytes >> 10), m_large_top, m_large_free.size());
+#endif
+        return false;
+    }
+    base = m_large_top;
+    capacity = static_cast<uint32_t>(bytes);
+    m_large_top += capacity;
+    // A tail returned to the bump end keeps its old contents.
+    dirty = base < m_large_high;
+    m_large_high = std::max(m_large_high, m_large_top);
+    return true;
+}
+
+void DynarmicHost::LargeFree(uint32_t base, uint32_t capacity) {
+    std::lock_guard<std::mutex> lock(m_large_mutex);
+    uint32_t begin = base, end = base + capacity;
+    auto next = m_large_free.lower_bound(begin);
+    if (next != m_large_free.end() && next->first == end) {
+        end += next->second;
+        next = m_large_free.erase(next);
+    }
+    if (next != m_large_free.begin()) {
+        const auto previous = std::prev(next);
+        if (previous->first + previous->second == begin) {
+            begin = previous->first;
+            m_large_free.erase(previous);
+        }
+    }
+    if (end == m_large_top) m_large_top = begin;  // Give the tail back to the bump end.
+    else m_large_free.emplace(begin, end - begin);
+}
+
+bool DynarmicHost::EnableLargeBlockRegion() {
+    if (m_memory_size != GUEST_ADDRESS_SPACE ||
+        m_map_current.load(std::memory_order_acquire) > kLargeBase) return false;
+    m_large_enabled.store(true, std::memory_order_release);
+    // Fail loudly at the source: coalescing, tail return, reuse and zeroing.
+    bool ok = true;
+    const uint32_t top = m_large_top;
+    const uint32_t a = GuestAlloc(3u << 20, 0x1000), b = GuestAlloc(5u << 20, 0x1000);
+    ok = ok && a >= kLargeBase && b >= kLargeBase && a < b && (a & 0xFFF) == 0 &&
+         GuestAllocSize(a) == (3u << 20) && GuestAllocSize(b) == (5u << 20);
+    if (ok) MemoryWrite32(a, 0xA5A5A5A5);
+    const uint32_t c = GuestAlloc(2u << 20, 16);  // Keeps a, b off the tail.
+    GuestFree(a);
+    GuestFree(b);
+    const uint32_t merged = GuestAlloc(8u << 20, 0x1000);  // Needs a and b coalesced.
+    ok = ok && c && merged && merged < c && MemoryRead32(merged) == 0;
+    GuestFree(merged);
+    GuestFree(c);
+    ok = ok && m_large_top == top && m_large_free.empty();
+    if (!ok) {
+        m_large_enabled.store(false, std::memory_order_release);
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_ERROR, "BL2GuestHeap", "large range self-check failed; disabled");
+#endif
+    }
+    return ok;
 }
 
 uint32_t DynarmicHost::GuestAllocSize(uint32_t addr) {
@@ -1246,7 +1920,8 @@ uint32_t DynarmicHost::GuestAllocMapping(size_t size, size_t alignment) {
         const uint32_t aligned =
             (current + static_cast<uint32_t>(alignment - 1)) &
             ~static_cast<uint32_t>(alignment - 1);
-        if (aligned < current || static_cast<uint64_t>(aligned) + size > kMapLimit) {
+        const uint32_t limit = m_large_enabled.load(std::memory_order_acquire) ? kLargeBase : kMapLimit;
+        if (aligned < current || static_cast<uint64_t>(aligned) + size > limit) {
             LOGE("GuestAllocMapping out of mapping space: at 0x%08X, want %zu",
                  aligned, size);
             return 0;
@@ -1369,9 +2044,11 @@ std::optional<std::uint32_t> DynarmicHost::MemoryReadCode(std::uint32_t vaddr) {
     // permanently-undefined instruction instead -- ExceptionRaised halts it and
     // prints where the jump came from.
     if (m_elf_loader) {
+        // Executable PT_LOAD segments only: a branch into a module's .data,
+        // .bss or GOT is as wild as one into the heap, and its words decode
+        // into coprocessor loads/stores that no core can translate.
         auto in_module = [vaddr](const ElfLoader* l) {
-            return l && vaddr >= l->GetBaseAddress() &&
-                   vaddr < l->GetBaseAddress() + l->GetImageSize();
+            return l && l->IsCodeRange(vaddr, 2);
         };
         // Below kTrampolineEnd: the exit traps and the SVC trampolines.
         constexpr uint32_t kTrampolineEnd = 0x00020000;
@@ -1416,20 +2093,114 @@ std::uint64_t DynarmicHost::MemoryRead64(std::uint32_t vaddr) {
     return 0;
 }
 
+void DynarmicHost::ProtectLowGuard() {
+#if defined(__ANDROID__)
+    const long page = ::sysconf(_SC_PAGESIZE);
+    if (page <= 0 || kLowGuardEnd % static_cast<uint32_t>(page) != 0 ||
+        ::mprotect(m_memory, kLowGuardEnd, PROT_READ) != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "BL2LowGuard", "low guest pages stay writable");
+        return;
+    }
+    m_low_guard_active.store(true, std::memory_order_release);
+#endif
+}
+
+void DynarmicHost::WriteLowGuardWord(uint32_t vaddr, uint32_t value) {
+    if (vaddr >= kLowGuardEnd || !m_low_guard_active.load(std::memory_order_acquire)) {
+        MemoryWrite32(vaddr, value);
+        return;
+    }
+#if defined(__ANDROID__)
+    // Rare (runtime trampolines): open only this page for the store.
+    const uintptr_t page = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
+    uint8_t* const first = m_memory + (vaddr & ~(page - 1));
+    std::lock_guard<std::mutex> lock(m_low_guard_mutex);
+    if (::mprotect(first, page, PROT_READ | PROT_WRITE) != 0) return;
+    *reinterpret_cast<uint32_t*>(m_memory + vaddr) = value;
+    ::mprotect(first, page, PROT_READ);
+#endif
+}
+
+void DynarmicHost::ReportLowGuardWrite(uint32_t vaddr, size_t bytes) {
+    static std::atomic<uint32_t> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+#if defined(__ANDROID__)
+    const uint32_t pc = s_active_jit ? s_active_jit->Regs()[15] : 0;
+    const uint32_t lr = s_active_jit ? s_active_jit->Regs()[14] : 0;
+    __android_log_print(ANDROID_LOG_ERROR, "BL2LowGuard",
+        "guest store to 0x%08X (%zu bytes) dropped; PC=%08X LR=%08X", vaddr, bytes, pc, lr);
+#else
+    (void)vaddr;
+    (void)bytes;
+#endif
+}
+
 void DynarmicHost::MemoryWrite8(std::uint32_t vaddr, std::uint8_t value) {
-    if (static_cast<uint64_t>(vaddr) < m_memory_size) m_memory[vaddr] = value;
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, 1);
+        return;
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    const bool cookie_trip = ObservePhysxGuestWrite(*this, vaddr, value);
+#endif
+    if (static_cast<uint64_t>(vaddr) < m_memory_size) {
+        m_memory[vaddr] = value;
+        NotifyGuestMemoryWritten(vaddr, 1);
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    if (cookie_trip) s_active_jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+#endif
 }
 
 void DynarmicHost::MemoryWrite16(std::uint32_t vaddr, std::uint16_t value) {
-    if (static_cast<uint64_t>(vaddr) + 2 <= m_memory_size) *reinterpret_cast<uint16_t*>(m_memory + vaddr) = value;
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, 2);
+        return;
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    const bool cookie_trip = ObservePhysxGuestWrite(*this, vaddr, value);
+#endif
+    if (static_cast<uint64_t>(vaddr) + 2 <= m_memory_size) {
+        *reinterpret_cast<uint16_t*>(m_memory + vaddr) = value;
+        NotifyGuestMemoryWritten(vaddr, 2);
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    if (cookie_trip) s_active_jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+#endif
 }
 
 void DynarmicHost::MemoryWrite32(std::uint32_t vaddr, std::uint32_t value) {
-    if (static_cast<uint64_t>(vaddr) + 4 <= m_memory_size) *reinterpret_cast<uint32_t*>(m_memory + vaddr) = value;
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, 4);
+        return;
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    const bool cookie_trip = ObservePhysxGuestWrite(*this, vaddr, value);
+#endif
+    if (static_cast<uint64_t>(vaddr) + 4 <= m_memory_size) {
+        *reinterpret_cast<uint32_t*>(m_memory + vaddr) = value;
+        NotifyGuestMemoryWritten(vaddr, 4);
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    if (cookie_trip) s_active_jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+#endif
 }
 
 void DynarmicHost::MemoryWrite64(std::uint32_t vaddr, std::uint64_t value) {
-    if (static_cast<uint64_t>(vaddr) + 8 <= m_memory_size) *reinterpret_cast<uint64_t*>(m_memory + vaddr) = value;
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, 8);
+        return;
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    const bool cookie_trip = ObservePhysxGuestWrite(*this, vaddr, value);
+#endif
+    if (static_cast<uint64_t>(vaddr) + 8 <= m_memory_size) {
+        *reinterpret_cast<uint64_t*>(m_memory + vaddr) = value;
+        NotifyGuestMemoryWritten(vaddr, 8);
+    }
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    if (cookie_trip) s_active_jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+#endif
 }
 
 #if defined(HORN_DYNARMIC_HAS_INTERPRETER_FALLBACK)
@@ -1453,6 +2224,9 @@ bool DynarmicHost::IsReadOnlyMemory(std::uint32_t vaddr) {
 }
 
 void DynarmicHost::CallSVC(std::uint32_t swi) {
+#if defined(HORN_ENABLE_PHYSX_COOKIE_WATCH)
+    PhysxSvcScope cookie_native_scope;
+#endif
     Dynarmic::A32::Jit* jit = s_active_jit;
     if (!jit) {
         LOGE("SVC 0x%X without an active JIT", swi);
@@ -1496,6 +2270,15 @@ void DynarmicHost::ExceptionRaised(std::uint32_t pc, Dynarmic::A32::Exception ex
          regs[15], regs[14], regs[13], s_active_jit->Cpsr());
     static std::atomic<uint32_t> dumps{0};
     if (dumps.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+        "Guest exception initiating_pc=%08X type=%d PC=%08X LR=%08X SP=%08X CPSR=%08X "
+        "R0=%08X R1=%08X R2=%08X R3=%08X R4=%08X R5=%08X R6=%08X R7=%08X "
+        "R8=%08X R9=%08X R10=%08X R11=%08X R12=%08X",
+        pc, static_cast<int>(exception), regs[15], regs[14], regs[13], s_active_jit->Cpsr(),
+        regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
+        regs[8], regs[9], regs[10], regs[11], regs[12]);
+#endif
     for (size_t first = 0; first < 16; first += 4) {
         LOGE("Guest exception registers r%zu..r%zu={%08X,%08X,%08X,%08X}",
              first, first + 3, regs[first], regs[first + 1],
@@ -1586,17 +2369,41 @@ static bool GuestCompareAndSwap(uint8_t* mem, size_t mem_size, uint32_t vaddr, T
 }
 
 bool DynarmicHost::MemoryWriteExclusive8(std::uint32_t vaddr, std::uint8_t value, std::uint8_t expected) {
-    return GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, sizeof(value));
+        return true;  // Dropped like a plain store; no endless STREX retry.
+    }
+    const bool written = GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (written) NotifyGuestMemoryWritten(vaddr, sizeof(value));
+    return written;
 }
 
 bool DynarmicHost::MemoryWriteExclusive16(std::uint32_t vaddr, std::uint16_t value, std::uint16_t expected) {
-    return GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, sizeof(value));
+        return true;  // Dropped like a plain store; no endless STREX retry.
+    }
+    const bool written = GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (written) NotifyGuestMemoryWritten(vaddr, sizeof(value));
+    return written;
 }
 
 bool DynarmicHost::MemoryWriteExclusive32(std::uint32_t vaddr, std::uint32_t value, std::uint32_t expected) {
-    return GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, sizeof(value));
+        return true;  // Dropped like a plain store; no endless STREX retry.
+    }
+    const bool written = GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (written) NotifyGuestMemoryWritten(vaddr, sizeof(value));
+    return written;
 }
 
 bool DynarmicHost::MemoryWriteExclusive64(std::uint32_t vaddr, std::uint64_t value, std::uint64_t expected) {
-    return GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (vaddr < kLowGuardEnd && m_low_guard_active.load(std::memory_order_relaxed)) {
+        ReportLowGuardWrite(vaddr, sizeof(value));
+        return true;  // Dropped like a plain store; no endless STREX retry.
+    }
+    const bool written = GuestCompareAndSwap(m_memory, m_memory_size, vaddr, value, expected);
+    if (written) NotifyGuestMemoryWritten(vaddr, sizeof(value));
+    return written;
 }

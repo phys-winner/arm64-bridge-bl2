@@ -34,12 +34,186 @@ static bool send(Mailbox& box, std::uint64_t epoch, std::uint64_t held,
 static void testUnknownAndWire() {
     Mailbox box;
     const auto wire = box.snapshot().wire();
-    CHECK(wire[0] == 1 && wire[1] != 0 && wire[2] == 0 && wire[3] == 0);
-    CHECK(wire[4] == 0 && wire[5] == 0 && wire[6] == 0 && wire[7] == 0);
+    CHECK(wire.size() == 18 && wire[0] == 3 && wire[1] != 0 && wire[2] == 0 && wire[3] == 0);
+    CHECK(wire[4] == 0 && wire[5] == 0 && wire[6] == 0);
+    CHECK(wire[7] == std::numeric_limits<std::uint64_t>::max() && wire[8] == wire[7]);
+    for (std::size_t i = 9; i != wire.size(); ++i) CHECK(wire[i] == 0);
     CHECK(!send(box, wire[1], actionBit(Action::Fire)));
     auto frame = box.consumeFrame(0, 100);
     CHECK(frame.fresh && frame.actionEdgeCount == 0 && near(frame.moveX, 0));
     CHECK(!box.consumeFrame(0, 100).fresh);
+}
+
+static float unpackFloat(std::uint64_t word, bool high) {
+    const auto bits = static_cast<std::uint32_t>(high ? word >> 32 : word);
+    float result = 0;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static void testLiveTelemetryPreservesCaptureAndReleasesRevocation() {
+    Mailbox box;
+    auto context = gameplay();
+    context.capabilities |= DirectUi;
+    const auto epoch = ready(box, context);
+    CHECK(box.uiPointer(epoch, 9, PointerPhase::Down, .8f, .9f, 101));
+    CHECK(box.submit(epoch, .4f, .2f, 0, 0, actionBit(Action::Grenade), 101));
+    box.consumeFrame(2, 101);
+    context.knownActions = actionBit(Action::Grenade) | actionBit(Action::NextWeapon);
+    context.weaponCount = 3; context.grenadeCount = 1;
+    context.hudValidMask = HudMinimap | HudAmmo | HudObjectives;
+    context.mapRect = {.75f, .05f, .95f, .35f};
+    context.ammoRect = {.8f, .7f, .98f, .95f};
+    context.objectiveRect = {.67f, .36f, .96f, .47f};
+    CHECK(box.publishContext(context) == epoch);
+    auto snap = box.snapshot();
+    const auto wire = snap.wire();
+    CHECK(wire[6] == context.knownActions && wire[7] == 3 && wire[8] == 1);
+    CHECK(wire[9] == 7);
+    CHECK(near(unpackFloat(wire[14], false), .67f) && near(unpackFloat(wire[14], true), .36f));
+    CHECK(near(unpackFloat(wire[15], false), .96f) && near(unpackFloat(wire[15], true), .47f));
+    CHECK(near(unpackFloat(wire[10], false), .75f) && near(unpackFloat(wire[10], true), .05f));
+    CHECK(near(unpackFloat(wire[13], false), .98f) && near(unpackFloat(wire[13], true), .95f));
+    CHECK(box.uiPointer(epoch, 9, PointerPhase::Move, .85f, .88f, 102));
+    auto frame = box.consumeFrame(3, 102);
+    CHECK(frame.resetReasons == NoReset && frame.pointerEventCount == 1);
+    CHECK(frame.pointerEvents[0].phase == PointerPhase::Move && frame.context.grenadeCount == 1);
+    CHECK(frame.heldActions == actionBit(Action::Grenade) && near(frame.moveX, .4f));
+    context.grenadeCount = 0;
+    context.availableActions &= ~actionBit(Action::Grenade);
+    context.objectiveRect.top = .39f;
+    CHECK(box.publishContext(context) == epoch);
+    CHECK(box.uiPointer(epoch, 9, PointerPhase::Up, .85f, .88f, 103));
+    frame = box.consumeFrame(4, 103);
+    CHECK(frame.context.grenadeCount == 0 && near(frame.context.objectiveRect.top,.39f));
+    CHECK(frame.resetReasons == NoReset && near(frame.moveX, .4f));
+    CHECK(frame.actionEdgeCount == 1 && !frame.actionEdges[0].down);
+    CHECK(frame.actionEdges[0].action == Action::Grenade && frame.actionEdges[0].sourceEpoch == epoch);
+    CHECK(frame.pointerEventCount == 1 && frame.pointerEvents[0].phase == PointerPhase::Up);
+}
+
+static void testTelemetryRejectsEachInvalidRectIndependently() {
+    Mailbox box;
+    auto context = gameplay();
+    const auto epoch = ready(box, context);
+    context.knownActions = ~std::uint64_t{0};
+    context.weaponCount = 65; context.grenadeCount = 65536;
+    context.hudValidMask = ~std::uint32_t{0};
+    context.mapRect = {.2f, .1f, .4f, .3f};
+    context.ammoRect = {0, 0, std::numeric_limits<float>::quiet_NaN(), 1};
+    CHECK(box.publishContext(context) == epoch);
+    auto snap = box.snapshot();
+    CHECK(snap.context.knownActions == kKnownActions && snap.context.weaponCount == -1 && snap.context.grenadeCount == -1);
+    CHECK(snap.context.hudValidMask == HudMinimap && snap.wire()[12] == 0 && snap.wire()[13] == 0);
+    context.mapRect = {.7f, .1f, .6f, .3f};
+    context.ammoRect = {.6f, .7f, 1, 1};
+    context.weaponCount = 64; context.grenadeCount = 65535;
+    CHECK(box.publishContext(context) == epoch);
+    snap = box.snapshot();
+    CHECK(snap.context.hudValidMask == HudAmmo && snap.context.weaponCount == 64 && snap.context.grenadeCount == 65535);
+    CHECK(snap.wire()[10] == 0 && snap.wire()[11] == 0);
+    context.mapRect = {0, -.01f, .6f, .3f};
+    context.ammoRect = {.6f, .7f, 1.01f, 1};
+    CHECK(box.publishContext(context) == epoch && box.snapshot().context.hudValidMask == 0);
+}
+
+static void testLastWeaponHasSeparateEdgeAndRevocation() {
+    Mailbox box;
+    auto context = gameplay();
+    const auto epoch = ready(box, context);
+    const auto bit = actionBit(Action::LastWeapon);
+    CHECK(bit == (std::uint64_t{1} << 25));
+    CHECK(send(box, epoch, bit));
+    const auto down = box.consumeFrame(2, 101);
+    CHECK(down.actionEdgeCount == 1 && down.actionEdges[0].action == Action::LastWeapon && down.actionEdges[0].down);
+    context.availableActions &= ~bit;
+    CHECK(box.publishContext(context) == epoch);
+    const auto up = box.consumeFrame(3, 102);
+    CHECK(up.actionEdgeCount == 1 && up.actionEdges[0].action == Action::LastWeapon && !up.actionEdges[0].down);
+    CHECK(shippedActionName(Action::LastWeapon) == nullptr);
+}
+
+static void testOriginalChatEntryAndRevocation() {
+    Mailbox box;
+    auto context = gameplay();
+    constexpr auto chat = actionBit(Action::Chat);
+    constexpr auto fire = actionBit(Action::Fire);
+    CHECK(chat == (std::uint64_t{1} << 26) && kActionCount == 27);
+    CHECK(std::strcmp(shippedActionName(Action::Chat), "Say") == 0);
+    context.availableActions &= ~chat; // Existing v3 producer has only the original 26 actions.
+    const auto epoch = ready(box, context);
+    CHECK(box.snapshot().wire().size() == 18 && box.snapshot().wire()[0] == 3);
+    CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire | chat, 101));
+    const auto old = box.consumeFrame(2, 101);
+    CHECK(old.actionEdgeCount == 1 && old.actionEdges[0].action == Action::Fire && old.heldActions == fire);
+    context.availableActions |= chat;
+    CHECK(box.publishContext(context) == epoch && (box.snapshot().wire()[4] & chat) != 0);
+    CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire | chat | (std::uint64_t{1} << 27), 102));
+    CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire, 102));
+    const auto down = box.consumeFrame(3, 102);
+    CHECK(down.actionEdgeCount == 1 && down.actionEdges[0].action == Action::Chat && down.actionEdges[0].down);
+    CHECK(down.heldActions == (fire | chat) && near(down.moveX, .25f) && near(down.moveY, .75f));
+    const auto up = box.consumeFrame(4, 103);
+    CHECK(up.actionEdgeCount == 1 && up.actionEdges[0].action == Action::Chat && !up.actionEdges[0].down);
+    CHECK(up.heldActions == fire && up.actionEdges[0].sourceEpoch == epoch);
+    CHECK(send(box, epoch, fire | chat, 104));
+    CHECK(box.consumeFrame(5, 104).heldActions == (fire | chat));
+    context.availableActions &= ~chat;
+    CHECK(box.publishContext(context) == epoch);
+    const auto revoked = box.consumeFrame(6, 105);
+    CHECK(revoked.resetReasons == NoReset && revoked.actionEdgeCount == 1 && revoked.heldActions == fire);
+    CHECK(revoked.actionEdges[0].action == Action::Chat && !revoked.actionEdges[0].down);
+    context.availableActions |= chat;
+    CHECK(box.publishContext(context) == epoch);
+    CHECK(send(box, epoch, fire | chat, 106));
+    box.consumeFrame(7, 106);
+    const auto keyboardEpoch = box.publishContext({Mode::TextInput, 0, 0, 2});
+    CHECK(keyboardEpoch != epoch && !send(box, epoch, chat, 107));
+    const auto focus = box.consumeFrame(8, 107);
+    CHECK(focus.resetReasons == ContextChanged && focus.heldActions == 0 && focus.actionEdgeCount == 2);
+    for (std::size_t i = 0; i != focus.actionEdgeCount; ++i) CHECK(!focus.actionEdges[i].down);
+    CHECK(!send(box, keyboardEpoch, chat, 108));
+    context.capabilities |= PhysicalOwnsInput;
+    const auto physicalEpoch = box.publishContext(context);
+    CHECK(!send(box, physicalEpoch, chat, 109));
+}
+
+static void testObjectivesUnknownEmptyAndIndependentValidation() {
+    Mailbox box;
+    auto context=gameplay();const auto epoch=ready(box,context);
+    context.hudValidMask=HudMinimap | HudAmmo | HudObjectives;
+    context.mapRect={.7f,.1f,.9f,.3f};context.ammoRect={.8f,.8f,1,1};
+    context.objectiveRect={.6f,.35f,.95f,.48f};
+    CHECK(box.publishContext(context)==epoch && box.snapshot().wire()[9]==7);
+    context.hudValidMask|=HudObjectivesEmpty; // Contradictory producer cannot claim empty.
+    CHECK(box.publishContext(context)==epoch);
+    CHECK(box.snapshot().context.hudValidMask==(HudMinimap | HudAmmo));
+    CHECK(box.snapshot().wire()[14]==0 && box.snapshot().wire()[15]==0);
+    context.hudValidMask=HudMinimap | HudAmmo | HudObjectives;
+    context.objectiveRect.right=std::numeric_limits<float>::quiet_NaN();
+    CHECK(box.publishContext(context)==epoch && box.snapshot().context.hudValidMask==3);
+    context.hudValidMask=HudMinimap | HudAmmo | HudObjectivesEmpty;
+    CHECK(box.publishContext(context)==epoch && box.snapshot().context.hudValidMask==11);
+    CHECK(box.snapshot().wire()[14]==0 && box.snapshot().wire()[15]==0);
+    context.hudValidMask=HudObjectives;context.objectiveRect={.6f,.35f,.95f,.48f};
+    CHECK(box.publishContext(context)==epoch && box.snapshot().context.hudValidMask==4);
+    CHECK(box.snapshot().wire()[10]==0 && box.snapshot().wire()[13]==0);
+    context.hudValidMask=0;
+    CHECK(box.publishContext(context)==epoch && box.snapshot().wire()[14]==0);
+}
+
+static void testUnarmedRevocationKeepsOtherInputs() {
+    Mailbox box;auto context=gameplay();const auto epoch=ready(box,context);
+    const auto removed=actionBit(Action::Fire) | actionBit(Action::Aim) | actionBit(Action::Reload);
+    CHECK(box.submit(epoch,.4f,0,0,0,removed | actionBit(Action::Jump),101));
+    box.consumeFrame(2,101);
+    context.weaponCount=0;context.knownActions|=removed;context.availableActions&=~removed;
+    CHECK(box.publishContext(context)==epoch);
+    const auto up=box.consumeFrame(3,102);
+    CHECK(up.resetReasons==NoReset && up.actionEdgeCount==3 && up.heldActions==actionBit(Action::Jump));
+    CHECK(near(up.moveX,.4f));
+    for (std::size_t i=0;i!=up.actionEdgeCount;++i)
+        CHECK(!up.actionEdges[i].down && (actionBit(up.actionEdges[i].action)&removed)!=0 && up.actionEdges[i].sourceEpoch==epoch);
 }
 
 static void testFastTapSurvivesBetweenTicks() {
@@ -59,6 +233,37 @@ static void testFastTapSurvivesBetweenTicks() {
         CHECK(frame.heldActions == (tick % 2 == 0 ? fire : 0));
     }
     CHECK(box.consumeFrame(6, 101).actionEdgeCount == 0);
+}
+
+static void testPauseDebugCapabilityRoundtrip() {
+    for (const auto extra : {std::uint32_t(PauseBackdrop),std::uint32_t(DebugCanvas),std::uint32_t(PauseBackdrop | DebugCanvas)}) {
+        Mailbox box;
+        const auto caps = std::uint32_t(DirectUi | UiNavigation) | extra;
+        Context context{Mode::Menu,caps | (1u << 31),actionBit(Action::Confirm) | actionBit(Action::UiDown),42};
+        const auto epoch = ready(box,context);
+        const auto snapshot = box.snapshot();
+        CHECK(snapshot.epoch == epoch && snapshot.context.capabilities == caps && snapshot.wire()[3] == caps);
+        CHECK(box.publishContext(context) == epoch); // Unknown bits remain masked; no spurious reset.
+        CHECK(send(box,epoch,actionBit(Action::Confirm) | actionBit(Action::UiDown)));
+        CHECK(box.uiPointer(epoch,7,PointerPhase::Down,.4f,.3f,101));
+        const auto frame = box.consumeFrame(2,101);
+        CHECK(frame.context.capabilities == caps && frame.context.availableActions == context.availableActions);
+        CHECK(frame.epoch == epoch && frame.actionEdgeCount == 2 && frame.pointerEventCount == 1);
+        CHECK(frame.actionEdges[0].action == Action::Confirm && frame.actionEdges[0].down && frame.actionEdges[0].sourceEpoch == epoch);
+        CHECK(frame.actionEdges[1].action == Action::UiDown && frame.actionEdges[1].down);
+        CHECK(frame.pointerEvents[0].phase == PointerPhase::Down && frame.pointerEvents[0].sourceEpoch == epoch);
+        context.capabilities = DirectUi | UiNavigation;
+        const auto nextEpoch = box.publishContext(context);
+        CHECK(nextEpoch != epoch && !send(box,epoch,0));
+        CHECK(!box.uiPointer(epoch,7,PointerPhase::Up,.4f,.3f,102));
+        const auto reset = box.consumeFrame(3,102);
+        CHECK(reset.epoch == nextEpoch && reset.resetReasons == ContextChanged && reset.actionEdgeCount == 2);
+        CHECK(!reset.actionEdges[0].down && reset.actionEdges[0].sourceEpoch == epoch);
+        CHECK(!reset.actionEdges[1].down && reset.actionEdges[1].sourceEpoch == epoch);
+        CHECK(reset.pointerEventCount == 1 && reset.pointerEvents[0].phase == PointerPhase::Cancel && reset.pointerEvents[0].sourceEpoch == epoch);
+        CHECK(send(box,nextEpoch,0,102));
+        CHECK(box.consumeFrame(4,102).context.capabilities == context.capabilities);
+    }
 }
 
 static void testLookOnceAndAnalogHold() {
@@ -391,9 +596,64 @@ static void testConcurrentSnapshotIsCoherent() {
     CHECK(coherent.load());
 }
 
+static void testUseHudRegionIsIndependent() {
+    Mailbox box;
+    auto context=gameplay();
+    context.knownActions=actionBit(Action::Use);
+    context.hudValidMask=HudMinimap | HudUse;
+    context.mapRect={.7f,.02f,.9f,.2f};
+    context.useRect={.38f,.49f,.65f,.55f};
+    const auto epoch=ready(box,context);
+    const auto words=box.snapshot().wire();
+    CHECK(words.size()==18 && words[0]==3 && words[9]==(HudMinimap|HudUse));
+    CHECK(near(unpackFloat(words[16],false),.38f) && near(unpackFloat(words[16],true),.49f));
+    CHECK(near(unpackFloat(words[17],false),.65f) && near(unpackFloat(words[17],true),.55f));
+    CHECK(send(box,epoch,actionBit(Action::Fire)|actionBit(Action::Use)));
+    box.consumeFrame(2,101);
+    context.useRect.right=std::numeric_limits<float>::quiet_NaN();
+    CHECK(box.publishContext(context)==epoch);
+    const auto invalid=box.snapshot();
+    CHECK(invalid.context.hudValidMask==HudMinimap && invalid.wire()[16]==0 && invalid.wire()[17]==0);
+    CHECK(invalid.context.availableActions&actionBit(Action::Use)); // Genuine availability survives a projection failure.
+    context.availableActions&=~actionBit(Action::Use);
+    CHECK(box.publishContext(context)==epoch);
+    const auto revoked=box.consumeFrame(3,102);
+    CHECK(revoked.actionEdgeCount==1 && revoked.actionEdges[0].action==Action::Use && !revoked.actionEdges[0].down);
+    CHECK(revoked.heldActions==actionBit(Action::Fire));
+}
+
+static void testNativeMapTwoPointerTransport() {
+    Mailbox box;
+    Context map{Mode::Menu,DirectUi | UiNavigation | MapGestures,actionBit(Action::Back),91};
+    const auto epoch=ready(box,map);
+    CHECK((box.snapshot().wire()[3]&MapGestures)!=0);
+    CHECK(box.uiPointer(epoch,7,PointerPhase::Down,.3f,.5f,101));
+    CHECK(box.uiPointer(epoch,42,PointerPhase::Down,.7f,.5f,102));
+    const auto down=box.consumeFrame(2,102);
+    CHECK(down.pointerEventCount==2 && down.pointerEvents[0].pointerId==7 && down.pointerEvents[1].pointerId==42);
+    CHECK(box.uiPointer(epoch,7,PointerPhase::Move,.2f,.5f,103));
+    CHECK(box.uiPointer(epoch,42,PointerPhase::Move,.8f,.5f,103));
+    const auto pinch=box.consumeFrame(3,103);
+    CHECK(pinch.pointerEventCount==2 && near(pinch.pointerEvents[0].surfaceX,.2f) && near(pinch.pointerEvents[1].surfaceX,.8f));
+    map.capabilities&=~MapGestures;
+    const auto next=box.publishContext(map);
+    CHECK(next!=epoch && !box.uiPointer(epoch,42,PointerPhase::Up,.8f,.5f,104));
+    const auto cancelled=box.consumeFrame(4,104);
+    CHECK(cancelled.pointerEventCount==2 && cancelled.resetReasons==ContextChanged);
+    for(std::size_t i=0;i<cancelled.pointerEventCount;++i) CHECK(cancelled.pointerEvents[i].phase==PointerPhase::Cancel);
+    CHECK((box.snapshot().wire()[3]&MapGestures)==0);
+}
+
 int main() {
     testUnknownAndWire();
+    testLiveTelemetryPreservesCaptureAndReleasesRevocation();
+    testTelemetryRejectsEachInvalidRectIndependently();
+    testLastWeaponHasSeparateEdgeAndRevocation();
+    testOriginalChatEntryAndRevocation();
+    testObjectivesUnknownEmptyAndIndependentValidation();
+    testUnarmedRevocationKeepsOtherInputs();
     testFastTapSurvivesBetweenTicks();
+    testPauseDebugCapabilityRoundtrip();
     testLookOnceAndAnalogHold();
     testResetReleasesAndRearms();
     testMenuRejectsGameplayAndUnavailableActions();
@@ -408,6 +668,8 @@ int main() {
     testHeartbeatAndMalformedInput();
     testConsumerAndSourceOwnership();
     testConcurrentSnapshotIsCoherent();
-    std::cout << "PASS: 16 native touch contract scenarios\n";
+    testNativeMapTwoPointerTransport();
+    testUseHudRegionIsIndependent();
+    std::cout << "PASS: 25 native touch contract scenarios\n";
     return 0;
 }

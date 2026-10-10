@@ -4,10 +4,13 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include "bl2_cache_payload.h"
 
 // The bridge must never assemble main and patch from different storage sources.
-// An entry reaches this selector only after its ZIP bounds/container index and
-// full SHA-256 have been verified by the source-specific reader.
+// Installed signed APKs use PackageManager integrity verification; their ZIP
+// bounds, container index and exact known layout are still checked here. Host
+// verification can additionally stream-hash payloads. sha256 denotes layout
+// identity for signed installed APKs, not a new runtime hash of their contents.
 enum class ObbSource : uint8_t {
     EmbeddedSplits,
     ExternalDirectory,
@@ -45,8 +48,10 @@ constexpr std::string_view kPatchObbSha256 =
 constexpr bool IsExpectedObb(const ObbCandidate& candidate, bool main) {
     return candidate.direct_readable &&
            candidate.logical_name == (main ? kMainObbName : kPatchObbName) &&
-           candidate.size == (main ? kMainObbSize : kPatchObbSize) &&
-           candidate.sha256 == (main ? kMainObbSha256 : kPatchObbSha256);
+           ((candidate.size == (main ? kMainObbSize : kPatchObbSize) &&
+             candidate.sha256 == (main ? kMainObbSha256 : kPatchObbSha256)) ||
+            (candidate.size == (main ? bl2_cache_payload::kMainBytes : bl2_cache_payload::kPatchBytes) &&
+             candidate.sha256 == (main ? bl2_cache_payload::kMainSha256 : bl2_cache_payload::kPatchSha256)));
 }
 
 constexpr ObbPairSelection SelectCompleteObbPair(

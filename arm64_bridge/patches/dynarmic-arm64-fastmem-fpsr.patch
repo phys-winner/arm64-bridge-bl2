@@ -39,9 +39,7 @@
      ctx.reg_alloc.SpillFlags();
      RegAlloc::Realize(Xaddr, Rvalue);
  
-@@ -592,7 +595,8 @@
-     const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
-     const auto fastmem_location = EmitMemoryStr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered, ShouldExt32(ctx));
+@@ -594,5 +597,6 @@
  
 -    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end, fastmem_location] {
 +    // Stores need the same isolated callback state as loads.

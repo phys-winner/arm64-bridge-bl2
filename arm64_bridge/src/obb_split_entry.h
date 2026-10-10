@@ -52,6 +52,7 @@ constexpr ObbSplitEntryResult InspectObbSplitEntry(
         return {ObbSplitEntryStatus::NotTarget, false, 0, 0};
     }
     const uint64_t expected_size = main ? kMainObbSize : kPatchObbSize;
+    const uint64_t relocated_size = main ? bl2_cache_payload::kMainBytes : bl2_cache_payload::kPatchBytes;
     // Only data-descriptor and UTF-8 name flags are compatible with a raw,
     // unencrypted STORED entry. The central and local records must agree.
     constexpr uint16_t allowed_flags = (1U << 3) | (1U << 11);
@@ -60,8 +61,8 @@ constexpr ObbSplitEntryResult InspectObbSplitEntry(
         entry.central_flags != entry.local_flags ||
         (entry.central_flags & ~allowed_flags) != 0 ||
         entry.central_method != 0 || entry.local_method != 0 ||
-        entry.compressed_size != expected_size ||
-        entry.uncompressed_size != expected_size) {
+        entry.compressed_size != entry.uncompressed_size ||
+        (entry.uncompressed_size != expected_size && entry.uncompressed_size != relocated_size)) {
         return {ObbSplitEntryStatus::Rejected, main, 0, 0};
     }
     const auto bounds = ResolveZipStoredEntryBounds(
@@ -72,5 +73,5 @@ constexpr ObbSplitEntryResult InspectObbSplitEntry(
         return {ObbSplitEntryStatus::Rejected, main, 0, 0};
     }
     return {ObbSplitEntryStatus::NeedsContentVerification, main,
-            bounds.data_offset, expected_size};
+            bounds.data_offset, entry.uncompressed_size};
 }

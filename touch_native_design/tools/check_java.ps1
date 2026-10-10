@@ -7,13 +7,13 @@ $ErrorActionPreference = 'Stop'
 $kit = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $output = Join-Path $kit 'build\java'
 New-Item -ItemType Directory -Force -Path "$output\classes", "$output\dex", "$output\tests" | Out-Null
-$source = @(Get-ChildItem -LiteralPath (Join-Path $kit 'java') -Recurse -Filter '*.java' -File | ForEach-Object FullName)
+$source = @(Get-ChildItem -LiteralPath (Join-Path $kit '..\android_port\src') -Recurse -Filter '*.java' -File | ForEach-Object FullName)
 & "$Jdk\javac.exe" --release 8 -encoding UTF-8 -Xlint:all -cp $AndroidJar -d "$output\classes" $source
 if ($LASTEXITCODE) { throw 'Java compilation failed' }
 $test = Join-Path $kit 'tests\TouchInputTest.java'
-& "$Jdk\javac.exe" --release 8 -encoding UTF-8 -cp "$output\classes" -d "$output\tests" $test
+& "$Jdk\javac.exe" --release 8 -encoding UTF-8 -cp "$output\classes;$AndroidJar" -d "$output\tests" $test
 if ($LASTEXITCODE) { throw 'Java test compilation failed' }
-& "$Jdk\java.exe" -cp "$output\classes;$output\tests" com.tt2kgames.Borderlands2.touch.TouchInputTest
+& "$Jdk\java.exe" -cp "$output\classes;$output\tests;$AndroidJar" com.tt2kgames.Borderlands2.touch.TouchInputTest
 if ($LASTEXITCODE) { throw 'Java behavioral tests failed' }
 & "$Jdk\jar.exe" --create --file "$output\touch-classes.jar" -C "$output\classes" .
 if ($LASTEXITCODE) { throw 'JAR creation failed' }

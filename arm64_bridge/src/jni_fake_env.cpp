@@ -19,13 +19,6 @@
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
 #define LOGE(...) HORN_LOGE(LOG_TAG, __VA_ARGS__)
 
-// The Tegra 4 system-settings profile asks Java to render at 0.9 scale. Keep
-// the profile's high-detail feature/content choices without accepting that
-// legacy tablet-era resolution reduction. Values above 1 remain untouched so
-// a future supersampling request is still honored.
-static constexpr float kMinimumRenderScale = 1.0f;
-static std::atomic<bool> s_logged_render_scale_clamp{false};
-
 // JNIEnv table slot count (through GetObjectRefType)
 static thread_local JNIEnv* thread_local_env = nullptr;
 
@@ -754,18 +747,6 @@ void FakeJniEnv::CallMethod(Dynarmic::A32::Jit& jit, uint32_t mid_handle, uint32
             case 'F': { float f; memcpy(&f, &a.v, 4); jv.f = f; break; }
             case 'D': { double d; memcpy(&d, &a.v, 8); jv.d = d; break; }
             case 'L': jv.l = a.obj; break;
-        }
-    }
-
-    if (retType == 'V' && !jvs.empty() &&
-        mi.name == "JavaCallback_SetFixedSizeScale" && mi.sig == "(F)V" &&
-        jvs[0].f < kMinimumRenderScale) {
-        const float requested = jvs[0].f;
-        jvs[0].f = kMinimumRenderScale;
-        bool expected = false;
-        if (s_logged_render_scale_clamp.compare_exchange_strong(expected, true)) {
-            LOGI("Native-resolution floor: JavaCallback_SetFixedSizeScale %.3f -> %.3f",
-                 requested, kMinimumRenderScale);
         }
     }
 
