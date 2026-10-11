@@ -1,6 +1,7 @@
 #include "gfx_widget_fixture.h"
 #include "bl2_touch_settings.h"
 #include <iostream>
+#include <limits>
 using namespace widget_fixture;
 
 int main(int argc, char** argv) {
@@ -728,6 +729,61 @@ int main(int argc, char** argv) {
         assert(TouchSettingValueText(3,.223999798) == "0.22" && TouchSettingValueText(4,.55000001192) == "0.55");
         assert(TouchSettingValueText(11,1) == "1.00" && TouchSettingValueText(12,.400000059) == "0.40");
         assert(touchSettingsState.values == saved); // Display rounding cannot quantize saved preferences.
+        // v7 appends the Reload button toggle after frame pacing; ids 0-34 keep their slots.
+        assert(kTouchSettingsVersion == 7 && kTouchSettingCount == 36 && kTouchReloadButtonSetting == 35);
+        assert(touchSettingSpecs[kTouchReloadButtonSetting].toggle &&
+            std::string(TouchSettingCaption(kTouchReloadButtonSetting,false)) == "RELOAD BUTTON" &&
+            std::string(TouchSettingCaption(kTouchReloadButtonSetting,true)) == "КНОПКА ПЕРЕЗАРЯДКИ" &&
+            TouchSettingHint(kTouchReloadButtonSetting,true) && TouchSettingHint(kTouchReloadButtonSetting,false));
+        assert(!SetBl2TouchSetting(kTouchReloadButtonSetting,2) && !SetBl2TouchSetting(kTouchReloadButtonSetting,.5));
+        assert(SetBl2TouchSetting(kTouchReloadButtonSetting,1));
+        const auto reloadOn = ExchangeBl2TouchSettings(host);
+        assert(reloadOn.size() == kTouchSettingCount+3 && reloadOn[3+kTouchReloadButtonSetting] == 1 &&
+            reloadOn[3+kTouchFramePacingSetting] == saved[kTouchFramePacingSetting]);
+        auto oldSize = host; oldSize.pop_back(); oldSize[0] = 6; oldSize[1] = reloadOn[1];
+        assert(ExchangeBl2TouchSettings(oldSize)[3+kTouchReloadButtonSetting] == 1); // A v6 host cannot clear it.
+        host[1] = reloadOn[1]; host[2+kTouchReloadButtonSetting] = 2;
+        assert(ExchangeBl2TouchSettings(host)[3+kTouchReloadButtonSetting] == 1); // Non-boolean host value rejected.
+    }
+    {
+        // Overflowing original descriptions scroll by whole lines under a vertical drag.
+        const auto missions = Bl2TextScrollTargets("StatusMenuExGFxMovie",1);
+        assert(missions.size() == 1 && std::string(missions[0]->field) == "_root.missions.missionSummary.description" &&
+            missions[0]->parentOwnsSwipe && std::string(missions[0]->arrows) == "SetScrollArrows");
+        const auto challenges = Bl2TextScrollTargets("StatusMenuExGFxMovie",5);
+        assert(challenges.size() == 2 && !challenges[0]->parentOwnsSwipe && !challenges[1]->arrows);
+        assert(Bl2TextScrollTargets("QuestAcceptGFxMovie",-1).size() == 1);
+        for (const auto screen : {0,2,3,4}) assert(Bl2TextScrollTargets("StatusMenuExGFxMovie",screen).empty());
+        assert(Bl2TextScrollTargets("PauseGFxMovie",1).empty() && Bl2TextScrollTargets("OptionsGFxMovie",5).empty());
+        // UI_StatusMenu EditText526 at its 101.6% layout scale: Scaleform reports
+        // _x/_y at the box's own top-left, so its [-86.15,-2] origin is not re-added.
+        const std::array<double,7> summary{-52.65,-109.35,276.75*1.016,258.45*1.016,101.6,101.6,0};
+        GfxRect local;
+        assert(Bl2TextScrollLocalRect(*missions[0],summary,local));
+        assert(std::abs(local.left-(-52.65)) < 1e-9 && std::abs(local.top-(-109.35)) < 1e-9);
+        assert(std::abs(local.right-(-52.65+276.75*1.016)) < 1e-9 && std::abs(local.bottom-(-109.35+258.45*1.016)) < 1e-9);
+        for (const unsigned bad : {2u,3u,4u,6u}) {
+            auto metrics = summary; metrics[bad] += bad == 6 ? .5 : 5;
+            assert(!Bl2TextScrollLocalRect(*missions[0],metrics,local) && local.right == 0);
+        }
+        // Device read of the live field at its own _z=-600: placement (-52.65,
+        // -109.35) plus the scaled origin, both sides reduced by one depth factor.
+        const std::array<double,7> deep{-140.20,-111.40,271.35,253.40,101.6,101.6,0};
+        assert(Bl2TextScrollLocalRect(*missions[0],deep,local));
+        assert(std::abs(local.left-(-140.20)) < 1e-9 && std::abs(local.right-(-140.20+276.75*1.016)) < 1e-9);
+        assert(std::abs(local.top-(-111.40)) < 1e-9 && std::abs(local.bottom-(-111.40+258.45*1.016)) < 1e-9);
+        auto uneven = deep; uneven[3] = 258.45*1.016; // One reduced side is another shape.
+        assert(!Bl2TextScrollLocalRect(*missions[0],uneven,local) && local.right == 0);
+        auto shrunk = summary; shrunk[2] *= .85; shrunk[3] *= .85; // Beyond any depth factor.
+        assert(!Bl2TextScrollLocalRect(*missions[0],shrunk,local) && local.right == 0);
+        auto dead = summary; dead[0] = std::numeric_limits<double>::quiet_NaN();
+        assert(!Bl2TextScrollLocalRect(*missions[0],dead,local));
+        assert(Bl2TextScrollLine(1,9,-100,20) == 6 && Bl2TextScrollLine(6,9,100,20) == 1);
+        assert(Bl2TextScrollLine(1,9,-1000,20) == 9 && Bl2TextScrollLine(9,9,1000,20) == 1);
+        assert(Bl2TextScrollLine(3,9,-9,20) == 3 && Bl2TextScrollLine(3,9,-11,20) == 4); // Rounded whole lines.
+        assert(Bl2TextScrollLine(3,9,std::numeric_limits<double>::quiet_NaN(),20) == 3);
+        assert(Bl2TextScrollLine(3,9,-50,0) == 3 && Bl2TextScrollLine(0,9,-50,20) == 0 && Bl2TextScrollLine(10,9,-50,20) == 10);
+        std::cout << "PASS: settings v7 Reload toggle; mission/challenge/quest description targets, authored boxes and line mapping\n";
     }
     {
         Vm vm(argv[1]);

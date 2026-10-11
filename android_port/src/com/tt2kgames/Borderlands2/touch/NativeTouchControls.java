@@ -33,6 +33,7 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
 import com.tt2kgames.Borderlands2.LaunchControls;
+import com.tt2kgames.Borderlands2.GameRestart;
 import com.tt2kgames.Borderlands2.GameStorage;
 import static com.tt2kgames.Borderlands2.touch.TouchContract.*;
 
@@ -48,6 +49,12 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private static final int[] RADIAL = {NEXT_WEAPON, SKILL, CROUCH, MELEE, INVENTORY, MAP, PREV_WEAPON, RELOAD, CHAT};
     private static final String[] RADIAL_EN = {"Weapon", "Skill", "Crouch", "Melee", "Inventory", "Map", "Previous", "Reload", "Chat"};
     private static final String[] RADIAL_RU = {"Оружие", "Навык", "Присесть", "Удар", "Рюкзак", "Карта", "Предыдущее", "Зарядить", "Чат"};
+    // A vehicle seat's radial (review 4.4): Horn and Switch seat. Look back and
+    // Turret are holds: a second finger on the open radial keeps them pressed.
+    private static final int[] RADIAL_VEHICLE = {VEHICLE_HORN, SWITCH_SEATS, LOOK_BACK, DRIVER_FIRE_TURRET,
+            INVENTORY, MAP, NEXT_WEAPON, RELOAD, CHAT};
+    private static final String[] RADIAL_VEHICLE_EN = {"Horn", "Switch seat", "Look back", "Turret", "Inventory", "Map", "Weapon", "Reload", "Chat"};
+    private static final String[] RADIAL_VEHICLE_RU = {"Сигнал", "Пересесть", "Оглянуться", "Турель", "Рюкзак", "Карта", "Оружие", "Зарядить", "Чат"};
     private static final long STALE_MS = 1000;
     private static final int HINT_MAP = TouchPreferences.HINT_MAP, HINT_WEAPON = TouchPreferences.HINT_WEAPON,
             HINT_GAME_MORE = TouchPreferences.HINT_GAME_MORE, HINT_MENU_MORE = TouchPreferences.HINT_MENU_MORE,
@@ -92,6 +99,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private final ArrayList<Button> buttons = new ArrayList<>();
     private final ArrayList<Button> radialButtons = new ArrayList<>();
     private final SparseArray<Button> utilityPointers = new SparseArray<>();
+    private final int[] moveVisualBefore = new int[8], moveVisualAfter = new int[8];
     private final SparseArray<Integer> legacyPointers = new SparseArray<>();
     private final SparseArray<Boolean> legacyKeys = new SparseArray<>();
     private final ArrayList<float[]> occupied = new ArrayList<>();
@@ -111,15 +119,19 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private Button editButton;
     private float editOffsetX, editOffsetY;
     private long lastFrame = -1, lastFrameTime;
-    private int settingsRevision;
+    private int settingsRevision, renderRestartOffered, videoOptionsAway;
     private long lastSettingsPoll;
-    private boolean layoutEditPending, renderScalePending, layoutChanged;
+    private boolean layoutEditPending, layoutChanged, inWorld;
+    private android.app.AlertDialog restartDialog;
+    /** Render resolution this process started with: the engine sizes its targets once. */
+    private static int sessionRenderPercent;
     private RouteListener routeListener;
     private boolean nativeRoute, imeVisible;
     private boolean fallback, radialOpen, radialDragged;
     private long legacyHeld;
     private float fallbackYaw, fallbackPitch, radialX,radialY,radialRadius,radialStartX,radialStartY;
     private int radialPointer=-1, radialSelection=-1, radialCount=8;
+    private int[] radial=RADIAL;
     private long radialStarted;
     private String hintText;
     private long hintUntil;
@@ -223,12 +235,29 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (radialOpen) { closeRadial(); invalidate(); return true; }
         if (expanded && context.menu()) { clearMenuMore(); buildButtons(); invalidate(); return true; }
         if (context.has(PHYSICAL_OWNS_INPUT)) return false;
+        if (context.mode == CINEMATIC) {
+            int action = cinematicBackAction(context,eligible);
+            if (action < 0) return false;
+            activate(nextLegacyId++, action, 0, 0);
+            return true;
+        }
         // Loading, text entry and stale frames swallow Back instead of closing the game.
         if (!eligible) return true;
-        int action = context.gameplay() ? PAUSE : context.menu() ? BACK
-                : context.mode == CINEMATIC && context.has(CAN_SKIP) ? SKIP : -1;
+        int action = context.gameplay() ? PAUSE : context.menu() ? BACK : -1;
         if (action >= 0 && context.allows(action)) activate(nextLegacyId++, action, 0, 0);
         return true;
+    }
+    /**
+     * Back in a cinematic skips it, else opens the pause menu. Without a routed
+     * cinematic action -1 keeps the game's own Android Back instead of eating it.
+     */
+    static int cinematicBackAction(Context c,boolean eligible) {
+        if (c.mode != CINEMATIC || !eligible || !c.usable()) return -1;
+        return c.allows(SKIP) ? SKIP : c.allows(PAUSE) ? PAUSE : -1;
+    }
+    /** Only the legacy fallback still needs virtual key X; native Use is a held action bit. */
+    static boolean legacyUse(Context c,boolean fallback,int action) {
+        return fallback && action == USE && c.gameplay();
     }
     private void schedule() {
         if (!scheduled && !disposed && resumed && !linkageFailed) {
@@ -280,6 +309,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                     || !Arrays.equals(context.objectiveRect,next.objectiveRect)
                     || !Arrays.equals(context.useRect,next.useRect)) layoutDirty = true;
             context = next; eligible = nextEligible;
+            // Main menu versus a loaded world, for the restart warning.
+            if (context.mode == FRONTEND) inWorld = false;
+            else if (context.mode == GAMEPLAY || context.mode == VEHICLE || context.mode == CINEMATIC
+                    || context.mode == DEAD) inWorld = true;
             if (!context.menu()) clearMenuMore();
             if (eligible) updateMenuMore(now);
             if (layoutEditPending && eligible && context.gameplay()) {
@@ -369,6 +402,15 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         return preferences.x(action,0)==preferences.x(action,1)
                 || preferences.y(action,0)==preferences.y(action,1);
     }
+    /**
+     * Without a native ammo bar or reload observation the button is the only
+     * route. Otherwise the native route already withholds Reload for a full or
+     * unreloadable magazine and while reloading, so the preference decides.
+     * The caller still requires the action to be allowed outside the editor.
+     */
+    static boolean reloadButtonShown(Context c,boolean ammoBar,boolean editing,boolean preference) {
+        return editing || c.mode != GAMEPLAY || !ammoBar || !c.known(RELOAD) || preference;
+    }
     static boolean confirmedUnarmed(Context c) {
         // A special/transient readied-count zero with an equipped weapon must
         // keep its fallback. Native known Fire=false also proves Pawn.Weapon=null.
@@ -400,12 +442,31 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (!target.intersect(safe)) target.setEmpty();
     }
     private void addGameplayCluster() {
-        int[] actions={FIRE,AIM,GRENADE,JUMP};
-        String[] labels={label("Fire", "Огонь"),label("Aim", "Прицел"),label("Grenade", "Граната"),label("Jump", "Прыжок")};
+        addCluster(new int[]{FIRE,AIM,GRENADE,JUMP},new String[]{label("Fire", "Огонь"),label("Aim", "Прицел"),
+                label("Grenade", "Граната"),label("Jump", "Прыжок")},editing ? (1L<<26)-1 : context.actions);
+    }
+    /**
+     * A vehicle seat replaces the on-foot cluster (review 4.4): the driver keeps
+     * Fire and gets Boost and Brake in the Grenade and Jump places; a turret seat
+     * shows its Aim (held alternate fire), an attached rider its Grenade. Exit
+     * moves with the group in the Action place, away from Fire, Boost and Brake.
+     */
+    private void addSeatCluster() {
+        boolean rider=!editing && !context.allows(VEHICLE_BOOST) && context.allows(GRENADE);
+        addCluster(new int[]{FIRE,AIM,rider ? GRENADE : VEHICLE_BOOST,VEHICLE_BRAKE,EXIT_VEHICLE},
+                new String[]{label("Fire", "Огонь"),label("Aim", "Прицел"),
+                        rider ? label("Grenade", "Граната") : label("Boost", "Ускорить"),label("Brake", "Тормоз"),
+                        label("Exit", "Выйти")},
+                editing ? bit(FIRE)|bit(VEHICLE_BOOST)|bit(VEHICLE_BRAKE)|bit(EXIT_VEHICLE) : context.actions);
+    }
+    private void addCluster(int[] actions,String[] labels,long mask) {
         boolean custom=false;for(int action:actions) custom |= customPosition(preferences,action);
         float[][] group=custom ? null : TouchLayout.gameplayCluster(safe.left,safe.top,safe.right,safe.bottom,
-                dp(1),layoutScale,preferences.leftHanded,editing ? (1L<<26)-1 : context.actions,occupied,hudReserved);
-        if (group == null) { for(int i=0;i<actions.length;++i) addGameplay(actions[i],labels[i]); return; }
+                dp(1),layoutScale,preferences.leftHanded,actions,mask,occupied,hudReserved);
+        if (group == null) {
+            for(int i=0;i<actions.length;++i) if ((mask & bit(actions[i])) != 0) addGameplay(actions[i],labels[i]);
+            return;
+        }
         for(int i=0;i<actions.length;++i) if(group[i]!=null) {
             occupied.add(group[i]);
             buttons.add(new Button(actions[i],labels[i],new RectF(group[i][0],group[i][1],group[i][2],group[i][3]),dp(2)));
@@ -424,20 +485,25 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                     !ammoTarget.isEmpty() || confirmedUnarmed(context),context.hudObjectivesKnown() && context.hudMap());
             if (context.hudObjectives()) TouchLayout.reserveSurfaceRect(context.objectiveRect,
                     viewport.left,viewport.top,viewport.right,viewport.bottom,hudReserved);
-            for (RectF rect : new RectF[]{mapTarget,ammoTarget,useTarget}) if (!rect.isEmpty())
+            // The Action caption comes and goes with the aimed object. It stays
+            // tappable but never displaces controls: hovering only adds Action.
+            for (RectF rect : new RectF[]{mapTarget,ammoTarget}) if (!rect.isEmpty())
                 hudReserved.add(new float[]{rect.left,rect.top,rect.right,rect.bottom});
             addGameplay(PAUSE,label("Pause", "Пауза"));
             addGameplay(editing ? DONE : MORE,editing ? label("Done", "Готово") : label("More", "Ещё"));
-            if (context.mode == GAMEPLAY) addGameplayCluster();
-            else { addGameplay(FIRE,label("Fire", "Огонь")); addGameplay(AIM,label("Aim", "Прицел")); }
-            if (editing || context.mode != GAMEPLAY || ammoTarget.isEmpty() || !context.known(RELOAD)) addGameplay(RELOAD,label("Reload", "Зарядить"));
-            addGameplay(USE,label("Use", "Действие"));
-            if (context.mode == VEHICLE) {
-                add(VEHICLE_BRAKE, label("Brake", "Тормоз"), 52, 76, 48);
-                add(VEHICLE_BOOST, label("Boost", "Ускорить"), 192, 76, 48);
-                add(VEHICLE_HORN, label("Horn", "Сигнал"), 192, 148, 48);
-            }
+            boolean seat=context.mode == VEHICLE;
+            if (seat) addSeatCluster();
+            else addGameplayCluster();
+            // A seat shows Reload only where the engine offers it (an attached
+            // rider's own weapon); its layout editor never adds on-foot buttons.
+            if ((!seat || !editing) && reloadButtonShown(context,!ammoTarget.isEmpty(),editing,preferences.reloadButton))
+                addGameplay(RELOAD,label("Reload", "Зарядить"));
+            // A seat's Exit is in its cluster; Horn and Switch seat are in the radial.
+            if (!seat) addGameplay(USE,label("Use", "Действие"));
         } else if (context.mode == CINEMATIC && context.has(CAN_SKIP)) {
+            // The cinematic replaces the cluster: Pause where it always is,
+            // Skip only while the original SkipCinematic is available.
+            addGameplay(PAUSE,label("Pause", "Пауза"));
             add(SKIP, label("Skip", "Пропуск"), 48, 40, 64);
         } else if (context.menu()) {
             add(BACK, label("Back", "Назад"), 36, 36, 56);
@@ -467,12 +533,13 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     }
     private void buildRadial() {
         radialButtons.clear();
+        String[] labels=radial==RADIAL_VEHICLE ? (russian?RADIAL_VEHICLE_RU:RADIAL_VEHICLE_EN) : (russian?RADIAL_RU:RADIAL_EN);
         for(int i=0;i<radialCount;i++) {
-            int a=RADIAL[i];
+            int a=radial[i];
             if (!radialAvailable(a)) continue;
             double angle=i*Math.PI*2/radialCount-Math.PI/2;
             float x=radialX+(float)Math.cos(angle)*radialRadius,y=radialY+(float)Math.sin(angle)*radialRadius,s=dp(25);
-            radialButtons.add(new Button(a,(russian?RADIAL_RU:RADIAL_EN)[i],new RectF(x-s,y-s,x+s,y+s),dp(2)));
+            radialButtons.add(new Button(a,labels[i],new RectF(x-s,y-s,x+s,y+s),dp(2)));
         }
     }
     private boolean radialAvailable(int action) {
@@ -480,6 +547,9 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 && !(action == CHAT && (fallback || !context.gameplay()))
                 && !(context.weaponCount >= 0 && context.weaponCount < 2 && (action == NEXT_WEAPON || action == PREV_WEAPON));
     }
+    static int[] radialActions(Context context) { return context.mode == VEHICLE ? RADIAL_VEHICLE : RADIAL; }
+    /** Radial items a second finger holds like a button (Turret fire, Look back). */
+    static boolean radialHold(int action) { return action == LOOK_BACK || action == DRIVER_FIRE_TURRET; }
     static int radialActionCount(Context context,boolean fallback) {
         return !fallback && context.usable() && context.gameplay() && context.allows(CHAT) ? 9 : 8;
     }
@@ -489,6 +559,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         // Capture the count once: a live availability change must not rotate
         // the other sectors underneath an already held finger.
         radialCount=radialActionCount(context,fallback);
+        radial=radialActions(context);
         radialRadius=Math.min(dp(94),Math.min(safe.width(),safe.height())/2-dp(30));
         float margin=radialRadius+dp(27);
         radialX=Math.max(safe.left+margin,Math.min(safe.right-margin,x));
@@ -515,7 +586,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
     }
     private void menuMoreHint() {
-        if (context.has(MAP_GESTURES)) showHint("Drag the map; pinch to zoom. Tap an icon to select", "Сдвигайте карту; разведите пальцы для масштаба. Тап — выбор значка",HINT_MAP_NAVIGATION);
+        if (context.has(MAP_GESTURES)) showHint("Drag the map, pinch to zoom. Waypoint marks the centre; hold a place to mark it",
+                "Двигайте карту, щипок — масштаб. «Маршрутная точка» — метка в центре, удержание — под пальцем",HINT_MAP_NAVIGATION);
         else if (context.has(DEBUG_CANVAS)) showHint("Tap rows; swipe lists and tabs. Hold More for actions", "Тапы — выбор; свайпы — списки и вкладки. Удерживайте «Ещё» для действий",HINT_DEBUG_MORE);
         else showHint("Tap to select, tap again to change. Swipe lists; hold More for actions", "Тап — выбор, повторный — изменение. Свайп — список; удерживайте «Ещё» для действий",HINT_MENU_MORE);
     }
@@ -590,7 +662,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             paint.setStyle(Paint.Style.FILL);paint.setColor(0xE6222830);paint.setAlpha(235);
             canvas.drawCircle(radialX,radialY,radialRadius+dp(29),paint);
             for(Button b:radialButtons) {
-                boolean selected=radialSelection>=0 && RADIAL[radialSelection]==b.action;
+                boolean selected=radialSelection>=0 && radial[radialSelection]==b.action;
                 paint.setColor(selected?0xFFFFD569:0xFF454F5D);canvas.drawCircle(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,paint);
                 paint.setColor(selected?Color.BLACK:Color.WHITE);paint.setTextSize(dp(10));paint.setTextAlign(Paint.Align.CENTER);
                 float measured=paint.measureText(b.label),available=b.rect.width()-dp(8);
@@ -625,9 +697,15 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         } else if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
             down(event.getPointerId(index), event.getX(index), event.getY(index));
         } else if (action == MotionEvent.ACTION_MOVE) {
+            moveVisual(moveVisualBefore);
             for (int h = 0; h < event.getHistorySize(); h++) for (int i = 0; i < event.getPointerCount(); i++)
                 move(event.getPointerId(i), event.getHistoricalX(i,h), event.getHistoricalY(i,h));
             for (int i = 0; i < event.getPointerCount(); i++) move(event.getPointerId(i), event.getX(i), event.getY(i));
+            moveVisual(moveVisualAfter);
+            // Look drags draw nothing here. Redrawing this full-screen layer per
+            // touch sample costs GPU time beside the game, and the compositor then
+            // waits for the game's GPU work before it takes the game's frame.
+            if (Arrays.equals(moveVisualBefore, moveVisualAfter)) return true;
         } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {
             int id = event.getPointerId(index);
             float x=event.getX(index),y=event.getY(index);
@@ -635,7 +713,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 int selected=radialDragged?TouchLayout.radialSector(x,y,radialX,radialY,radialRadius,radialCount):-1;
                 boolean tap=!radialDragged && SystemClock.uptimeMillis()-radialStarted<300;
                 closeRadial();
-                if (selected >= 0 && radialAvailable(RADIAL[selected])) activate(id,RADIAL[selected],x,y);
+                if (selected >= 0 && radialAvailable(radial[selected])) activate(id,radial[selected],x,y);
                 else if (tap) moreHint();
             } else if (hudGesture.owns(id)) {
                 RectF rect=hudPointers.get(id); hudPointers.remove(id);
@@ -684,6 +762,12 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
         if(radialOpen && id!=radialPointer) {
             if(b!=null && radialButtons.contains(b)) {
+                // A held item stays pressed under this finger past the radial,
+                // through the same native held bit as a button; others act on release.
+                if (!fallback && radialHold(b.action)) {
+                    input.down(id, TouchInput.BUTTON, b.action, x, y);
+                    haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
+                }
                 utilityPointers.put(id,b);
                 return;
             } else if(b!=null && b.action==MORE) {closeRadial();return;}
@@ -707,8 +791,9 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if(b.action<0 || b.action==PAUSE) {
                 utilityPointers.put(id,b);return;
             }
-            // X keeps the game's target-aware Use/Pickup/Revive and long-hold equip semantics.
-            if(context.gameplay() && b.action==USE) { legacyPointers.put(id,99);publishLegacyKeys(fallback?legacyHeld:0);return; }
+            // The native held Use bit presses the game's own X button: tap picks
+            // up, hold equips, with no virtual controller. Fallback keeps key X.
+            if(legacyUse(context,fallback,b.action)) { legacyPointers.put(id,99);publishLegacyKeys(legacyHeld);return; }
             input.down(id, TouchInput.BUTTON, b.action, x, y);
             haptic(HapticFeedbackConstants.VIRTUAL_KEY); return;
         }
@@ -719,7 +804,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if (!fallback && context.known(USE) && context.allows(USE) && useTarget.contains(x,y)) {
                 // The transparent native hint shares the Action button's real
                 // press/hold/up path, including pickup and hold-to-equip.
-                legacyPointers.put(id,99);publishLegacyKeys(0);
+                input.down(id, TouchInput.BUTTON, USE, x, y);
                 haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
             }
             if (!fallback && (mapTarget.contains(x,y) || (context.mode == GAMEPLAY && ammoTarget.contains(x,y)))) {
@@ -739,6 +824,20 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             input.down(id, movement ? TouchInput.MOVEMENT : TouchInput.LOOK, -1, x, y);
         }
     }
+    // What onDraw shows that a touch move can change: held buttons, the radial
+    // selection, utility holds, and the stick with its knob in whole pixels.
+    private void moveVisual(int[] out) {
+        long held = input.held();
+        boolean moving = input.moving();
+        float reach = dp(48 * preferences.scale);
+        out[0] = (int) held; out[1] = (int) (held >>> 32);
+        out[2] = radialOpen ? radialSelection : -2;
+        out[3] = utilityPointers.size();
+        out[4] = moving ? Math.round(input.stickX()) : Integer.MIN_VALUE;
+        out[5] = moving ? Math.round(input.stickY()) : 0;
+        out[6] = moving ? Math.round(input.moveX() * reach) : 0;
+        out[7] = moving ? Math.round(input.moveY() * reach) : 0;
+    }
     private void move(int id, float x, float y) {
         if (hudGesture.owns(id)) { hudGesture.move(id,x,y); return; }
         if (id==menuMorePointer) {
@@ -748,7 +847,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if(id==radialPointer) {
             if(Math.hypot(x-radialStartX,y-radialStartY)>dp(12)) radialDragged=true;
             int selected=radialDragged?TouchLayout.radialSector(x,y,radialX,radialY,radialRadius,radialCount):-1;
-            if(selected>=0 && !radialAvailable(RADIAL[selected])) selected=-1;
+            if(selected>=0 && !radialAvailable(radial[selected])) selected=-1;
             if(selected!=radialSelection && selected>=0) haptic(HapticFeedbackConstants.CLOCK_TICK);
             radialSelection=selected;return;
         }
@@ -776,7 +875,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             } else {clearMenuMore();buildButtons();menuMoreHint();}
             return;
         }
-        if(action>=LEGACY || (action==USE && context.gameplay()) || (fallback && action==MAP)) {
+        if(action>=LEGACY || legacyUse(context,fallback,action) || (fallback && action==MAP)) {
             final int key=action>=LEGACY?action-LEGACY:action==USE?99:4;
             final int owner=nextLegacyId++;
             legacyPointers.put(owner,key);publishLegacyKeys(fallback?legacyHeld:0);
@@ -849,8 +948,15 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (layoutChanged) { layoutChanged = false; preferences.save(); }
     }
     public static float renderScale(Activity owner) {
-        NativeTouchControls controls=active.get();
-        return (controls!=null && controls.activity==owner ? controls.preferences : new TouchPreferences(owner)).renderPercent/100f;
+        return sessionRenderPercent(owner)/100f;
+    }
+    /** A changed resolution takes effect in the next process, after a restart. */
+    private static synchronized int sessionRenderPercent(Activity owner) {
+        if (sessionRenderPercent == 0) {
+            NativeTouchControls controls=active.get();
+            sessionRenderPercent=(controls!=null && controls.activity==owner ? controls.preferences : new TouchPreferences(owner)).renderPercent;
+        }
+        return sessionRenderPercent;
     }
     public static boolean microphoneEnabled(Activity owner) {
         NativeTouchControls controls=active.get();
@@ -882,9 +988,23 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     }
     private String label(String english, String ru) { return russian ? ru : english; }
     private void applyRenderScale() {
+        // Same size as UE3JavaApp's launch callback, which truncates.
+        float scale=renderScale(activity);
         if(surface instanceof SurfaceView && surface.getWidth()>0 && surface.getHeight()>0)
-            ((SurfaceView)surface).getHolder().setFixedSize(Math.round(surface.getWidth()*preferences.renderPercent/100f),
-                    Math.round(surface.getHeight()*preferences.renderPercent/100f));
+            ((SurfaceView)surface).getHolder().setFixedSize((int)(surface.getWidth()*scale),(int)(surface.getHeight()*scale));
+    }
+    private void offerRenderRestart() {
+        renderRestartOffered=preferences.renderPercent;
+        if (activity.isFinishing() || activity.isDestroyed() || (restartDialog!=null && restartDialog.isShowing())) return;
+        String message=label("Render resolution "+renderRestartOffered+"% applies after the game restarts. Restart now?",
+                "Разрешение рендера "+renderRestartOffered+"% применится после перезапуска игры. Перезапустить сейчас?");
+        if (inWorld) message+=label("\n\nProgress since the last save will be lost.",
+                "\n\nПрогресс после последнего сохранения будет потерян.");
+        restartDialog=new android.app.AlertDialog.Builder(activity)
+                .setMessage(message)
+                .setPositiveButton(label("Restart","Перезапустить"),(dialog,which)->GameRestart.restart(activity))
+                .setNegativeButton(label("Later","Позже"),null)
+                .show();
     }
     private void haptic(int feedback) {
         if (preferences.haptics) performHapticFeedback(feedback);
@@ -903,20 +1023,21 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if (expected != guest[i+1]) update = true;
         }
         boolean microphoneBefore = preferences.microphoneEnabled;
-        int renderBefore = preferences.renderPercent;
         if (update) preferences.applySettingsWire(guest);
         boolean changed = settingsRevision == 0 || (guest[2]&2)!=0;
         int[] applied = preferences.settingsWire(settingsRevision);
         for (int i = 2; i < host.length; ++i) if (host[i] != applied[i]) changed = true;
         boolean microphoneChanged = microphoneBefore != preferences.microphoneEnabled;
-        boolean renderChanged = renderBefore != preferences.renderPercent;
         settingsRevision = guest[1];
         if ((guest[2]&1) != 0) layoutEditPending = true;
         if ((guest[2]&4) != 0) gyro.reset();
         if (microphoneChanged) applyMicrophone();
-        if (renderChanged) renderScalePending = true;
-        // Keep the original GFx slider's gesture alive while settings change.
-        if (renderScalePending && !next.menu()) { renderScalePending = false; applyRenderScale(); }
+        // The engine sizes its render targets at launch: a new resolution is
+        // offered as a restart once the video options page has closed. Two
+        // polls ride out the page's own list rebuilds.
+        videoOptionsAway = (guest[2]&16) != 0 ? 0 : Math.min(videoOptionsAway+1, 2);
+        if ((finalPoll || videoOptionsAway >= 2) && preferences.renderPercent != renderRestartOffered
+                && preferences.renderPercent != sessionRenderPercent(activity)) offerRenderRestart();
         if (changed) {
             layoutDirty = true; gyro.reset();
             if (!next.menu()) { cancelInput(); return true; }

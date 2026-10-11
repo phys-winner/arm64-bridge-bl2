@@ -167,7 +167,7 @@ std::uint64_t mix(std::uint64_t seed, std::uint64_t value) {
 }
 
 struct Observation {
-    std::uint32_t viewport = 0, world = 0, controller = 0, input = 0, movie = 0, movieOwner = 0;
+    std::uint32_t viewport = 0, world = 0, local = 0, controller = 0, input = 0, movie = 0, movieOwner = 0;
     std::vector<std::string> contexts;
     std::vector<std::string> available;
     std::string movieClass;
@@ -205,6 +205,7 @@ Observation observe(Reader& read, std::uint32_t viewport) {
     }
     const auto local = read.u32(players);
     if (!read.object(local) || !read.span(local, 0x68)) return out;
+    out.local = local;
     out.controller = read.u32(local + 0x40);
     if (!read.object(out.controller) || !read.span(out.controller, 0x770)) return out;
     out.identity = mix(out.identity, read.objectToken(out.controller));
@@ -286,9 +287,6 @@ Observation observe(Reader& read, std::uint32_t viewport) {
 #endif
     }
     std::sort(out.available.begin(), out.available.end());
-    const auto has = [&](const char* name) {
-        return std::find(out.contexts.begin(), out.contexts.end(), name) != out.contexts.end();
-    };
     out.reason = "observed-only";
     bool nativeMenuOpen = false;
     if (!out.movie) {
@@ -301,12 +299,11 @@ Observation observe(Reader& read, std::uint32_t viewport) {
         }
     }
     if (nativeMenuOpen || (out.movie && out.movieClass != "WillowHUDGFxMovie")) out.mode = bl2::touch::Mode::Menu;
-    else if (has("InputContext_Cinematic")) out.mode = bl2::touch::Mode::Cinematic;
-    else if (has("InputContext_DrivingVehicle") || has("InputContext_InVehicleTurret") ||
-             has("InputContext_VehicleAttachedRider")) out.mode = bl2::touch::Mode::Vehicle;
-    else if (has("InputContext_OnFoot") || has("InputContext_Injured") || has("InputContext_InjuredMoving"))
-        out.mode = bl2::touch::Mode::Gameplay;
-    else out.reason = "unclassified-live-context";
+    else {
+        out.mode = bl2::touch::Bl2TouchContextMode(out.contexts);
+        if (out.mode == bl2::touch::Mode::Unknown)
+            out.reason = out.contexts.size() > 2 ? "too-many-live-contexts" : "unclassified-live-context";
+    }
     return out;
 }
 
@@ -315,6 +312,153 @@ std::string joined(const std::vector<std::string>& names) {
     for (const auto& name : names) { if (!result.empty()) result += ','; result += name; }
     return result;
 }
+
+#if HORN_ENABLE_LOGGING
+// Diagnostic builds only, for device QA of class contexts, skills and vehicles:
+// debug.bl2bridge.qa_exec="<tag>:<console command>" runs the command once
+// through the original ULocalPlayer::Exec(const TCHAR*, FOutputDevice&) with
+// *GLog, exactly as the game's own console would. A new tag repeats it.
+constexpr std::uint32_t kLocalPlayerExec = 0x01623F50;
+constexpr std::uint32_t kGLog = 0x02F3A200;
+constexpr std::array<std::uint32_t, 4> kLocalPlayerExecPrefix = {0xE92D4FF0, 0xED2D8B02, 0xE1A07000, 0xE59F4794};
+bool qaExecVerified = false;
+std::string qaLastExec;
+std::uint64_t qaPollMs = 0;
+std::uint32_t qaScratch = 0;
+// ClientMessage and script `log text of a QA command reach only GLog's output
+// devices. A 16-byte guest FOutputDevice (vptr, 0, 0, 1: the base fields as
+// FOutputDeviceRedirector's constructor sets them) whose vtable copies
+// _ZTV17FOutputDeviceNull with Serialize (address point + 8, the slot
+// FOutputDevice::Log calls) bound to a host thunk joins the original redirector
+// at the first command. Only a 3 s window after each command reaches logcat.
+constexpr std::uint32_t kAddOutputDevice = 0x00FFA120;
+constexpr std::array<std::uint32_t, 4> kAddOutputDevicePrefix = {0xE92D40F8, 0xE2807040, 0xE59F30B8, 0xE1A04001};
+constexpr std::uint32_t kNullDeviceVtable = 0x02D26170;
+constexpr std::array<std::uint32_t, 3> kNullDeviceSlots = {0x00F250B8, 0x00F265A4, 0x00F24CBC};
+// "@ondemand <package>" asks the original client RPC body to stream a vehicle
+// package (UWillowPlayerPawnDataManager::LoadDataPackageAsyncNoCallback, which
+// appends _SF), as the server does for a Catch-A-Ride. SpawnVehicle needs it.
+constexpr std::uint32_t kClientLoadOnDemand = 0x02369C18;
+constexpr std::array<std::uint32_t, 4> kClientLoadOnDemandPrefix = {0xE92D4038, 0xE1A05001, 0xE59F302C, 0xE1A04000};
+bool qaOnDemandVerified = false;
+// "@standalone <command>": WillowCheatManager.SpawnVehicle returns unless
+// WorldInfo.NetMode is NM_Standalone, and BL2 hosts single player as a listen
+// server. UWorld::GetNetMode reads GWorld->PersistentLevel(+0x50)->Actors
+// (+0x3C)[0]->NetMode (byte +0x370); only this one Exec call sees 0.
+constexpr std::uint32_t kWorldGetNetMode = 0x017BA4D4;
+constexpr std::array<std::uint32_t, 5> kWorldGetNetModeWords = {0xE5903050, 0xE593303C, 0xE5933000, 0xE5D30370, 0xE12FFF1E};
+bool qaStandaloneVerified = false;
+bool qaMirrorVerified = false;
+std::uint32_t qaMirrorThunk = 0, qaMirror = 0;
+std::atomic<std::uint64_t> qaMirrorUntil{0};
+std::atomic<unsigned> qaMirrorLines{0};
+
+void qaMirrorSerialize(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+    if (bl2::touch::monotonicMilliseconds() > qaMirrorUntil.load(std::memory_order_relaxed) ||
+        qaMirrorLines.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+    const auto text = jit.Regs()[1];
+    std::string line;
+    for (std::uint32_t i = 0; i != 480 && text >= 0x10000 && text + i < host.GetGuestMemorySize(); ++i) {
+        const auto c = host.MemoryRead8(text + i);
+        if (!c) break;
+        line += c >= 32 && c < 127 ? static_cast<char>(c) : '?';
+    }
+    HORN_LOGI(kTag, "qa-glog event=%u %s", jit.Regs()[2], line.c_str());
+}
+
+bool qaMirrorAttach(Reader& read) {
+    if (qaMirror) return true;
+    if (!qaMirrorVerified || !qaMirrorThunk) return false;
+    for (std::size_t i = 0; i < kNullDeviceSlots.size(); ++i)
+        if (read.u32(read.base + kNullDeviceVtable + 8 + std::uint32_t(i * 4)) != read.base + kNullDeviceSlots[i]) {
+            qaMirrorVerified = false;
+            HORN_LOGE(kTag, "qa-glog unavailable: FOutputDeviceNull vtable slot %zu mismatch", i);
+            return false;
+        }
+    const auto redirector = read.u32(read.base + kGLog);
+    if (!read.span(redirector, 0x44)) return false;
+    const auto block = read.host.GuestAlloc(7 * 4 + 16, 8);
+    if (!block) return false;
+    for (std::uint32_t i = 0; i != 7; ++i)
+        read.host.MemoryWrite32(block + i * 4, read.u32(read.base + kNullDeviceVtable + i * 4));
+    read.host.MemoryWrite32(block + 4 * 4, qaMirrorThunk);
+    const auto device = block + 7 * 4;
+    read.host.MemoryWrite32(device, block + 8);
+    read.host.MemoryWrite32(device + 4, 0);
+    read.host.MemoryWrite32(device + 8, 0);
+    read.host.MemoryWrite32(device + 12, 1);
+    if (!bl2::touch::Bl2TouchCallGuest(read.host, read.base + kAddOutputDevice, {redirector, device})) return false;
+    qaMirror = device;
+    HORN_LOGI(kTag, "qa-glog mirror attached device=%08X redirector=%08X", device, redirector);
+    return true;
+}
+
+void qaConsoleExec(Reader& read, const Observation& result) {
+    const auto now = bl2::touch::monotonicMilliseconds();
+    if (!qaExecVerified || now - qaPollMs < 250) return;
+    qaPollMs = now;
+    char value[PROP_VALUE_MAX] = {};
+    __system_property_get("debug.bl2bridge.qa_exec", value);
+    const std::string request(value);
+    const auto separator = request.find(':');
+    if (request == qaLastExec || separator == std::string::npos || separator + 1 >= request.size()) return;
+    qaLastExec = request;
+    const auto command = request.substr(separator + 1);
+    const auto device = read.u32(read.base + kGLog);
+    if (!read.object(result.local) || !read.span(device, 4) || !read.span(read.u32(device), 4)) {
+        HORN_LOGE(kTag, "qa-exec refused (no local player/log device): %s", command.c_str());
+        return;
+    }
+    if (!qaScratch) qaScratch = read.host.GuestAlloc(PROP_VALUE_MAX + 8, 8);
+    if (!qaScratch) return;
+    for (std::size_t i = 0; i <= command.size(); ++i)
+        read.host.MemoryWrite8(qaScratch + std::uint32_t(i), i < command.size() ? std::uint8_t(command[i]) : 0);
+    if (qaMirrorAttach(read)) {
+        qaMirrorLines.store(0, std::memory_order_relaxed);
+        qaMirrorUntil.store(now + 3000, std::memory_order_relaxed);
+    }
+    if (command.rfind("@ondemand ", 0) == 0) {
+        // FString {Data, Num incl. NUL, Max} after the text; the callee copies it.
+        const auto text = command.size() - 10 + 1;
+        const auto string = (qaScratch + std::uint32_t(command.size()) + 4) & ~3u;
+        if (!qaOnDemandVerified || !read.object(result.controller) || string + 12 > qaScratch + PROP_VALUE_MAX + 8) {
+            HORN_LOGE(kTag, "qa-exec @ondemand refused: %s", command.c_str());
+            return;
+        }
+        read.host.MemoryWrite32(string, qaScratch + 10);
+        read.host.MemoryWrite32(string + 4, std::uint32_t(text));
+        read.host.MemoryWrite32(string + 8, std::uint32_t(text));
+        const bool called = bl2::touch::Bl2TouchCallGuest(read.host, read.base + kClientLoadOnDemand,
+            {result.controller, string});
+        HORN_LOGI(kTag, "qa-exec tag=%s ondemand='%s' called=%u", request.substr(0, separator).c_str(),
+            command.substr(10).c_str(), called ? 1u : 0u);
+        return;
+    }
+    std::uint32_t netModeAt = 0;
+    std::uint8_t netMode = 0;
+    if (command.rfind("@standalone ", 0) == 0) {
+        const auto world = read.u32(read.base + 0x0300D940);
+        const auto level = read.object(world) ? read.u32(world + 0x50) : 0;
+        const auto info = read.object(level) ? read.u32(read.u32(level + 0x3C)) : 0;
+        if (!qaStandaloneVerified || read.className(info) != "WorldInfo" || !read.span(info + 0x370, 1) ||
+            (netMode = read.host.MemoryRead8(info + 0x370)) > 3) {
+            HORN_LOGE(kTag, "qa-exec @standalone refused: %s", command.c_str());
+            return;
+        }
+        netModeAt = info + 0x370;
+        const auto rest = command.substr(12);
+        for (std::size_t i = 0; i <= rest.size(); ++i)
+            read.host.MemoryWrite8(qaScratch + std::uint32_t(i), i < rest.size() ? std::uint8_t(rest[i]) : 0);
+        read.host.MemoryWrite8(netModeAt, 0);
+    }
+    std::uint32_t handled = 0;
+    const bool called = bl2::touch::Bl2TouchCallGuest(read.host, read.base + kLocalPlayerExec,
+        {result.local, qaScratch, device}, handled);
+    if (netModeAt) read.host.MemoryWrite8(netModeAt, netMode);
+    HORN_LOGI(kTag, "qa-exec tag=%s command='%s' called=%u handled=%u netmode=%u", request.substr(0, separator).c_str(),
+        command.c_str(), called ? 1u : 0u, handled, netModeAt ? unsigned(netMode) : 255u);
+}
+#endif
 
 void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
     if (!active || insideProbe) return;
@@ -335,17 +479,49 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         // Injured uses the same original PlayerWalking axes. Its Pawn state
         // keeps the native crawl/zero-speed timing and ProcessInjuredViewRotation.
         // Native14 witnessed that the OnFoot-only gate suppressed both axes in
-        // FFYL. Vehicles, focused GFx and ambiguous multi-contexts stay denied.
-        const bool gameplayAxes = bl2::touch::Bl2TouchGameplayAxes(result.mode,result.movie,
-            result.contexts.size(),result.contexts.empty() ? std::string_view{} : result.contexts[0]);
-        const auto mask = gameplaySink->prepare(gameplayAxes ? result.controller : 0,
-                                               gameplayAxes ? result.input : 0, result.identity, result.viewport);
-        if (gameplayAxes && gameplaySink->ready()) {
-            context.capabilities = bl2::touch::GameplayInput | bl2::touch::RelativeLook;
+        // FFYL. Class contexts (Siren's added SirenOnFoot, every action skill,
+        // Mercenary FFYL) keep the same route; Execute keeps actions only.
+        // Focused GFx and unlisted or 3+ contexts stay denied.
+        const bool gameplayActions = bl2::touch::Bl2TouchGameplayActions(result.mode,result.movie,result.contexts);
+        const bool gameplayAxes = bl2::touch::Bl2TouchGameplayAxes(result.mode,result.movie,result.contexts);
+        // InputContext_Cinematic holds SkipCinematic and ShowMenu (PauseMenu):
+        // the same resolver and IsActionAvailable, no axes and no HUD telemetry.
+        // Skip stays only while ServerSkipMatinee could skip the camera matinee.
+        const bool cinematicActions = bl2::touch::Bl2TouchCinematicActions(result.mode,result.movie,result.contexts);
+        // Vehicle seats resolve their own shipped actions (ExitVehicle,
+        // SwitchSeats, Handbrake, Afterburner, Horn, DriverFireTurret, LookBack,
+        // Fire, Aim) and add the stick to the RawJoy fields PlayerDriving reads.
+        const bool vehicleActions = bl2::touch::Bl2TouchVehicleActions(result.mode,result.movie,result.contexts);
+        const bool vehicleAxes = bl2::touch::Bl2TouchVehicleAxes(result.mode,result.movie,result.contexts);
+        const bool routed = gameplayActions || vehicleActions || cinematicActions;
+        using Scene = bl2::touch::Ue3GameplaySink::Scene;
+        const auto scene = gameplayActions ? Scene::Gameplay : (vehicleActions ? Scene::Vehicle : Scene::Cinematic);
+        const auto mask = gameplaySink->prepare(routed ? result.controller : 0, routed ? result.input : 0,
+            result.identity, result.viewport, gameplayAxes || vehicleAxes, scene);
+        if (cinematicActions && gameplaySink->ready()) {
+            context.availableActions = mask & (bl2::touch::actionBit(bl2::touch::Action::Skip) |
+                bl2::touch::actionBit(bl2::touch::Action::Pause));
+            if (context.availableActions) context.capabilities = bl2::touch::CanSkip;
+        }
+        if (gameplayActions && gameplaySink->ready()) {
+            context.capabilities = bl2::touch::GameplayInput | (gameplayAxes ? bl2::touch::RelativeLook : 0u);
             context.availableActions = mask & (((std::uint64_t{1} << 15) - 1) |
                 bl2::touch::actionBit(bl2::touch::Action::LastWeapon) |
                 bl2::touch::actionBit(bl2::touch::Action::Chat));
             gameplaySink->telemetry(context);
+        }
+        if (vehicleActions && gameplaySink->ready()) {
+            context.capabilities = bl2::touch::GameplayInput | (vehicleAxes ? bl2::touch::RelativeLook : 0u);
+            context.availableActions = mask & (((std::uint64_t{1} << 15) - 1) |
+                bl2::touch::actionBit(bl2::touch::Action::VehicleBrake) |
+                bl2::touch::actionBit(bl2::touch::Action::VehicleBoost) |
+                bl2::touch::actionBit(bl2::touch::Action::VehicleHorn) |
+                bl2::touch::actionBit(bl2::touch::Action::LastWeapon) |
+                bl2::touch::actionBit(bl2::touch::Action::Chat) |
+                bl2::touch::actionBit(bl2::touch::Action::ExitVehicle) |
+                bl2::touch::actionBit(bl2::touch::Action::SwitchSeats) |
+                bl2::touch::actionBit(bl2::touch::Action::DriverFireTurret) |
+                bl2::touch::actionBit(bl2::touch::Action::LookBack));
         }
         if (uiSink || widgetSink) {
             const auto caps = widgetSink ? widgetSink->prepare(result.viewport,result.controller,result.movie,result.movieOwner,result.identity) :
@@ -390,6 +566,9 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
     else if (gameplaySink) bl2::touch::consumeIntoEngine(mailbox, tick,
         bl2::touch::monotonicMilliseconds(), *gameplaySink);
     else (void)mailbox.consumeFrame(tick, bl2::touch::monotonicMilliseconds());
+#if HORN_ENABLE_LOGGING
+    qaConsoleExec(read, result);
+#endif
     [[maybe_unused]] const auto snapshot = mailbox.snapshot();
     const std::string contexts = joined(result.contexts), actions = joined(result.available);
     const auto description = std::to_string(result.identity) + '/' + result.reason + '/' + contexts + '/' + actions + '/' + std::to_string(context.capabilities);
@@ -473,6 +652,36 @@ bool InstallBl2TouchRuntime(DynarmicHost& host) {
     constexpr std::array<std::uint32_t, 4> availability = {0xE92D0070,0xE5903290,0xE3530000,0x1A000002};
     for (std::size_t i = 0; i < availability.size(); ++i)
         if (host.MemoryRead32(base + 0x0235679C + std::uint32_t(i * 4)) != availability[i]) return false;
+    // UWillowPlayerInput::InputKey, the original X button route of touch Use.
+    constexpr std::array<std::uint32_t, 4> inputKey = {0xE92D40F0,0xE1A04000,0xE5D0017C,0xE24DD01C};
+    if (elf.GetSymbolAddress("_ZN18UWillowPlayerInput8InputKeyEi5FName11EInputEventfj") != base + 0x0236E058) return false;
+    for (std::size_t i = 0; i < inputKey.size(); ++i)
+        if (host.MemoryRead32(base + 0x0236E058 + std::uint32_t(i * 4)) != inputKey[i]) return false;
+#if HORN_ENABLE_LOGGING
+    qaExecVerified = elf.GetSymbolAddress("_ZN12ULocalPlayer4ExecEPKcR13FOutputDevice") == base + kLocalPlayerExec &&
+        elf.GetSymbolAddress("GLog") == base + kGLog;
+    for (std::size_t i = 0; qaExecVerified && i < kLocalPlayerExecPrefix.size(); ++i)
+        qaExecVerified = host.MemoryRead32(base + kLocalPlayerExec + std::uint32_t(i * 4)) == kLocalPlayerExecPrefix[i];
+    if (!qaExecVerified) HORN_LOGE(kTag, "qa-exec unavailable: ULocalPlayer::Exec/GLog signature mismatch");
+    qaMirrorVerified = qaExecVerified &&
+        elf.GetSymbolAddress("_ZN23FOutputDeviceRedirector15AddOutputDeviceEP13FOutputDevice") == base + kAddOutputDevice &&
+        elf.GetSymbolAddress("_ZTV17FOutputDeviceNull") == base + kNullDeviceVtable;
+    for (std::size_t i = 0; qaMirrorVerified && i < kAddOutputDevicePrefix.size(); ++i)
+        qaMirrorVerified = host.MemoryRead32(base + kAddOutputDevice + std::uint32_t(i * 4)) == kAddOutputDevicePrefix[i];
+    if (qaMirrorVerified) qaMirrorThunk = host.GetThunkManager().RegisterThunk("bl2_qa_glog_serialize", qaMirrorSerialize);
+    if (!qaMirrorThunk) HORN_LOGE(kTag, "qa-glog unavailable: FOutputDeviceRedirector/FOutputDeviceNull signature mismatch");
+    qaOnDemandVerified = qaExecVerified &&
+        elf.GetSymbolAddress("_ZN23AWillowPlayerController25ClientLoadOnDemandPackageERK7FString") == base + kClientLoadOnDemand;
+    for (std::size_t i = 0; qaOnDemandVerified && i < kClientLoadOnDemandPrefix.size(); ++i)
+        qaOnDemandVerified = host.MemoryRead32(base + kClientLoadOnDemand + std::uint32_t(i * 4)) == kClientLoadOnDemandPrefix[i];
+    qaStandaloneVerified = qaExecVerified && elf.GetSymbolAddress("_ZNK6UWorld10GetNetModeEv") == base + kWorldGetNetMode;
+    for (std::size_t i = 0; qaStandaloneVerified && i < kWorldGetNetModeWords.size(); ++i)
+        qaStandaloneVerified = host.MemoryRead32(base + kWorldGetNetMode + std::uint32_t(i * 4)) == kWorldGetNetModeWords[i];
+    // A request left over from an earlier process is never replayed.
+    char staleRequest[PROP_VALUE_MAX] = {};
+    __system_property_get("debug.bl2bridge.qa_exec", staleRequest);
+    qaLastExec = staleRequest;
+#endif
 
     std::array<std::uint32_t, sizeof(hooks) / sizeof(hooks[0])> sites{};
 #if defined(BL2_NATIVE_ARM32)

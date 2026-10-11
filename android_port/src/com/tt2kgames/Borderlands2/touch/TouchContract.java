@@ -3,7 +3,7 @@ package com.tt2kgames.Borderlands2.touch;
 /** Versioned ABI shared with bl2_touch_input.h. No engine offsets belong here. */
 public final class TouchContract {
     private TouchContract() {}
-    public static final int VERSION = 3;
+    public static final int VERSION = 4;
     public static final int UNKNOWN = 0, LOADING = 1, CINEMATIC = 2, FRONTEND = 3,
             GAMEPLAY = 4, VEHICLE = 5, MENU = 6, DIALOG = 7, TEXT_INPUT = 8, DEAD = 9;
     public static final int GAMEPLAY_INPUT = 1, RELATIVE_LOOK = 2, DIRECT_UI = 4,
@@ -14,7 +14,9 @@ public final class TouchContract {
             NEXT_WEAPON = 10, PREV_WEAPON = 11, INVENTORY = 12, MAP = 13,
             PAUSE = 14, BACK = 15, CONFIRM = 16, SKIP = 17,
             VEHICLE_BRAKE = 18, VEHICLE_BOOST = 19, VEHICLE_HORN = 20,
-            UI_UP = 21, UI_DOWN = 22, UI_LEFT = 23, UI_RIGHT = 24, LAST_WEAPON = 25, CHAT = 26;
+            UI_UP = 21, UI_DOWN = 22, UI_LEFT = 23, UI_RIGHT = 24, LAST_WEAPON = 25, CHAT = 26,
+            EXIT_VEHICLE = 27, SWITCH_SEATS = 28, DRIVER_FIRE_TURRET = 29, LOOK_BACK = 30,
+            ACTION_COUNT = 31;
     public static final int DOWN = 0, MOVE = 1, UP = 2, CANCEL = 3;
     public static long bit(int action) { return 1L << action; }
 

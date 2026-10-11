@@ -33,6 +33,10 @@ bool copyMemory(const void* p, std::uint32_t at, void* out, std::size_t bytes) {
 #endif
     return true;
 }
+const char* TouchPageUsage(bool russian) {
+    return russian ? "Тап: выделить; повторный тап: изменить. Смахивание: прокрутка. Для раскладки продолжите игру." :
+        "Tap to select; tap again to change. Swipe to scroll. Resume the game to edit the button layout.";
+}
 struct Reader {
     DynarmicHost& host;
     const std::uint32_t base;
@@ -549,12 +553,14 @@ private:
         // Value TextFields and descriptions are independent of optional CLIK
         // typography. Some authored lists do not expose the private _rowHeight.
         if (original_.movieClass == "OptionsGFxMovie") {
-            if (!page_ && s.hasCallBudget(4)) {
+            if ((!page_ || (page_ == 1 && originalDescription_)) && s.hasCallBudget(4)) {
                 double selected = -1;
                 if (number(list_,"selectedIndex",selected) && selected >= 0 &&
                     std::floor(selected) == selected && selected < events_.size()) {
                     const auto id = events_[static_cast<std::size_t>(selected)] - kTouchSettingsValue;
-                    const auto hint = id >= 0 ? TouchSettingHint(static_cast<std::size_t>(id),Bl2RussianLocaleSelected()) : nullptr;
+                    const auto own = id >= 0 ? TouchSettingHint(static_cast<std::size_t>(id),Bl2RussianLocaleSelected()) : nullptr;
+                    // The touch page keeps its usage line under rows without their own hint.
+                    const auto hint = own ? own : page_ ? TouchPageUsage(Bl2RussianLocaleSelected()) : nullptr;
                     if (hint) {
                         auto text = s.stringValue(hint);
                         auto result = s.invoke(options_,"SetDescription",{text},true);
@@ -631,7 +637,7 @@ private:
         if (!data || !s.setMember(list_,"data",data)) { s.release(data); return false; }
         s.release(data);
         if (page == 2) {
-            for (std::size_t i = 21; i < kTouchSettingCount; ++i) {
+            for (std::size_t i = 21; i < kTouchFramePacingSetting; ++i) {
 #if defined(BL2_NATIVE_ARM32)
                 if(i>=32)continue; // These replacements belong to the ARM64 bridge.
 #endif
@@ -641,7 +647,10 @@ private:
         } else if (page == 1) {
             for (std::size_t i = 1; i < 16; ++i) if (i != 8 &&
                 !row(TouchSettingCaption(i,Bl2RussianLocaleSelected()),kTouchSettingsValue + static_cast<std::int32_t>(i),static_cast<int>(i))) return false;
-            if (!row(Bl2RussianLocaleSelected() ? "ИЗМЕНИТЬ РАСКЛАДКУ" : "EDIT BUTTON LAYOUT",kTouchSettingsEdit) ||
+            if (!row(TouchSettingCaption(kTouchReloadButtonSetting,Bl2RussianLocaleSelected()),
+                    kTouchSettingsValue + static_cast<std::int32_t>(kTouchReloadButtonSetting),
+                    static_cast<int>(kTouchReloadButtonSetting)) ||
+                !row(Bl2RussianLocaleSelected() ? "ИЗМЕНИТЬ РАСКЛАДКУ" : "EDIT BUTTON LAYOUT",kTouchSettingsEdit) ||
                 !row(Bl2RussianLocaleSelected() ? "СБРОСИТЬ УПРАВЛЕНИЕ" : "RESET TOUCH CONTROLS",kTouchSettingsReset) ||
                 !row(Bl2RussianLocaleSelected() ? "КАЛИБРОВКА НАКЛОНА" : "CALIBRATE TILT AIMING",kTouchSettingsCalibrate) ||
                 !row(Bl2RussianLocaleSelected() ? "НАЗАД" : "BACK",kTouchSettingsBack)) return false;
@@ -656,6 +665,11 @@ private:
             if (!row(TouchSettingCaption(id,Bl2RussianLocaleSelected()),kTouchSettingsValue + id,id)) return false;
             if (id == 0 && (!row(TouchSettingCaption(18,Bl2RussianLocaleSelected()),kTouchSettingsValue + 18,18) ||
                 !row(TouchSettingCaption(19,Bl2RussianLocaleSelected()),kTouchSettingsValue + 19,19) ||
+#if !defined(BL2_NATIVE_ARM32) // The frame pacer belongs to the ARM64 bridge.
+                !row(TouchSettingCaption(kTouchFramePacingSetting,Bl2RussianLocaleSelected()),
+                    kTouchSettingsValue + static_cast<std::int32_t>(kTouchFramePacingSetting),
+                    static_cast<int>(kTouchFramePacingSetting)) ||
+#endif
                 !row(TouchSettingCaption(20,Bl2RussianLocaleSelected()),kTouchSettingsValue + 20,20) ||
                 !row(Bl2RussianLocaleSelected() ? "ДОПОЛНИТЕЛЬНАЯ ГРАФИКА" : "ADDITIONAL GRAPHICS",kTouchSettingsGraphicsOpen))) return false;
         }
@@ -672,9 +686,8 @@ private:
             if (originalDescription_) {
                 auto hint = s.stringValue(page == 2 ? (Bl2RussianLocaleSelected() ?
                     "Здесь сохраняются обычные настройки. Картофельная графика временно перекрывает их." :
-                    "Your ordinary settings are saved here. Potato graphics temporarily overrides them.") : Bl2RussianLocaleSelected() ?
-                    "Тап: выделить; повторный тап: изменить. Смахивание: прокрутка. Для раскладки продолжите игру." :
-                    "Tap to select; tap again to change. Swipe to scroll. Resume the game to edit the button layout.");
+                    "Your ordinary settings are saved here. Potato graphics temporarily overrides them.") :
+                    TouchPageUsage(Bl2RussianLocaleSelected()));
                 result = s.invoke(options_,"SetDescription",{hint},true); s.release(result); s.release(hint);
             }
         } else {
@@ -693,7 +706,8 @@ private:
         auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
         state.owner = original_.owner; state.list = original_.list; state.provider = original_.provider;
         state.nativeStructure = original_.structure; state.nativeEvents = original_.eventIds;
-        state.events = events_; state.page = page; return true;
+        state.events = events_; state.page = page;
+        state.videoOptions = original_.providerClass == "WillowScrollingListDataProviderVideoOptions"; return true;
     }
     void drop(bool restore) {
         if (values_) {
@@ -710,7 +724,7 @@ private:
             values_->close(); values_.reset(); transport_.reset();
         }
         auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
-        if (state.owner == original_.owner) { state.owner = state.list = state.provider = state.nativeStructure = 0; state.events.clear(); state.nativeEvents.clear(); state.page = false; }
+        if (state.owner == original_.owner) { state.owner = state.list = state.provider = state.nativeStructure = 0; state.events.clear(); state.nativeEvents.clear(); state.page = false; state.videoOptions = false; }
         list_ = options_ = headerText_ = originalHeader_ = description_ = originalDescription_ = originalData_ = listeners_ = sliderHandler_ = spinnerHandler_ = quietSlider_ = quietSpinner_ = emptyListeners_ = {};
         page_ = false;
         observedScale_ = 0;

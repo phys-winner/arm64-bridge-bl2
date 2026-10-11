@@ -4,6 +4,7 @@
 #include <array>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace bl2::touch {
@@ -158,6 +159,42 @@ struct MapCursorTarget {
 // mouse position as the new waypoint.
 MapCursorTarget CaptureBl2MapCursor(GfxSession&,GfxHandle map,GfxHandle mask,
     std::uint32_t width,std::uint32_t height,float x,float y);
+
+// Original menu descriptions are fixed EditTexts that scroll by whole lines
+// (PageUp/PageDown, LT/RT, the wheel and the more-arrows). A vertical drag
+// that starts on one moves the same TextField.scroll the originals do.
+struct TextScrollTarget {
+    const char* field;     // AS path of the TextField from _root
+    bool parentOwnsSwipe;  // the whole parent panel owns the swipe
+    const char* arrows;    // _root function redrawing the original arrows, or nullptr
+    GfxRect box;           // authored EditText box, pixels at 100% scale
+};
+// Mission log (StatusMenuExGFxMovie screen1), challenge log (screen5) and the
+// mission accept/turn-in dialog. Other screens have no scrollable description.
+std::vector<const TextScrollTarget*> Bl2TextScrollTargets(std::string_view movieClass,std::int32_t screen);
+// [_x,_y,_width,_height,_xscale,_yscale,_rotation] of the authored field. The
+// field must still have its authored size (up to one uniform depth factor for
+// a field with its own _z); Scaleform reports _x/_y at the box's own top-left,
+// so the authored nonzero origin is never added again.
+bool Bl2TextScrollLocalRect(const TextScrollTarget&,const std::array<double,7>& metrics,GfxRect& local);
+// Dragging up by one line height reveals one later line.
+std::int32_t Bl2TextScrollLine(std::int32_t start,std::int32_t maximum,double dragPixels,double linePixels);
+struct TextScrollCapture {
+    const TextScrollTarget* target=nullptr;
+    GfxIdentity field{};
+    GfxRect bounds{};        // surface-normalized region owning the swipe
+    std::int32_t scroll=1,maximum=1;
+    double linePixels=0;     // surface pixels per visible text line
+    const char* reason="text-unobserved"; // diagnostics: last rejected step
+    std::array<double,7> metrics{};       // diagnostics: last measured field
+    explicit operator bool() const { return target!=nullptr; }
+};
+// Observation only: a visible, actually overflowing description under the point.
+TextScrollCapture CaptureBl2TextScroll(GfxSession&,std::string_view movieClass,std::int32_t screen,
+    std::uint32_t width,std::uint32_t height,float x,float y);
+// Mutation session: the same field takes the line, clamped to its live
+// maxscroll, then the original arrow function redraws.
+bool ScrollBl2Text(GfxSession&,const TextScrollCapture&,std::int32_t line);
 
 // Keep one of these on a separate, read-only GfxSession from DOWN until UP or
 // cancellation. Pinned list/data/renderer/row/slider values prevent address reuse

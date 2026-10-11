@@ -7,9 +7,9 @@
 
 namespace bl2::touch {
 
-constexpr std::uint64_t kProtocolVersion = 3;
+constexpr std::uint64_t kProtocolVersion = 4;
 constexpr std::size_t kSnapshotWords = 18;
-constexpr std::size_t kActionCount = 27;
+constexpr std::size_t kActionCount = 31;
 constexpr std::size_t kTransitionsPerAction = 16;
 constexpr std::size_t kMaxPointers = 10;
 constexpr std::size_t kPointerQueueCapacity = 64;
@@ -32,7 +32,9 @@ enum class Action : std::uint8_t {
     Fire = 0, Aim, Jump, Crouch, Reload, Use, Melee, Grenade, Skill, Sprint,
     NextWeapon, PreviousWeapon, Inventory, Map, Pause, Back, Confirm, Skip,
     VehicleBrake, VehicleBoost, VehicleHorn, UiUp, UiDown, UiLeft, UiRight,
-    LastWeapon, Chat
+    LastWeapon, Chat,
+    // Protocol 4: the remaining shipped vehicle seat actions.
+    ExitVehicle, SwitchSeats, DriverFireTurret, LookBack
 };
 constexpr std::uint64_t actionBit(Action action) {
     return std::uint64_t{1} << static_cast<unsigned>(action);

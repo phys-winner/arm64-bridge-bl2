@@ -223,6 +223,15 @@ struct Ue3UiSink::State {
     unsigned footerScaleAttempts=0;
     bool footerScaleReady=false;
     bool characterWasSelected = false, mapDragHeld = false, itemDragHeld = false;
+    // A drag on an overflowing original description scrolls its text by
+    // lines; a tap or a swipe elsewhere keeps the ordinary transaction.
+    struct TextScroll {
+        TextScrollCapture capture;
+        std::int32_t pointer=-1,line=1;
+        float startX=0,startY=0;
+        bool active=false;
+    } textScroll;
+    unsigned textScrollLogs=0;
     std::int32_t dialogAtDown = -1;
     std::uint32_t mouseName = 0;
     std::uint64_t characterProbeOwner = 0;
@@ -1498,6 +1507,61 @@ struct Ue3UiSink::State {
         clearAgeGate();
     }
     void clearFooter() { footerTarget={};footerSession.reset();footerTransport.reset(); }
+    void clearTextScroll() { textScroll={}; }
+    void textScrollDown(const PointerEvent& event) {
+        clearTextScroll();
+        if (!current()) return;
+        if (Bl2TextScrollTargets(frameTarget.direct.movieClass,frameTarget.direct.screen).empty()) {
+            if (frameTarget.direct.movieClass=="StatusMenuExGFxMovie") {
+                TextScrollCapture none;none.reason="text-no-target";textScrollDiagnostic(none,nullptr,event);
+            }
+            return;
+        }
+        if (!geometry) geometry=std::make_unique<GfxHostTransport>(host,[this] { return current(); });
+        GfxSession s(*geometry,base,frameTarget.interface,geometry->scratch(),512,false);
+        const auto capture=CaptureBl2TextScroll(s,frameTarget.direct.movieClass,frameTarget.direct.screen,
+            frameTarget.width,frameTarget.height,event.surfaceX,event.surfaceY);
+        textScrollDiagnostic(capture,&s,event);
+        if (capture) textScroll={capture,event.pointerId,capture.scroll,event.surfaceX,event.surfaceY,false};
+    }
+    void textScrollDiagnostic(const TextScrollCapture& capture,const GfxSession* s,const PointerEvent& event) {
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+        if (textScrollLogs>=24) return;
+        char property[PROP_VALUE_MAX]{};__system_property_get("debug.bl2bridge.touch_diagnostics",property);
+        if (property[0]!='1' || property[1]) return;
+        ++textScrollLogs;
+        const auto& v=capture.metrics;const auto& b=capture.bounds;
+        __android_log_print(ANDROID_LOG_INFO,"BL2TouchDiagnostics",
+            "text-scroll class=%s screen=%d reason=%s session=%s calls=%u point=(%.4f,%.4f) "
+            "metrics=(%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f) bounds=(%.4f,%.4f,%.4f,%.4f) scroll=%d/%d line=%.2f",
+            frameTarget.direct.movieClass.c_str(),frameTarget.direct.screen,capture.reason,!s ? "none" : s->reason() ? s->reason() : "okay",s ? s->calls() : 0u,
+            event.surfaceX,event.surfaceY,v[0],v[1],v[2],v[3],v[4],v[5],v[6],b.left,b.top,b.right,b.bottom,
+            capture.scroll,capture.maximum,capture.linePixels);
+#else
+        (void)capture;(void)s;(void)event;
+#endif
+    }
+    // True once the drag belongs to the description; its transaction is then
+    // dropped, so neither a tap nor a list-navigation swipe follows on UP.
+    bool textScrollMove(const PointerEvent& event) {
+        auto& t=textScroll;
+        if (t.pointer!=event.pointerId || (!t.active && !t.capture) || !current()) return t.active;
+        const float dx=(event.surfaceX-t.startX)*static_cast<float>(frameTarget.width);
+        const float dy=(event.surfaceY-t.startY)*static_cast<float>(frameTarget.height);
+        if (!t.active) {
+            const float slop=.015f*static_cast<float>(std::min(frameTarget.width,frameTarget.height));
+            if (!std::isfinite(dx) || !std::isfinite(dy) || std::abs(dy)<=slop || std::abs(dy)<=std::abs(dx)) return false;
+            t.active=true;transactions.clear();
+        }
+        if (!t.capture) return true;
+        const auto line=Bl2TextScrollLine(t.capture.scroll,t.capture.maximum,dy,t.capture.linePixels);
+        if (line!=t.line) {
+            GfxSession s(*geometry,base,frameTarget.interface,geometry->scratch(),192,true);
+            if (ScrollBl2Text(s,t.capture,line)) t.line=line;
+            else t.capture={}; // Replaced field: keep owning the drag, change nothing more.
+        }
+        return true;
+    }
     void clearWaypoint() { queuedWaypoint.clear();queuedWaypointOwner={}; }
     std::optional<NativeFooterFamily> footerFamily() const {
         if(frameTarget.capabilities & MapGestures) return NativeFooterFamily::Map;
@@ -1933,7 +1997,7 @@ void Ue3UiSink::beginTouchFrame(const Frame& frame) {
     auto& s = *state_;
     if (frame.resetReasons || frame.epoch != s.epoch || frame.context.sceneIdentity != s.frameTarget.scene) {
         s.releaseInventory();
-        s.releaseDrag();s.clearCharacter();s.clearAgeGate();s.clearFooter();
+        s.releaseDrag();s.clearCharacter();s.clearAgeGate();s.clearFooter();s.clearTextScroll();
     }
     s.epoch = frame.epoch; s.frameTarget = s.prepared;
     s.frameValid = s.preparedValid && frame.context.sceneIdentity == s.prepared.scene &&
@@ -1984,7 +2048,7 @@ void Ue3UiSink::beginTouchFrame(const Frame& frame) {
 }
 void Ue3UiSink::action(const ActionEdge& edge) {
     auto& s = *state_;
-    if (edge.down && edge.sourceEpoch == s.epoch) { s.releaseInventory();s.releaseDrag();s.clearCharacter();s.clearAgeGate();s.clearFooter(); }
+    if (edge.down && edge.sourceEpoch == s.epoch) { s.releaseInventory();s.releaseDrag();s.clearCharacter();s.clearAgeGate();s.clearFooter();s.clearTextScroll(); }
     const bool current=s.current();
     s.inventoryDiagnostic(edge.down?"action-down":"action-up",current?"current":"current-rejected",
         nullptr,nullptr,nullptr,nullptr,-1,-1,static_cast<int>(edge.action));
@@ -2017,7 +2081,7 @@ void Ue3UiSink::pointer(const PointerEvent& event) {
     s.characterRouteDiagnostic(event,false,current,s.transactions.ownsPointer(event.pointerId),false);
     s.footerRouteDiagnostic(event,current);
 #endif
-    if (!current || !(s.frameTarget.capabilities & kUiTapTest)) { s.releaseInventory();s.releaseDrag();s.clearCharacter();s.clearAgeGate();s.clearFooter();s.transactions.clear(); return; }
+    if (!current || !(s.frameTarget.capabilities & kUiTapTest)) { s.releaseInventory();s.releaseDrag();s.clearCharacter();s.clearAgeGate();s.clearFooter();s.clearTextScroll();s.transactions.clear(); return; }
     if(event.phase==PointerPhase::Down || event.phase==PointerPhase::Cancel) s.clearWaypoint();
     if(event.phase==PointerPhase::Down) s.scaleFooter(true);
     if(event.phase==PointerPhase::Down && !s.mapGesture.captured() && !s.inventoryGesture.captured() && !s.footerTarget)
@@ -2046,6 +2110,17 @@ void Ue3UiSink::pointer(const PointerEvent& event) {
         s.transactions.clear();
         if (const auto update = s.itemGesture.pointer(event,true)) s.itemUpdate(*update);
         return;
+    }
+    if (event.phase == PointerPhase::Down) {
+        // Track only; the DOWN still reaches the transaction for an ordinary tap.
+        if (!s.textScroll.active && !s.footerTarget) s.textScrollDown(event);
+    } else if (s.textScroll.pointer == event.pointerId) {
+        if (event.phase == PointerPhase::Move && s.textScrollMove(event)) return;
+        if (event.phase == PointerPhase::Up || event.phase == PointerPhase::Cancel) {
+            const bool owned = s.textScroll.active;
+            s.clearTextScroll();
+            if (owned) return;
+        }
     }
     if (event.phase == PointerPhase::Down) {
         s.dialogAtDown = -1;
@@ -2078,7 +2153,7 @@ void Ue3UiSink::hover(const PointerEvent& event) {
         s.mouse(1,std::floor(event.surfaceX*(s.frameTarget.width-1)),std::floor(event.surfaceY*(s.frameTarget.height-1)));
 }
 void Ue3UiSink::endTouchFrame(const Frame&) {
-    if (!state_->current()) { state_->releaseInventory();state_->releaseDrag();state_->clearCharacter();state_->clearAgeGate();state_->clearFooter();state_->transactions.clear(); }
+    if (!state_->current()) { state_->releaseInventory();state_->releaseDrag();state_->clearCharacter();state_->clearAgeGate();state_->clearFooter();state_->clearTextScroll();state_->transactions.clear(); }
     else if(state_->inventoryStart && state_->inventoryGesture.captured()) {
         // Process a deferred press only after this boundary's Cancel/UP/second
         // finger, so an ended intent can never start a native drag afterward.

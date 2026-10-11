@@ -261,6 +261,7 @@ set(BRIDGE_SOURCES
     src/bl2_program_upgrade.cpp
     src/bl2_jit_learning.cpp
     src/bl2_hitch_report.cpp
+    src/bl2_frame_pacer.cpp
     src/bl2_guest_integrity.cpp
 )
 

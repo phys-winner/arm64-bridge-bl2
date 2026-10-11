@@ -7,7 +7,7 @@ $androidJar = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\platforms\android-36\a
 $d8Jar = 'D:\ai_test\old_game_restoration\tools\android\sdk\build-tools\37.0.0\lib\d8.jar'
 $toolsRoot = 'D:\ai_test\old_game_restoration\tools\android'
 $relativePackage = 'com\tt2kgames\Borderlands2'
-$portNames = @('LaunchControls','GameStorage','DisplayModePolicy','Downloader',
+$portNames = @('LaunchControls','GameStorage','DisplayModePolicy','Downloader','GameRestart',
     'LocalPlatform','LocalIdentity','LocalSaveGame','LocalAchievements')
 $source = @($portNames | ForEach-Object { Join-Path $root "android_port\src\$relativePackage\$_.java" })
 $touchNames = @('NativeTouchControls','TouchBridge','TouchContract','TouchInput','TouchLayout','TouchPreferences','TouchSources','TouchGyro')

@@ -8,6 +8,7 @@
 #include "elf_loader.h"
 #include "../../touch_native_design/arm64_bridge/bl2_touch_bindings.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -27,7 +28,14 @@ constexpr std::uint32_t kCountReadied = 0x0229ECA0;
 constexpr std::uint32_t kActorProcessEvent = 0x010E86C8;
 constexpr std::uint32_t kAppFree = 0x00F26444;
 constexpr std::uint32_t kGetActionSkill = 0x0207B904;
+// UWillowPlayerInput::InputKey(int,FName,EInputEvent,float,UBOOL); its vptr slot
+// is _ZTV18UWillowPlayerInput word 85 minus the two ABI header words.
+constexpr std::uint32_t kInputKey = 0x0236E058;
+constexpr std::uint32_t kInputKeySlot = 0x14C;
 constexpr float kRotatorUnitsPerDegree = 65536.0f / 360.0f;
+// GameplayInput routes gameplay actions and axes; CanSkip routes only the
+// cinematic Skip/Pause actions resolved from the same live input contexts.
+constexpr std::uint32_t kRoutedCapabilities = GameplayInput | CanSkip;
 
 std::uint32_t floatWord(float value) {
     std::uint32_t bits = 0; std::memcpy(&bits, &value, sizeof(bits)); return bits;
@@ -57,6 +65,7 @@ struct OwnedAction {
     Definition definition{};
     std::uint64_t epoch = 0;
     bool held = false;
+    bool key = false; // Released through the original button, not FireInputActionBehaviors.
 };
 } // namespace
 
@@ -88,6 +97,8 @@ struct Ue3GameplaySink::State {
     } useCache{},skillCache{};
     std::uint64_t skillTreeToken = 0;
     bool triggerQueriesDisabled = false;
+    std::uint64_t useKeyInput = 0;
+    std::uint32_t useKeyIndex = 0, useKeyNumber = 0;
     std::unique_ptr<GfxHostTransport> hudTransport;
 #if HORN_ENABLE_LOGGING
     Context lastDiagnostic{};
@@ -108,6 +119,12 @@ struct Ue3GameplaySink::State {
     };
     std::array<HintDiagnostic,2> lastHintDiagnostic{};
     unsigned hintDiagnosticLogs=0;
+    unsigned actionDiagnosticLogs=0;
+    const char* lastCinematicReason=nullptr;
+    std::uint32_t lastCinematicInterp=0;
+    std::uint64_t probePoll=0, probeMove=0, probeLook=0;
+    unsigned probeLogs=0;
+    bool probeOn=false;
 #endif
     EquippedWeaponHistory weaponHistory{};
     struct CachedProperty { std::uint64_t type = 0; const char* name = nullptr; const char* kind = nullptr; Property value{}; };
@@ -115,6 +132,8 @@ struct Ue3GameplaySink::State {
     struct CachedFunction { std::uint64_t type = 0; const char* name = nullptr; const char* owner = nullptr; std::uint32_t value = 0; std::uint64_t identity = 0; };
     mutable std::vector<CachedFunction> functions;
     bool preparedValid = false, frameValid = false;
+    bool preparedAxes = false, frameAxes = false;
+    bool preparedVehicle = false, frameVehicle = false;
     bool movementPending = false, lookPending = false;
     float right = 0, forward = 0, yaw = 0, pitch = 0;
 
@@ -197,7 +216,9 @@ struct Ue3GameplaySink::State {
             const auto total = read(type + 0x48) & 0x00FFFFFFu;
             if (!total || total > 1048576) return {};
             auto field = read(type + 0x44);
-            for (unsigned i = 0; field && i != 2048; ++i) {
+            // WillowPlayerController alone has 2387 direct children (functions,
+            // properties, consts); its tail fields lie beyond 2048 links.
+            for (unsigned i = 0; field && i != 4096; ++i) {
                 if (!token(field) || read(field + 0x28) != type) return {};
                 if (objectName(field) == wanted) {
                     Property p{field, read(field + 0x54), read(field + 0x44), read(field + 0x74), read(field + 0x40)};
@@ -285,7 +306,26 @@ struct Ue3GameplaySink::State {
         result = word != 0;
         return true;
     }
-    void observeReload(const Target& target, std::uint32_t weapon) {
+    bool boolField(std::uint32_t object, const char* wanted, bool& value) const {
+        const auto p = field(object, wanted, "BoolProperty");
+        if (!p || p.size != 4 || p.dimension != 1 || !p.extra || (p.extra & (p.extra - 1)) ||
+            !span(object + p.offset, 4)) return false;
+        value = (read(object + p.offset) & p.extra) != 0;
+        return true;
+    }
+    bool intField(std::uint32_t object, const char* wanted, std::int32_t& value) const {
+        const auto p = field(object, wanted, "IntProperty");
+        if (!p || p.size != 4 || p.dimension != 1 || !span(object + p.offset, 4)) return false;
+        value = static_cast<std::int32_t>(read(object + p.offset));
+        return true;
+    }
+    bool floatField(std::uint32_t object, const char* wanted, float& value) const {
+        const auto p = field(object, wanted, "FloatProperty");
+        if (!p || p.size != 4 || p.dimension != 1 || !span(object + p.offset, 4)) return false;
+        value = wordFloat(read(object + p.offset));
+        return true;
+    }
+    void observeReload(const Target& target, std::uint32_t pawn, std::uint32_t weapon) {
         const auto count = field(weapon, "ReloadCnt", "IntProperty");
         const auto capacity = field(weapon, "ClipSize", "IntAttributeProperty");
         if (!count || !capacity || count.size != 4 || capacity.size != 4 ||
@@ -299,6 +339,18 @@ struct Ue3GameplaySink::State {
         // ordinary UIntProperty::CopyCompleteValue. NeedToReload instead tests
         // an empty clip and is only the game's automatic-reload predicate.
         if (loaded >= maximum) { known(Action::Reload, false); return; }
+        // WeaponReloading.BeginState sets the main-hand WillowPawn.bReloading
+        // (an IntProperty) to 1 and its EndState back to 0; ReloadCnt refills
+        // only at the end. A reload already running offers nothing new.
+        // BeginReload also refuses bUseOverheatBehavior, which HasSpareAmmo
+        // nevertheless reports as spare ammo.
+        std::int32_t reloading = 0;
+        bool overheat = false;
+        if ((intField(pawn, "bReloading", reloading) && reloading != 0) ||
+            (boolField(weapon, "bUseOverheatBehavior", overheat) && overheat)) {
+            if (targetUnchanged(target)) known(Action::Reload, false);
+            return;
+        }
         bool spare = false;
         if (boolQuery(target, weapon, "HasSpareAmmo", "WillowWeapon", 0x00020102, spare) &&
             targetUnchanged(target)) known(Action::Reload, spare);
@@ -725,11 +777,15 @@ struct Ue3GameplaySink::State {
 #endif
         session.release(parent);session.release(counter);
         // Original HUD EditText671/955 has a fixed, non-autosized own rectangle
-        // [1573,5347,-40,731] twips. Its nonzero origin must be retained: _x/_y
-        // alone are not the top-left of the displayed number. Parent bullets
-        // carries the inherited HUD3D transform and interface scaling.
+        // [1573,5347,-40,731] twips; Scaleform already reports its _x/_y at
+        // that rectangle's top-left. Parent bullets carries the inherited
+        // HUD3D transform (its _yrotation and perspective, which native
+        // localToGlobal projects) and interface scaling.
+        // Swipes and taps own the whole strip around that proven counter.
         std::array<double,4> rect{};
         if (!okay || !Bl2AmmoCounterLocalRect(v,rect)) return false;
+        std::array<double,4> strip{};
+        if (Bl2AmmoStripLocalRect(v,strip)) rect=strip;
         out={rect[0],rect[1],rect[2],rect[3]};
         return true;
     }
@@ -915,6 +971,139 @@ struct Ue3GameplaySink::State {
             ammoMetrics[0],ammoMetrics[1],ammoMetrics[2],ammoMetrics[3],ammoMetrics[4],ammoMetrics[5],ammoMetrics[6]);
 #endif
     }
+    // Startup InputDevice_Controller binds the original X button ("XboxTypes_X")
+    // to press Reload/Use/RevivePlayer, tap Pickup and hold PickupEquip/
+    // InjuredSuicide. Driving that FInputButtonData through the original
+    // InputKey keeps the game's own tap/hold timing and target choice, with no
+    // Android virtual controller involved. Buttons: input+0x204, 28-byte
+    // records with the FName at +12 (FindButtonDataInArray 0236EDBC).
+    bool useKeyName(const Target& target, std::uint32_t& index, std::uint32_t& number) {
+        if (useKeyInput == target.inputToken && useKeyIndex) { index = useKeyIndex; number = useKeyNumber; return true; }
+        std::uint32_t data = 0, count = 0;
+        if (!array(target.input + 0x204, 512, data, count) || !span(data, std::size_t(count) * 28)) return false;
+        unsigned matches = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto text = name(data + i * 28 + 12);
+            for (auto& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (text != "xboxtypes_x") continue;
+            index = read(data + i * 28 + 12); number = read(data + i * 28 + 16); ++matches;
+        }
+        if (matches != 1) return false;
+        useKeyInput = target.inputToken; useKeyIndex = index; useKeyNumber = number;
+        return true;
+    }
+    bool useKey(const Target& target, bool down) {
+        std::uint32_t index = 0, number = 0, local = 0, players = 0, count = 0;
+        if (!localOwner(target) || !useKeyName(target, index, number) ||
+            read(read(target.input) + kInputKeySlot) != base + kInputKey) return false;
+        const auto engine = read(base + 0x03008D20);
+        std::int32_t controllerId = 0;
+        if (array(engine + 0x48C, 4, players, count) && count == 1) local = read(players);
+        if (!local || !intField(local, "ControllerId", controllerId)) controllerId = 0;
+        // IE_Pressed 0 / IE_Released 1, AmountDepressed, bGamepad.
+        return Bl2TouchCallGuest(host, base + kInputKey, {target.input, static_cast<std::uint32_t>(controllerId),
+            index, number, down ? 0u : 1u, floatWord(down ? 1.0f : 0.0f), 1u});
+    }
+    // WillowPlayerController.ServerSkipMatinee (the original SkipCinematic
+    // console command) skips only SeqAct_Interp(ControllingDirTrackInst.Outer.Outer)
+    // and only when bIsSkippable. Most story cinematics leave it false.
+    UseAvailability matineeSkip(const Target& target) {
+        std::uint32_t track = 0;
+        if (!objectField(target.controller, "ControllingDirTrackInst", track)) return cinematicDiagnostic("track-schema", 0, 0, 0, {});
+        if (!track) return cinematicDiagnostic("no-director", 0, 0, 0, {true, false});
+        const auto group = read(track + 0x28), interp = read(group + 0x28);
+        bool skippable = false;
+        if (!isA(track, "InterpTrackInstDirector") || !isA(group, "InterpGroupInst") ||
+            !isA(interp, "SeqAct_Interp") || !boolField(interp, "bIsSkippable", skippable) ||
+            !targetUnchanged(target)) return cinematicDiagnostic("chain", track, group, interp, {});
+        return cinematicDiagnostic(skippable ? "skippable" : "unskippable", track, group, interp, {true, skippable});
+    }
+    UseAvailability cinematicDiagnostic(const char* reason, std::uint32_t track, std::uint32_t group,
+                                        std::uint32_t interp, UseAvailability result) {
+#if HORN_ENABLE_LOGGING
+        if (reason != lastCinematicReason || interp != lastCinematicInterp) {
+            lastCinematicReason = reason; lastCinematicInterp = interp;
+            HORN_LOGI("BL2TouchDiagnostics", "native-touch cinematic skip=%s track=%08X group=%08X interp=%08X name=%s",
+                reason, track, group, interp, interp ? objectName(interp).c_str() : "");
+        }
+#else
+        (void)reason; (void)track; (void)group; (void)interp;
+#endif
+        return result;
+    }
+    void observeCinematic(const Target& target) {
+        observation = {};
+        const auto skip = matineeSkip(target);
+        if (skip.known) known(Action::Skip, skip.usable);
+    }
+    // Diagnostic builds: what each touch action edge actually did.
+    void actionDiagnostic(const ActionEdge& edge,const char* result) {
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+        // Menu edges reach both sinks; only routed gameplay/cinematic frames count.
+        if (actionDiagnosticLogs>=96 || (!frameValid && std::strcmp(result,"released")!=0)) return;
+        char property[PROP_VALUE_MAX]{};
+        __system_property_get("debug.bl2bridge.touch_diagnostics",property);
+        if (property[0]!='1' || property[1]) return;
+        ++actionDiagnosticLogs;
+        const char* name=shippedActionName(edge.action);
+        HORN_LOGI("BL2TouchDiagnostics","native-touch action=%s(%u) down=%u result=%s epoch=%llu frameEpoch=%llu",
+            name ? name : "synthetic",static_cast<unsigned>(edge.action),edge.down ? 1u : 0u,result,
+            static_cast<unsigned long long>(edge.sourceEpoch),static_cast<unsigned long long>(frameEpoch));
+#else
+        (void)edge;(void)result;
+#endif
+    }
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+    // Diagnostic builds, debug.bl2bridge.vehicle_probe=1: what the hooked input,
+    // its controller and a driven Vehicle hold at the two existing axis seams.
+    // Read-only; every offset comes from the live UProperty metadata.
+    // Bytecode: PlayerInput copies RawJoyUp/RawJoyRight from aBaseY/aStrafe
+    // before PreProcessInput and PIProcessInput; PlayerDriving.PlayerMove passes
+    // RawJoyUp/RawJoyRight to ProcessDrive -> Vehicle.SetInputs(InForward, -InStrafe).
+    void vehicleProbe(std::uint32_t input, const char* seam) {
+        const auto now=monotonicMilliseconds();
+        if (now-probePoll>=500) {
+            probePoll=now;
+            char property[PROP_VALUE_MAX]{};
+            __system_property_get("debug.bl2bridge.vehicle_probe",property);
+            probeOn=property[0]=='1' && !property[1];
+        }
+        auto& last=seam[0]=='m' ? probeMove : probeLook;
+        if (!probeOn || probeLogs>=1200 || now-last<250 || !isWillowInput(input)) return;
+        const auto controller=read(input+0x28);
+        std::uint32_t pawn=0;
+        if (!isA(controller,"WillowPlayerController") || !objectField(controller,"Pawn",pawn)) return;
+        static constexpr const char* inputNames[10]={"RawJoyUp","RawJoyRight","RawJoyLookRight","RawJoyLookUp",
+            "aBaseY","aStrafe","aForward","aTurn","aLookUp","aUp"};
+        float in[10];
+        bool moving=false;
+        for (int i=0;i!=10;++i) {
+            if (!floatField(input,inputNames[i],in[i])) in[i]=NAN;
+            moving |= std::isfinite(in[i]) && in[i]!=0;
+        }
+        const bool vehicle=isA(pawn,"Vehicle");
+        if (!vehicle && !moving) return;
+        last=now; ++probeLogs;
+        static constexpr const char* vehicleNames[5]={"Throttle","Steering","Rise","ForwardVel","StrafeSteeringValue"};
+        float driven[5]={NAN,NAN,NAN,NAN,NAN};
+        if (vehicle) for (int i=0;i!=5;++i) if (!floatField(pawn,vehicleNames[i],driven[i])) driven[i]=NAN;
+        bool console=false, inverted=false;
+        std::int32_t mode=-1;
+        const int consoleKnown=boolField(controller,"bConsoleController",console) ? int(console) : -1;
+        const int invertedKnown=boolField(controller,"bUseInvertedReverseSteering",inverted) ? int(inverted) : -1;
+        // GetVehicleSteeringMode compares this IntProperty with int literals.
+        (void)intField(controller,"VehicleSteeringMode",mode);
+        std::string contexts;
+        std::uint32_t data=0,count=0;
+        if (array(input+0x1A4,32,data,count))
+            for (std::uint32_t i=0;i<count && i<3;++i) contexts+=(i?",":"")+objectName(read(data+i*4));
+        HORN_LOGI("BL2TouchDiagnostics","vehicle-probe seam=%s ctx=[%s] pawn=%s raw=(%.3f,%.3f,%.3f,%.3f) "
+            "axes=(baseY=%.3f strafe=%.3f forward=%.3f turn=%.3f lookUp=%.3f up=%.3f) steeringMode=%d console=%d "
+            "invertedReverse=%d vehicle=(throttle=%.3f steering=%.3f rise=%.3f forwardVel=%.1f strafeSteer=%.3f)",
+            seam,contexts.c_str(),className(pawn).c_str(),in[0],in[1],in[2],in[3],in[4],in[5],in[6],in[7],in[8],in[9],
+            int(mode),consoleKnown,invertedKnown,driven[0],driven[1],driven[2],driven[3],driven[4]);
+    }
+#endif
     void observeGameplay(const Target& target) {
         observation = {};
         std::uint32_t pawn = 0, manager = 0, weapon = 0;
@@ -953,7 +1142,7 @@ struct Ue3GameplaySink::State {
             known(Action::Fire,false);known(Action::Aim,false);
         }
         if (weaponKnown && isA(weapon, "WillowWeapon")) {
-            observeReload(target, weapon);
+            observeReload(target, pawn, weapon);
         }
         observeUse(target,pawn);
         observeSkill(target,pawn);
@@ -1033,7 +1222,7 @@ struct Ue3GameplaySink::State {
             !targetUnchanged(frameTarget)) return false;
         const auto current = sharedMailbox().snapshot();
         return current.epoch == frameEpoch && current.context.sceneIdentity == frameTarget.scene &&
-            (current.context.capabilities & GameplayInput) && !(current.context.capabilities & PhysicalOwnsInput);
+            (current.context.capabilities & kRoutedCapabilities) && !(current.context.capabilities & PhysicalOwnsInput);
     }
     bool collect(std::uint32_t definition, std::vector<std::uint32_t>& actions) const {
         std::uint32_t data = 0, count = 0;
@@ -1116,7 +1305,8 @@ struct Ue3GameplaySink::State {
     void release(std::size_t index) {
         const auto record = owned[index];
         owned[index] = {}; // Clear before callbacks: nested scene reset is safe.
-        if (record.held) (void)invoke(record.target, record.definition, false);
+        if (record.held && record.key) (void)useKey(record.target, false);
+        else if (record.held) (void)invoke(record.target, record.definition, false);
     }
     void releaseAll() {
         for (std::size_t i = 0; i != owned.size(); ++i) release(i);
@@ -1142,6 +1332,24 @@ struct Ue3GameplaySink::State {
         return Bl2TouchCallGuest(host, base + kAddAxis, {frameTarget.input, pointer, floatWord(delta)});
 #endif
     }
+    // PlayerInput copies RawJoyUp/RawJoyRight from aBaseY/aStrafe before
+    // PIProcessInput, and PlayerDriving.PlayerMove later in the same tick passes
+    // them to ProcessDrive -> WillowVehicle.SetInputs (Throttle = RawJoyUp).
+    // Add the stick there as a pad's left stick would, inside [-1,1]. The
+    // offsets are this input class's own UProperty metadata.
+    bool rawJoy(float forward, float right) {
+        if (!current() || !std::isfinite(forward) || !std::isfinite(right)) return false;
+        const auto input = frameTarget.input;
+        const auto up = field(input, "RawJoyUp", "FloatProperty");
+        const auto side = field(input, "RawJoyRight", "FloatProperty");
+        if (!up || !side || up.size != 4 || side.size != 4 || up.dimension != 1 || side.dimension != 1 ||
+            up.offset == side.offset || !span(input + up.offset, 4) || !span(input + side.offset, 4)) return false;
+        const float throttle = wordFloat(read(input + up.offset)), steer = wordFloat(read(input + side.offset));
+        if (!std::isfinite(throttle) || !std::isfinite(steer)) return false;
+        host.MemoryWrite32(input + up.offset, floatWord(std::clamp(throttle + forward, -1.0f, 1.0f)));
+        host.MemoryWrite32(input + side.offset, floatWord(std::clamp(steer + right, -1.0f, 1.0f)));
+        return true;
+    }
 };
 
 Ue3GameplaySink::Ue3GameplaySink(DynarmicHost& host, LifetimeGeneration generation)
@@ -1149,9 +1357,10 @@ Ue3GameplaySink::Ue3GameplaySink(DynarmicHost& host, LifetimeGeneration generati
 Ue3GameplaySink::~Ue3GameplaySink() = default;
 
 std::uint64_t Ue3GameplaySink::prepare(std::uint32_t controller, std::uint32_t input, std::uint64_t scene,
-                                     std::uint32_t viewport) {
+                                     std::uint32_t viewport, bool axes, Scene kind) {
     auto& s = *state_;
     s.preparedValid = false; s.available = 0; s.observation = {};
+    s.preparedAxes = axes; s.preparedVehicle = kind == Scene::Vehicle;
     if (!s.generation || !s.span(controller, 0x770) || !s.span(input, 0x294)) return 0;
     Target target;
     target.controller = controller; target.input = input; target.scene = scene; target.viewport = viewport;
@@ -1178,7 +1387,9 @@ std::uint64_t Ue3GameplaySink::prepare(std::uint32_t controller, std::uint32_t i
     for (std::size_t i = 0; i != kActionCount; ++i) {
         if (matches[i] == 1 && s.availableNow(target, definitions[i])) s.available |= std::uint64_t{1} << i;
     }
-    s.observeGameplay(target);
+    // A seat's Pawn is the vehicle: no on-foot HUD, weapon or Use telemetry.
+    if (kind == Scene::Gameplay) s.observeGameplay(target);
+    else if (kind == Scene::Cinematic) s.observeCinematic(target);
     s.preparedValid = s.targetUnchanged(target);
     return s.preparedValid ? s.available : 0;
 }
@@ -1203,9 +1414,10 @@ void Ue3GameplaySink::beginTouchFrame(const Frame& frame) {
     auto& s = *state_;
     s.frameValid = false;
     if (frame.resetReasons) s.releaseAll();
-    s.frameEpoch = frame.epoch; s.frameTarget = s.prepared;
+    s.frameEpoch = frame.epoch; s.frameTarget = s.prepared; s.frameAxes = s.preparedAxes;
+    s.frameVehicle = s.preparedVehicle;
     s.frameValid = s.preparedValid && frame.context.sceneIdentity == s.prepared.scene &&
-        (frame.context.capabilities & GameplayInput) && !(frame.context.capabilities & PhysicalOwnsInput);
+        (frame.context.capabilities & kRoutedCapabilities) && !(frame.context.capabilities & PhysicalOwnsInput);
     if (!s.current()) s.releaseAll();
 }
 void Ue3GameplaySink::action(const ActionEdge& edge) {
@@ -1213,20 +1425,39 @@ void Ue3GameplaySink::action(const ActionEdge& edge) {
     const auto index = static_cast<std::size_t>(edge.action);
     if (index >= kActionCount) return;
     if (!edge.down) {
-        if (s.owned[index].held && s.owned[index].epoch == edge.sourceEpoch) s.release(index);
+        const bool owned = s.owned[index].held && s.owned[index].epoch == edge.sourceEpoch;
+        if (owned) s.release(index);
+        s.actionDiagnostic(edge, owned ? "released" : "not-owned");
         return;
     }
     if (s.owned[index].held || edge.sourceEpoch != s.frameEpoch || !s.current() ||
-        !(s.available & actionBit(edge.action))) return;
+        !(s.available & actionBit(edge.action))) {
+        s.actionDiagnostic(edge, s.owned[index].held ? "already-held" : edge.sourceEpoch != s.frameEpoch ? "stale-epoch" :
+            !(s.available & actionBit(edge.action)) ? "unavailable" : "not-current");
+        return;
+    }
+    if (edge.action == Action::Use) {
+        // Record before dispatch, as below: the press can open a GFx scene.
+        s.owned[index] = {s.frameTarget, {}, edge.sourceEpoch, true, true};
+        const bool pressed = s.useKey(s.frameTarget, true);
+        if (!pressed) s.owned[index] = {};
+        s.actionDiagnostic(edge, pressed ? "use-key-pressed" : "use-key-refused");
+        return;
+    }
     if (edge.action == Action::LastWeapon) {
-        (void)s.selectLast(s.frameTarget);
+        s.actionDiagnostic(edge, s.selectLast(s.frameTarget) ? "last-weapon" : "last-weapon-refused");
         return;
     }
     Definition definition;
-    if (!s.resolve(s.frameTarget, edge.action, definition) || !s.current()) return;
+    if (!s.resolve(s.frameTarget, edge.action, definition) || !s.current()) {
+        s.actionDiagnostic(edge, "unresolved");
+        return;
+    }
     // Record before dispatch: OnBegin can synchronously open a GFx scene.
     s.owned[index] = {s.frameTarget, definition, edge.sourceEpoch, true};
-    if (!s.invoke(s.frameTarget, definition, true)) s.owned[index] = {};
+    const bool invoked = s.invoke(s.frameTarget, definition, true);
+    if (!invoked) s.owned[index] = {};
+    s.actionDiagnostic(edge, invoked ? "invoked" : "invoke-failed");
 }
 void Ue3GameplaySink::pointer(const PointerEvent&) {
     // DirectUi is never advertised by this gameplay stage. Calling Native_Touch
@@ -1235,7 +1466,7 @@ void Ue3GameplaySink::pointer(const PointerEvent&) {
 void Ue3GameplaySink::movement(float right, float forward) {
     auto& s = *state_;
     s.movementPending = false;
-    if (!s.current() || !std::isfinite(right) || !std::isfinite(forward)) return;
+    if (!s.frameAxes || !s.current() || !std::isfinite(right) || !std::isfinite(forward)) return;
     const auto length = std::hypot(right, forward);
     if (length > 1) { right /= length; forward /= length; }
     s.right = right; s.forward = forward; s.movementPending = true;
@@ -1243,7 +1474,7 @@ void Ue3GameplaySink::movement(float right, float forward) {
 void Ue3GameplaySink::relativeLook(float yaw, float pitch) {
     auto& s = *state_;
     s.lookPending = false;
-    if (!s.current() || !std::isfinite(yaw) || !std::isfinite(pitch)) return;
+    if (!s.frameAxes || !s.current() || !std::isfinite(yaw) || !std::isfinite(pitch)) return;
     const auto snapshot = sharedMailbox().snapshot();
     if (!(snapshot.context.capabilities & RelativeLook)) return;
     s.yaw = std::clamp(yaw, -kMaxPendingLookDegrees, kMaxPendingLookDegrees);
@@ -1252,14 +1483,21 @@ void Ue3GameplaySink::relativeLook(float yaw, float pitch) {
 }
 void Ue3GameplaySink::beforeAxisProcessing(std::uint32_t input) {
     auto& s = *state_;
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+    s.vehicleProbe(input, "move");
+#endif
     if (!s.movementPending || input != s.frameTarget.input) return;
     s.movementPending = false;
     // Single native add after joystick/key queue processing, before PI's normal
     // movement scaling. No second dead zone or virtual joystick callback.
     if (!s.axis(1, 0x100, s.forward) || !s.axis(7, 0x118, s.right)) s.lookPending = false;
+    else if (s.frameVehicle) (void)s.rawJoy(s.forward, s.right);
 }
 void Ue3GameplaySink::beforeLookClamp(std::uint32_t input) {
     auto& s = *state_;
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+    s.vehicleProbe(input, "look");
+#endif
     if (!s.lookPending || input != s.frameTarget.input) return;
     s.lookPending = false;
     // Bytecode proof: UpdateRotation assigns int(aTurn/aLookUp) to DeltaRot.

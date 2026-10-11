@@ -75,8 +75,8 @@ public final class TouchInput {
                 || !Float.isFinite(x) || !Float.isFinite(y)) return;
         if (role == MOVEMENT && (!context.gameplay() || moveId >= 0)) role = IGNORE;
         if (role == LOOK && (!context.gameplay() || !context.has(RELATIVE_LOOK))) role = IGNORE;
-        if (role == BUTTON && (action < 0 || action > CHAT || !context.allows(action))) role = IGNORE;
-        if (role == BUTTON && action == AIM && aimToggle && context.gameplay()) {
+        if (role == BUTTON && (action < 0 || action >= ACTION_COUNT || !context.allows(action))) role = IGNORE;
+        if (role == BUTTON && action == AIM && aimLatches()) {
             boolean alreadyOwned = false;
             for (Pointer p : pointers.values()) if (p.role == BUTTON && p.action == AIM) alreadyOwned = true;
             if (alreadyOwned) role = IGNORE;
@@ -138,7 +138,7 @@ public final class TouchInput {
     public void heartbeat() { emit(0, 0); }
     /** One native action edge pair; existing held owners and look remain intact. */
     public void pulse(int action) {
-        if (!context.usable() || action < 0 || action > CHAT || !context.allows(action)
+        if (!context.usable() || action < 0 || action >= ACTION_COUNT || !context.allows(action)
                 || (held() & bit(action)) != 0) return;
         sink.submit(context.epoch, moveX, moveY, 0, 0, held() | bit(action));
         emit(0, 0);
@@ -161,8 +161,11 @@ public final class TouchInput {
     private void recomputeHeld() {
         held = aimLatched ? bit(AIM) : 0;
         // OR of all owners: releasing one of two fingers cannot release the other.
-        for (Pointer p : pointers.values()) if (p.role == BUTTON && !(aimToggle && p.action == AIM)) held |= bit(p.action);
+        for (Pointer p : pointers.values()) if (p.role == BUTTON && !(p.action == AIM && aimLatches())) held |= bit(p.action);
     }
+    // On foot Aim may toggle; a vehicle seat's Aim is the turret's held
+    // alternate fire (ZoomWeapon -> StartAltFire/StopAltFire), never a latch.
+    private boolean aimLatches() { return aimToggle && context.mode == GAMEPLAY && context.gameplay(); }
     private void emit(float yaw, float pitch) {
         if (context.epoch > 0) sink.submit(context.epoch, moveX, moveY, yaw, pitch, held());
     }

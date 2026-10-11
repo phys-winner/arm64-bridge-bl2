@@ -8,6 +8,8 @@ struct MapVm final : GfxTransport {
     Vm vm;
     Raw parent{},field{},map{},mask{};
     std::uint32_t first=30,count=6;
+    // The Waypoint word is a second genuine MapBar command (GFx_Accept).
+    std::uint32_t waypoint=4,waypointCount=8;
     unsigned transportCalls=0;
     double lineAlignment=147;
     std::vector<unsigned> indices;
@@ -26,6 +28,7 @@ struct MapVm final : GfxTransport {
     void text(const char* caption) {
         vm.prop(field,"text",vm.str(caption));
         const std::string s=caption;first=static_cast<std::uint32_t>(s.find("Legend"));count=6;
+        waypoint=static_cast<std::uint32_t>(s.find("Waypoint"));waypointCount=8;
     }
     WidgetPoint footer(NativeFooterFamily family) {
         inventoryMode=true;
@@ -63,7 +66,7 @@ struct MapVm final : GfxTransport {
         if (pc==invoke && (vm.text(a[3])=="getCharBoundaries" || vm.text(a[3])=="getExactCharBoundaries")) {
             assert(a[1]==field[4] && a[5]==1);
             const auto i=static_cast<unsigned>(number(vm.raw(a[4])));indices.push_back(i);
-            assert(inventoryMode || (i>=first && i<first+count));
+            assert(inventoryMode || (i>=first && i<first+count) || (i>=waypoint && i<waypoint+waypointCount));
             Raw out{};
             if (!charMissing) {
                 // Original helper02863FC8 loads line+0x0C before glyph
@@ -228,7 +231,8 @@ int main(int argc,char** argv) {
         GfxSession down(vm,base,movie,scratch1,512,false),up(vm,base,movie,scratch2,512,false);
         const auto a=vm.hit(down),b=vm.hit(up);
         assert(a && b && SameBl2MapLegend(a,b) && a.count==6 && a.first==vm.first);
-        assert(a.bounds.left<530.f/1280 && a.bounds.right>530.f/1280 && vm.indices.size()==12);
+        // Each capture measures both commands' first cells, then Legend's six.
+        assert(a.bounds.left<530.f/1280 && a.bounds.right>530.f/1280 && vm.indices.size()==16);
         assert(vm.vm.clicks==0 && vm.vm.sliderNotifications==0); // Capturing never activates the footer.
         UiTransactions intent;intent.begin(8,80,true,false,2560,1440);
         const auto event=[&](PointerPhase phase,float x=530.f/1280) {return intent.pointer({1,phase,x,610.f/720,8,0,100});};
@@ -288,9 +292,9 @@ int main(int argc,char** argv) {
                 assert(bool(expected)==bool(actual));if(expected)assert(SameBl2MapLegend(expected,actual));
                 assert(a.calls()==b.calls() && a.bytesRead()==b.bytesRead() && plain.transportCalls==observed.transportCalls);
                 assert(plain.indices==observed.indices && std::string(report.reason)!="unobserved");
-                if(!fault) assert(actual && report.hit && report.projected && report.measured==6 && report.first==plain.first && report.count==6);
+                if(!fault) assert(actual && report.hit && report.projected && report.measured==8 && report.first==plain.first && report.count==6);
                 if(fault==5)assert(report.rectType==0 && report.measured==0 && std::string(report.reason)=="legend-character-rectangle");
-                if(fault==9)assert(!report.hit && report.projected && report.measured==6 && std::string(report.reason)=="legend-outside");
+                if(fault==9)assert(!report.hit && !report.projected && report.measured==2 && std::string(report.reason)=="legend-outside");
             }
             assert(plain.transportCalls==observed.transportCalls && plain.vm.clicks==0 && observed.vm.clicks==0);
             assert(plain.vm.refs.empty() && observed.vm.refs.empty() && plain.vm.movieRefs==1 && observed.vm.movieRefs==1);
@@ -321,5 +325,31 @@ int main(int argc,char** argv) {
         {GfxSession s(vm,base,movie,scratch1,negative==5 ? 16u : 192u,false);assert(!vm.cursor(s).valid);}
         assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
     }
-    std::puts("Native Map footer/UTF-16/11 observed/plain controls/3D inverse/queued mouse/ownership/cancel/budget controls PASS");
+    {
+        // MapBar's A hint routes to the original Enter/A release, which runs
+        // PlaceCustomObjective at the crosshair. Legend stays its own word.
+        MapVm vm(argv[1]);
+        const double x=500.45-378.55+253+(double(vm.waypoint)-double(vm.first))*8+147+32;
+        GfxSession down(vm,base,movie,scratch1,512,false),up(vm,base,movie,scratch2,512,false);
+        const auto a=vm.hit(down,static_cast<float>(x/1280),610.f/720),b=vm.hit(up,static_cast<float>(x/1280),610.f/720);
+        assert(a && b && SameBl2MapLegend(a,b) && a.command==NativeFooterCommand::Accept && a.first==4 && a.count==8);
+        assert(vm.vm.clicks==0); // Capture never activates the footer.
+        up.beginInputBoundary();
+        const auto legend=vm.hit(up);assert(legend && legend.command==NativeFooterCommand::Legend && !SameBl2MapLegend(a,legend));
+    }
+    {
+        // Russian MapBar: "<A> Маршрутная точка   <LT><RT> Масштабирование   <Y> Легенда   <B> Закрыть".
+        MapVm vm(argv[1]);
+        const char* caption="(A) \xD0\x9C\xD0\xB0\xD1\x80\xD1\x88\xD1\x80\xD1\x83\xD1\x82\xD0\xBD\xD0\xB0\xD1\x8F "
+            "\xD1\x82\xD0\xBE\xD1\x87\xD0\xBA\xD0\xB0  (Y) \xD0\x9B\xD0\xB5\xD0\xB3\xD0\xB5\xD0\xBD\xD0\xB4\xD0\xB0  (B) Close";
+        vm.vm.prop(vm.field,"text",vm.vm.str(caption));vm.first=26;vm.count=7;vm.waypoint=4;vm.waypointCount=16;
+        const double x=500.45-378.55+253+(4-26)*8.0+147+64;
+        GfxSession s(vm,base,movie,scratch1,512,false);
+        const auto t=vm.hit(s,static_cast<float>(x/1280),610.f/720);
+        assert(t && t.command==NativeFooterCommand::Accept && t.first==4 && t.count==16 && vm.vm.clicks==0);
+        s.beginInputBoundary();
+        const auto legend=vm.hit(s,static_cast<float>((500.45-378.55+253+147+24)/1280),610.f/720);
+        assert(legend && legend.command==NativeFooterCommand::Legend && legend.first==26 && legend.count==7);
+    }
+    std::puts("Native Map footer/UTF-16/11 observed/plain controls/3D inverse/queued mouse/ownership/cancel/budget, Waypoint EN/RU controls PASS");
 }

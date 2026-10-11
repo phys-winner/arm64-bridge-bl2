@@ -14,8 +14,12 @@ namespace bl2::touch {
 #ifndef BL2_ENABLE_DEBUG_MENU_DEFAULT
 #define BL2_ENABLE_DEBUG_MENU_DEFAULT 0
 #endif
-constexpr std::uint32_t kTouchSettingsVersion = 5;
-constexpr std::size_t kTouchSettingCount = 34;
+constexpr std::uint32_t kTouchSettingsVersion = 7;
+constexpr std::size_t kTouchSettingCount = 36;
+// Present pacing (bl2_frame_pacer): ON by default and switchable while playing.
+constexpr std::size_t kTouchFramePacingSetting = 34;
+// Java shows Reload while a reload is possible; ON by default.
+constexpr std::size_t kTouchReloadButtonSetting = 35;
 constexpr std::int32_t kTouchSettingsOpen = 0x6A100000;
 constexpr std::int32_t kTouchSettingsGraphicsOpen = 0x6A100004;
 constexpr std::int32_t kTouchSettingsValue = 0x6A100100;
@@ -40,7 +44,8 @@ inline constexpr TouchSettingSpec touchSettingSpecs[] = {
     {"DYNAMIC SHADOWS",0,1,1,true}, {"LIGHT ENVIRONMENT SHADOWS",0,1,1,true},
     {"STATIC DECALS",0,1,1,true}, {"UNBATCHED DECALS",0,1,1,true}, {"LIGHT SHAFTS",0,1,1,true},
     {"DISTORTION",0,1,1,true}, {"RADIAL BLUR",0,1,1,true}, {"ANISOTROPIC FILTERING",0,4,1,false},
-    {"FASTER VISIBILITY TESTS",0,1,1,true}, {"FASTER AUDIO LIMITER",0,1,1,true}
+    {"FASTER VISIBILITY TESTS",0,1,1,true}, {"FASTER AUDIO LIMITER",0,1,1,true},
+    {"FRAME PACING",0,1,1,true}, {"RELOAD BUTTON",0,1,1,true}
 };
 static_assert(std::size(touchSettingSpecs) == kTouchSettingCount);
 inline const char* TouchSettingCaption(std::size_t id, bool russian) {
@@ -53,8 +58,10 @@ inline const char* TouchSettingCaption(std::size_t id, bool russian) {
         "КАРТОФЕЛЬНАЯ ГРАФИКА", "СВЕЧЕНИЕ", "РАЗМЫТИЕ ДВИЖЕНИЯ", "БЛИКИ ЛИНЗ",
         "ДИНАМИЧЕСКИЕ ТЕНИ", "ТЕНИ ОСВЕЩЕНИЯ", "СТАТИЧЕСКИЕ ДЕКАЛИ", "ОТДЕЛЬНЫЕ ДЕКАЛИ",
         "СВЕТОВЫЕ ЛУЧИ", "ИСКАЖЕНИЯ", "РАДИАЛЬНОЕ РАЗМЫТИЕ", "АНИЗОТРОПНАЯ ФИЛЬТРАЦИЯ",
-        "УСКОРЕНИЕ ОТСЕЧЕНИЯ ОБЪЕКТОВ", "УСКОРЕНИЕ АУДИОЛИМИТЕРА"
+        "УСКОРЕНИЕ ОТСЕЧЕНИЯ ОБЪЕКТОВ", "УСКОРЕНИЕ АУДИОЛИМИТЕРА", "РОВНЫЙ ТЕМП КАДРОВ",
+        "КНОПКА ПЕРЕЗАРЯДКИ"
     };
+    static_assert(std::size(captions) == kTouchSettingCount);
     return russian ? captions[id] : touchSettingSpecs[id].caption;
 }
 inline const char* TouchSettingHint(std::size_t id, bool russian) {
@@ -67,12 +74,18 @@ inline const char* TouchSettingHint(std::size_t id, bool russian) {
     if (id == 20) return russian ?
         "Упрощает графику ниже штатного минимума, сохраняя разрешение рендера. Выключение возвращает выбранные настройки." :
         "Reduces graphics below the normal minimum, preserving render resolution. Switching off restores your selected settings.";
-    if (id >= 21 && id < kTouchSettingCount) return russian ?
+    if (id == kTouchFramePacingSetting) return russian ?
+        "Каждый кадр на экране одинаковое время: без рывков, но FPS округляется вниз (на 120 Гц: 60, 40, 30, 24, 20)." :
+        "Every frame stays on screen equally long: no judder, but FPS rounds down (at 120 Hz: 60, 40, 30, 24, 20).";
+    if (id == kTouchReloadButtonSetting) return russian ?
+        "Кнопка «Зарядить» появляется, когда магазин неполный и перезарядка ещё не идёт. Тап по полосе патронов перезаряжает и без неё." :
+        "Shows Reload while the magazine is not full and no reload is running. Tapping the ammo bar reloads either way.";
+    if (id >= 21 && id < 32) return russian ?
         "Сохраняется отдельно. Картофельная графика временно перекрывает выбранное значение." :
         "Saved separately. Potato graphics temporarily overrides the selected value.";
     if (id == 0) return russian ?
-        "Больше — чётче изображение; меньше — быстрее игра. Применяется после выхода из меню." :
-        "Higher values sharpen the image; lower values improve performance. Applied after leaving the menu.";
+        "Больше — чётче изображение; меньше — быстрее игра. Применяется после перезапуска игры." :
+        "Higher values sharpen the image; lower values improve performance. Applied after the game restarts.";
     if (id == 8) return russian ?
         "Микрофон для голосового чата. При первом включении требуется разрешение Android." :
         "Microphone for voice chat. Android permission is required the first time it is enabled.";
@@ -109,6 +122,7 @@ inline std::string TouchSettingValueText(std::size_t id, double value) {
 struct TouchSettingsState {
     std::mutex mutex;
     bool initialized = false, resetPending = false;
+    bool videoOptions = false;  // The shown options list is the video page.
     unsigned page = 0;
     std::uint32_t revision = 0, commands = 0, uiRequest = 0;
     std::array<std::uint32_t,kTouchSettingCount> values{};
@@ -116,9 +130,11 @@ struct TouchSettingsState {
     std::vector<std::int32_t> nativeEvents, events;
 };
 inline TouchSettingsState touchSettingsState;
-// Host input [version 5, revision acknowledgement, 34 values]; output
-// [version 5, revision, one-shot command bits, 34 values]. Unacknowledged native
-// edits win over an older Java snapshot, including the final menu-close poll.
+// Host input [version 7, revision acknowledgement, 36 values]; output
+// [version 7, revision, command bits, 36 values]. Bits 1-8 are one-shot
+// commands; 16 is set while the video options page is shown, so Java can offer
+// a restart for a new render resolution once that page closes. Unacknowledged
+// native edits win over an older Java snapshot, including the final menu-close poll.
 inline std::vector<std::uint32_t> ExchangeBl2TouchSettings(const std::vector<std::uint32_t>& host) {
     auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
     bool valid = host.size() == kTouchSettingCount + 2 && host[0] == kTouchSettingsVersion;
@@ -140,7 +156,9 @@ inline std::vector<std::uint32_t> ExchangeBl2TouchSettings(const std::vector<std
         if (initialized && state.values != previous) state.uiRequest |= 4u;
         if (state.resetPending) { state.uiRequest |= 4u; state.resetPending = false; }
     }
-    std::vector<std::uint32_t> out{kTouchSettingsVersion,state.revision,state.commands}; state.commands = 0;
+    std::vector<std::uint32_t> out{kTouchSettingsVersion,state.revision,
+        state.commands | (state.owner && state.videoOptions ? 16u : 0u)};
+    state.commands = 0;
     out.insert(out.end(),state.values.begin(),state.values.end()); return out;
 }
 inline bool Bl2DebugMenuVisible() {
@@ -158,6 +176,10 @@ inline bool Bl2ShowFps() {
 inline std::uint32_t Bl2FrameRateLimit() {
     auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
     return state.initialized ? state.values[19] : 0u;
+}
+inline bool Bl2FramePacingEnabled() {
+    auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
+    return !state.initialized || state.values[kTouchFramePacingSetting] != 0;
 }
 inline bool SetBl2TouchSetting(std::size_t id, double value) {
     if (id >= kTouchSettingCount || !std::isfinite(value)) return false;

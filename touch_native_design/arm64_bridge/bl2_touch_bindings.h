@@ -28,6 +28,11 @@ constexpr const char* shippedActionName(Action action) {
     case Action::VehicleBrake: return "Handbrake";
     case Action::VehicleBoost: return "Afterburner";
     case Action::VehicleHorn: return "Horn";
+    // InputContext_DrivingVehicle / InVehicleTurret / VehicleAttachedRider.
+    case Action::ExitVehicle: return "ExitVehicle";
+    case Action::SwitchSeats: return "SwitchSeats";
+    case Action::DriverFireTurret: return "DriverFireTurret";
+    case Action::LookBack: return "LookBack";
     // GFx navigation: derive keys/actions from the focused movie. No fabricated
     // InputActionDefinition named Confirm, Back, or UI_Up exists in this table.
     case Action::LastWeapon: // Original inventory selection, not PreviousWeapon.

@@ -540,9 +540,14 @@ MapLegendTarget captureNativeFooter(GfxSession& s,NativeFooterFamily family,cons
     if(observation) observation->caption=out.caption;
     if (!captionString || out.caption.empty()) return reject("footer-caption");
     struct Word { const char* text;NativeFooterCommand command; };
+    // MapBar's GFx_Accept hint: the original A/Enter release runs
+    // PlaceCustomObjective at the crosshair, exactly like on a controller.
     constexpr Word legendWords[]={{"Legend",NativeFooterCommand::Legend},{"LEGEND",NativeFooterCommand::Legend},
         {"legend",NativeFooterCommand::Legend},{"Легенда",NativeFooterCommand::Legend},
-        {"ЛЕГЕНДА",NativeFooterCommand::Legend},{"легенда",NativeFooterCommand::Legend}};
+        {"ЛЕГЕНДА",NativeFooterCommand::Legend},{"легенда",NativeFooterCommand::Legend},
+        {"Waypoint",NativeFooterCommand::Accept},{"WAYPOINT",NativeFooterCommand::Accept},
+        {"waypoint",NativeFooterCommand::Accept},{"Маршрутная точка",NativeFooterCommand::Accept},
+        {"МАРШРУТНАЯ ТОЧКА",NativeFooterCommand::Accept},{"маршрутная точка",NativeFooterCommand::Accept}};
     constexpr Word inventoryWords[]={{"Inspect",NativeFooterCommand::Inspect},{"INSPECT",NativeFooterCommand::Inspect},
         {"Осмотреть",NativeFooterCommand::Inspect},{"ОСМОТРЕТЬ",NativeFooterCommand::Inspect},
         {"Trash/Favourite",NativeFooterCommand::Mark},{"TRASH/FAVOURITE",NativeFooterCommand::Mark},
@@ -889,6 +894,138 @@ MapCursorTarget CaptureBl2MapCursor(GfxSession& s,GfxHandle map,GfxHandle mask,
     }
     if (!WidgetContains(local,out.local)) return reject("map-cursor-outside-mask");
     out.valid=s.good();out.reason=out.valid ? "map-mouse-projected" : s.reason();return out;
+}
+namespace {
+// UI_StatusMenu EditText526 under MissionSummaryPanel (SetDescriptionScrollValue,
+// root SetScrollArrows), EditText118/117 of the challenge description panel,
+// and UI_Mission EditText55 (QuestAccept SetDescriptionScrollValue/SetScrollArrows).
+// The summary description also sits at _z=-600, so its whole panel owns swipes.
+constexpr TextScrollTarget kMissionLogText{"_root.missions.missionSummary.description",true,"SetScrollArrows",
+    {-86.15,-2,190.6,256.45}};
+constexpr TextScrollTarget kChallengeText{"_root.challenges.challengesPanel.descriptionPanel.challengeDescription",
+    false,nullptr,{-86.15,-2,172.95,63.25}};
+constexpr TextScrollTarget kChallengeLevels{"_root.challenges.challengesPanel.descriptionPanel.challengeLevels",
+    false,nullptr,{-86.15,-2,171.3,116.6}};
+constexpr TextScrollTarget kQuestText{"_root.missions.description",false,"SetScrollArrows",{-86.15,-2,278.8,280.7}};
+}
+std::vector<const TextScrollTarget*> Bl2TextScrollTargets(std::string_view movieClass,std::int32_t screen) {
+    if (movieClass=="StatusMenuExGFxMovie" && screen==1) return {&kMissionLogText};
+    if (movieClass=="StatusMenuExGFxMovie" && screen==5) return {&kChallengeText,&kChallengeLevels};
+    if (movieClass=="QuestAcceptGFxMovie") return {&kQuestText};
+    return {};
+}
+bool Bl2TextScrollLocalRect(const TextScrollTarget& target,const std::array<double,7>& v,GfxRect& local) {
+    local={};
+    for (const auto value:v) if (!std::isfinite(value)) return false;
+    const double sx=v[4]/100,sy=v[5]/100;
+    if (std::abs(v[0])>=1000000 || std::abs(v[1])>=1000000 || sx<=0 || sx>10 || sy<=0 || sy>10 || v[6]!=0) return false;
+    // The fixed authored box. A field with its own _z (the summary's -600)
+    // reports both sides reduced by one depth factor (device: .965, swaying
+    // by <.001), so only about the same factor on both axes is accepted,
+    // never another field's shape.
+    const double width=(target.box.right-target.box.left)*sx,height=(target.box.bottom-target.box.top)*sy;
+    const double fx=v[2]/width,fy=v[3]/height;
+    if (!std::isfinite(fx) || !std::isfinite(fy) || fx<.9 || fx>1.1 || std::abs(fx-fy)>.01) return false;
+    local={v[0],v[1],v[0]+width,v[1]+height};
+    return true;
+}
+std::int32_t Bl2TextScrollLine(std::int32_t start,std::int32_t maximum,double drag,double line) {
+    if (maximum<1 || start<1 || start>maximum || !std::isfinite(drag) || !std::isfinite(line) || line<=0) return start;
+    const double moved=std::round(-drag/line);
+    return static_cast<std::int32_t>(std::clamp(start+moved,1.0,static_cast<double>(maximum)));
+}
+TextScrollCapture CaptureBl2TextScroll(GfxSession& s,std::string_view movieClass,std::int32_t screen,
+    std::uint32_t width,std::uint32_t height,float x,float y) {
+    TextScrollCapture rejected;
+    const auto reject=[&](const char* reason) { rejected.reason=reason;return rejected; };
+    if (!s.good() || !width || !height || !std::isfinite(x) || !std::isfinite(y) || x<0 || x>1 || y<0 || y>1)
+        return reject("text-input");
+    const auto targets=Bl2TextScrollTargets(movieClass,screen);
+    GfxRect frame;GfxViewport viewport;
+    if (targets.empty()) return reject("text-no-target");
+    if (!s.frameRect(frame) || !s.viewport(viewport)) return reject("text-frame");
+    const auto shown=[&](GfxHandle clip) {
+        bool visible=false;double alpha=0;
+        return boolean(s,clip,"_visible",visible) && visible && number(s,clip,"_alpha",alpha) &&
+            std::isfinite(alpha) && alpha>0 && alpha<=100;
+    };
+    const auto normalize=[&](const GfxRect& stage,GfxRect& out) {
+        WidgetPoint a,b;
+        if (!NormalizeWidgetPoint(frame,viewport,width,height,{stage.left,stage.top},a) ||
+            !NormalizeWidgetPoint(frame,viewport,width,height,{stage.right,stage.bottom},b) ||
+            b.x<=a.x || b.y<=a.y) return false;
+        out={a.x,a.y,b.x,b.y};return true;
+    };
+    const Value root{s,s.variable("_root")};GfxIdentity rootId;
+    if (!s.identity(root,rootId)) return reject("text-root");
+    for (const auto* target:targets) {
+        const Value field{s,s.variable(target->field)};
+        const Value parent{s,s.member(field,"_parent")};
+        if (!field || (s.type(field)!=8 && s.type(field)!=10) || s.type(parent)!=10) { rejected.reason="text-field-type";continue; }
+        if (!shown(field)) { rejected.reason="text-field-hidden";continue; }
+        // Every ancestor below _root is shown: inactive challenge/badass
+        // panels and other screens keep their fields but hide a parent.
+        bool chain=true,reached=false;GfxHandle clip=s.member(field,"_parent");
+        for (unsigned depth=0;chain && depth<10;++depth) {
+            GfxIdentity id;
+            if (!s.identity(clip,id)) {chain=false;break;}
+            if (id==rootId) {reached=true;break;}
+            chain=shown(clip);
+            const auto next=s.member(clip,"_parent");s.release(clip);clip=next;
+        }
+        s.release(clip);
+        if (!chain || !reached) { rejected.reason="text-ancestor-hidden";continue; }
+        std::array<double,7> v{};
+        constexpr const char* names[]{"_x","_y","_width","_height","_xscale","_yscale","_rotation"};
+        bool okay=true;
+        for (std::size_t i=0;okay && i<v.size();++i) okay=number(s,field,names[i],v[i]);
+        rejected.metrics=v;
+        GfxRect local,stage,box,hit;
+        if (!okay || !Bl2TextScrollLocalRect(*target,v,local)) { rejected.reason="text-field-shape";continue; }
+        if (!s.projectedRect(parent,local,stage) || !normalize(stage,box)) { rejected.reason="text-field-projection";continue; }
+        hit=box;
+        if (target->parentOwnsSwipe && (!s.projectedBounds(parent,stage) || !normalize(stage,hit))) {
+            rejected.reason="text-panel-projection";continue;
+        }
+        rejected.bounds=hit;
+        if (!WidgetContains(hit,{x,y})) { rejected.reason="text-outside";continue; }
+        double scroll=0,maximum=0,bottom=0;
+        if (!number(s,field,"scroll",scroll) || !number(s,field,"maxscroll",maximum) ||
+            !number(s,field,"bottomScroll",bottom) || scroll!=std::floor(scroll) || maximum!=std::floor(maximum) ||
+            bottom!=std::floor(bottom) || maximum<2 || maximum>100000 || scroll<1 || scroll>maximum || bottom<scroll) {
+            const auto whole=[](double value) {
+                return std::isfinite(value) ? static_cast<std::int32_t>(std::clamp(value,-1.0,100000.0)) : -1;
+            };
+            rejected.scroll=whole(scroll);rejected.maximum=whole(maximum);
+            rejected.reason="text-not-overflowing";continue;
+        }
+        const double lines=bottom-scroll+1,pixels=(box.bottom-box.top)*height/lines;
+        GfxIdentity id;
+        if (!s.identity(field,id) || !std::isfinite(pixels) || pixels<4 || pixels>height || !s.good()) {
+            rejected.linePixels=pixels;rejected.reason="text-line-height";continue;
+        }
+        TextScrollCapture out;
+        out.target=target;out.field=id;out.bounds=hit;out.linePixels=pixels;out.metrics=v;out.reason="text-captured";
+        out.scroll=static_cast<std::int32_t>(scroll);out.maximum=static_cast<std::int32_t>(maximum);
+        return out;
+    }
+    return rejected;
+}
+bool ScrollBl2Text(GfxSession& s,const TextScrollCapture& capture,std::int32_t line) {
+    if (!capture || !s.good()) return false;
+    const Value field{s,s.variable(capture.target->field)};
+    double maximum=0,current=0;
+    if (!sameIdentity(s,field,capture.field) || !number(s,field,"maxscroll",maximum) || !number(s,field,"scroll",current) ||
+        maximum!=std::floor(maximum) || maximum<1 || maximum>100000) return false;
+    const double next=std::clamp(static_cast<double>(line),1.0,maximum);
+    if (next==current) return true;
+    const Value value{s,s.number(next)};
+    if (!value || !s.setMember(field,"scroll",value)) return false;
+    if (capture.target->arrows) {
+        const Value root{s,s.variable("_root")},redrawn{s,s.invoke(root,capture.target->arrows,{},true)};
+        (void)redrawn;
+    }
+    return s.good();
 }
 AgeGateWidgetTarget CaptureBl2AgeGateWidget(GfxSession& s,GfxHandle content,
     std::uint32_t width,std::uint32_t height,float x,float y) {

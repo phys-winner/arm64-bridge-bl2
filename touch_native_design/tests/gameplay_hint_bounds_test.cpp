@@ -128,6 +128,20 @@ int main(int argc,char** argv) {
             near(out.right,100+387*scale);near(out.bottom,180+34*scale);
         }
     }
+    for (const double scale:{1.0,1.25,2.0}) {
+        // A short left-aligned caption owns its painted text, not the empty
+        // remainder of the 351px box over the look area.
+        HintVm vm(argv[1]);vm.vm.prop(vm.tools,"_xscale",widget_fixture::num(scale*100));
+        vm.vm.prop(vm.tools,"_yscale",widget_fixture::num(scale*100));
+        vm.vm.prop(vm.desc,"textWidth",widget_fixture::num(80));GfxRect out;UseHintObservation detail;
+        assert(observe(vm,out,192,&detail));near(detail.textWidth,80);
+        near(out.left,100+35.8*scale);near(out.right,100+(37.8+84)*scale);
+        near(out.top,180+3.35*scale);near(out.bottom,180+34*scale);
+    }
+    for (const double width:{0.0,-5.0,347.3,std::numeric_limits<double>::quiet_NaN()}) {
+        HintVm vm(argv[1]);vm.vm.prop(vm.desc,"textWidth",widget_fixture::num(width));GfxRect out;
+        assert(observe(vm,out));near(out.right,100+387); // Implausible width keeps the authored box.
+    }
     for (const double frame:{0.0,1.0,3.0,14.0,15.0,40.0,54.0,56.0,57.0,58.0,59.0,2.5,999.0}) {
         HintVm vm(argv[1]);vm.vm.prop(vm.tools,"_currentframe",widget_fixture::num(frame));GfxRect out{1,2,3,4};
         assert(!observe(vm,out) && !vm.projections && out.left==0 && out.right==0);
@@ -156,5 +170,6 @@ int main(int argc,char** argv) {
         if (bad==13) assert(std::strcmp(detail.reason,"desc-display-replaced")==0 && vm.projections==4);
     }
     std::cout<<"PASS: original AS2 +16384/-16384 depth conversion, positive3 NULL regression, authored depth3 bound desc field and 100/125/200 projection\n";
+    std::cout<<"PASS: painted caption width trims the Action target; implausible widths keep the authored box\n";
     std::cout<<"PASS: melee/full/cannotUse/trade exclusion, empty/hidden/foreign/changed/stale/budget guards and managed cleanup\n";
 }

@@ -34,7 +34,7 @@ static bool send(Mailbox& box, std::uint64_t epoch, std::uint64_t held,
 static void testUnknownAndWire() {
     Mailbox box;
     const auto wire = box.snapshot().wire();
-    CHECK(wire.size() == 18 && wire[0] == 3 && wire[1] != 0 && wire[2] == 0 && wire[3] == 0);
+    CHECK(wire.size() == 18 && wire[0] == 4 && wire[0] == kProtocolVersion && wire[1] != 0 && wire[2] == 0 && wire[3] == 0);
     CHECK(wire[4] == 0 && wire[5] == 0 && wire[6] == 0);
     CHECK(wire[7] == std::numeric_limits<std::uint64_t>::max() && wire[8] == wire[7]);
     for (std::size_t i = 9; i != wire.size(); ++i) CHECK(wire[i] == 0);
@@ -138,17 +138,17 @@ static void testOriginalChatEntryAndRevocation() {
     auto context = gameplay();
     constexpr auto chat = actionBit(Action::Chat);
     constexpr auto fire = actionBit(Action::Fire);
-    CHECK(chat == (std::uint64_t{1} << 26) && kActionCount == 27);
+    CHECK(chat == (std::uint64_t{1} << 26) && kActionCount == 31);
     CHECK(std::strcmp(shippedActionName(Action::Chat), "Say") == 0);
-    context.availableActions &= ~chat; // Existing v3 producer has only the original 26 actions.
+    context.availableActions &= ~chat; // A producer without Chat keeps the original 26 actions.
     const auto epoch = ready(box, context);
-    CHECK(box.snapshot().wire().size() == 18 && box.snapshot().wire()[0] == 3);
+    CHECK(box.snapshot().wire().size() == 18 && box.snapshot().wire()[0] == kProtocolVersion);
     CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire | chat, 101));
     const auto old = box.consumeFrame(2, 101);
     CHECK(old.actionEdgeCount == 1 && old.actionEdges[0].action == Action::Fire && old.heldActions == fire);
     context.availableActions |= chat;
     CHECK(box.publishContext(context) == epoch && (box.snapshot().wire()[4] & chat) != 0);
-    CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire | chat | (std::uint64_t{1} << 27), 102));
+    CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire | chat | (std::uint64_t{1} << kActionCount), 102));
     CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire, 102));
     const auto down = box.consumeFrame(3, 102);
     CHECK(down.actionEdgeCount == 1 && down.actionEdges[0].action == Action::Chat && down.actionEdges[0].down);
@@ -320,6 +320,60 @@ static void testMenuRejectsGameplayAndUnavailableActions() {
     CHECK(near(frame.yawDegrees, 0) && near(frame.pitchDegrees, 0));
     CHECK(frame.actionEdgeCount == 1 && frame.actionEdges[0].action == Action::Back);
     CHECK(frame.heldActions == actionBit(Action::Back));
+}
+
+static void testCinematicSkipAndPauseWithoutAxes() {
+    Mailbox box;
+    const auto epoch = ready(box, {Mode::Cinematic, CanSkip,
+                                  actionBit(Action::Skip) | actionBit(Action::Pause), 1});
+    CHECK(box.submit(epoch, 1, 1, 30, 30, actionBit(Action::Fire) | actionBit(Action::Skip), 101));
+    const auto held = box.consumeFrame(2, 101);
+    CHECK(near(held.moveX, 0) && near(held.moveY, 0));
+    CHECK(near(held.yawDegrees, 0) && near(held.pitchDegrees, 0));
+    CHECK(held.actionEdgeCount == 1 && held.actionEdges[0].down && held.actionEdges[0].action == Action::Skip);
+    CHECK(send(box, epoch, actionBit(Action::Pause), 102));
+    const auto swap = box.consumeFrame(3, 102);
+    CHECK(swap.actionEdgeCount == 2 && swap.heldActions == actionBit(Action::Pause));
+    // An unskippable cinematic keeps Pause but never forwards a held Skip bit.
+    const auto pauseOnly = box.publishContext({Mode::Cinematic, CanSkip, actionBit(Action::Pause), 1});
+    CHECK(pauseOnly == epoch && send(box, epoch, actionBit(Action::Skip) | actionBit(Action::Pause), 103));
+    CHECK(box.consumeFrame(4, 103).heldActions == actionBit(Action::Pause));
+    const auto unrouted = box.publishContext({Mode::Cinematic, 0, actionBit(Action::Skip), 1});
+    CHECK(unrouted != epoch);
+    const auto release = box.consumeFrame(5, 103);
+    CHECK(release.resetReasons == ContextChanged && release.heldActions == 0);
+    CHECK(box.submit(unrouted, 0, 0, 0, 0, 0, 104) && send(box, unrouted, actionBit(Action::Skip), 104));
+    CHECK(box.consumeFrame(6, 104).actionEdgeCount == 0);
+}
+
+// Protocol 4: a vehicle seat routes its own shipped actions with axes; on-foot
+// actions absent from the seat's availability never reach the engine.
+static void testVehicleSeatActionsAndAxes() {
+    Mailbox box;
+    constexpr auto exit = actionBit(Action::ExitVehicle), seats = actionBit(Action::SwitchSeats);
+    constexpr auto turret = actionBit(Action::DriverFireTurret), back = actionBit(Action::LookBack);
+    constexpr auto seat = actionBit(Action::Fire) | actionBit(Action::VehicleBoost) | actionBit(Action::VehicleBrake) |
+        actionBit(Action::VehicleHorn) | exit | seats | turret | back;
+    CHECK(kActionCount == 31 && back == (std::uint64_t{1} << 30) && (kKnownActions & seat) == seat);
+    CHECK(std::strcmp(shippedActionName(Action::ExitVehicle), "ExitVehicle") == 0);
+    CHECK(std::strcmp(shippedActionName(Action::SwitchSeats), "SwitchSeats") == 0);
+    CHECK(std::strcmp(shippedActionName(Action::DriverFireTurret), "DriverFireTurret") == 0);
+    CHECK(std::strcmp(shippedActionName(Action::LookBack), "LookBack") == 0);
+    const auto epoch = ready(box, {Mode::Vehicle, GameplayInput | RelativeLook, seat, 7});
+    CHECK(box.submit(epoch, .6f, .8f, 4, -2, turret | back | actionBit(Action::Jump), 101));
+    const auto held = box.consumeFrame(2, 101);
+    CHECK(near(held.moveX, .6f) && near(held.moveY, .8f) && near(held.yawDegrees, 4) && near(held.pitchDegrees, -2));
+    CHECK(held.heldActions == (turret | back) && held.actionEdgeCount == 2);
+    for (std::size_t i = 0; i != held.actionEdgeCount; ++i) CHECK(held.actionEdges[i].down);
+    CHECK(send(box, epoch, exit, 102));
+    const auto swap = box.consumeFrame(3, 102);
+    CHECK(swap.heldActions == exit && swap.actionEdgeCount == 3);
+    // Leaving the seat changes the scene: the held Exit is released by the reset.
+    const auto onFoot = box.publishContext({Mode::Gameplay, GameplayInput | RelativeLook, kKnownActions, 8});
+    CHECK(onFoot != epoch);
+    const auto left = box.consumeFrame(4, 103);
+    CHECK(left.resetReasons == ContextChanged && left.heldActions == 0 && left.actionEdgeCount == 1);
+    CHECK(left.actionEdges[0].action == Action::ExitVehicle && !left.actionEdges[0].down);
 }
 
 static void testTextInputRejectsAllTouchCapabilities() {
@@ -605,7 +659,7 @@ static void testUseHudRegionIsIndependent() {
     context.useRect={.38f,.49f,.65f,.55f};
     const auto epoch=ready(box,context);
     const auto words=box.snapshot().wire();
-    CHECK(words.size()==18 && words[0]==3 && words[9]==(HudMinimap|HudUse));
+    CHECK(words.size()==18 && words[0]==kProtocolVersion && words[9]==(HudMinimap|HudUse));
     CHECK(near(unpackFloat(words[16],false),.38f) && near(unpackFloat(words[16],true),.49f));
     CHECK(near(unpackFloat(words[17],false),.65f) && near(unpackFloat(words[17],true),.55f));
     CHECK(send(box,epoch,actionBit(Action::Fire)|actionBit(Action::Use)));
@@ -657,6 +711,8 @@ int main() {
     testLookOnceAndAnalogHold();
     testResetReleasesAndRearms();
     testMenuRejectsGameplayAndUnavailableActions();
+    testCinematicSkipAndPauseWithoutAxes();
+    testVehicleSeatActionsAndAxes();
     testTextInputRejectsAllTouchCapabilities();
     testSceneIdentityCapabilitiesAndOwnership();
     testActionRevocationDoesNotInterruptMovement();
@@ -670,6 +726,6 @@ int main() {
     testConcurrentSnapshotIsCoherent();
     testNativeMapTwoPointerTransport();
     testUseHudRegionIsIndependent();
-    std::cout << "PASS: 25 native touch contract scenarios\n";
+    std::cout << "PASS: 27 native touch contract scenarios\n";
     return 0;
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "../../touch_native_design/arm64_bridge/bl2_touch_engine_adapter.h"
 #include "bl2_touch_gfx_values.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -37,9 +38,19 @@ inline bool Bl2UseHintLocalRect(const std::array<double,7>& v,GfxRect& out) {
     out={v[0]-2*v[4]/100,v[1]-2*v[5]/100,v[0]+349.2*v[4]/100,v[1]+28.65*v[5]/100};
     return true;
 }
+// EditText572 is left aligned: a short caption paints only its first
+// textWidth pixels after the 2px gutter. Keep that painted part as the tap
+// target instead of the empty rest of the 351px box over the look area.
+// An unreadable or implausible width keeps the whole authored box.
+inline GfxRect Bl2UseHintCaptionRect(const GfxRect& field,const std::array<double,7>& v,double textWidth) {
+    if (!std::isfinite(textWidth) || textWidth<=0 || textWidth>347.2) return field;
+    auto out=field;
+    out.right=std::min(field.right,v[0]+(textWidth+4)*v[4]/100);
+    return out;
+}
 struct UseHintObservation {
     const char* reason="unobserved";
-    double frame=0,currentFrame=0,depth=0;
+    double frame=0,currentFrame=0,depth=0,textWidth=-1;
     std::uint32_t toolsType=0,descType=0;
     GfxIdentity tools{},parent{};
     std::array<double,7> metrics{};
@@ -106,7 +117,9 @@ inline bool ObserveBl2UseHint(GfxSession& session,GfxHandle tools,GfxRect& out,
     GfxRect local,stage;double currentFrame=0;
     if (okay) {
         okay=Bl2UseHintLocalRect(metrics,local);
-        if (observation) observation->reason=okay ? "projection" : "desc-shape";
+        double textWidth=-1;
+        if (okay && number(desc,"textWidth",textWidth)) local=Bl2UseHintCaptionRect(local,metrics,textWidth);
+        if (observation) { observation->reason=okay ? "projection" : "desc-shape";observation->textWidth=textWidth; }
     }
     if (okay) {
         okay=session.projectedRect(tools,local,stage);
@@ -153,15 +166,31 @@ struct EquippedWeaponHistory {
 };
 
 // Current TextField attributes [x,y,width,height,xscale,yscale,rotation]. The
-// fixed non-autosized EditText671/955 owns [1573,5347,-40,731] twips. Preserve
-// that nonzero origin while projecting through its real parent MovieClip.
+// fixed non-autosized EditText671/955 owns [1573,5347,-40,731] twips. Scaleform
+// reports a TextField's _x/_y at that own rectangle's top-left, not at its
+// placement: the field placed at (-271.9,-7.05) reads (-193.25,-9.05) on
+// device. Never add the authored origin a second time.
 inline bool Bl2AmmoCounterLocalRect(const std::array<double,7>& v,std::array<double,4>& out) {
     out={};
     for (const auto value:v) if (!std::isfinite(value)) return false;
     if (std::abs(v[0])>=1000000 || std::abs(v[1])>=1000000 ||
         v[4]<=0 || v[4]>1000 || v[5]<=0 || v[5]>1000 || v[6]!=0 ||
         std::abs(v[2]-188.7*v[4]/100)>.02 || std::abs(v[3]-38.55*v[5]/100)>.02) return false;
-    out={v[0]+78.65*v[4]/100,v[1]-2*v[5]/100,v[0]+267.35*v[4]/100,v[1]+36.55*v[5]/100};
+    out={v[0],v[1],v[0]+v[2],v[1]+v[3]};
+    return true;
+}
+// The whole visible ammo strip in parent p1.bullets coordinates (HUD
+// sprite673, frames none..weaponSwitch): bar backdrop604/672, the fill
+// 643/647 inside mask641, separator252, counter EditText671 and the union of
+// every bullet_icon670 frame. The flash effect is excluded. These children
+// keep authored placements; prove that with the counter's exact reported
+// rectangle origin, else keep only the counter as the target.
+inline bool Bl2AmmoStripLocalRect(const std::array<double,7>& v,std::array<double,4>& out) {
+    out={};
+    for (const auto value:v) if (!std::isfinite(value)) return false;
+    if (std::abs(v[0]+193.25)>.05 || std::abs(v[1]+9.05)>.05 || std::abs(v[2]-188.7)>.02 ||
+        std::abs(v[3]-38.55)>.02 || std::abs(v[4]-100)>.01 || std::abs(v[5]-100)>.01 || v[6]!=0) return false;
+    out={-212.85,-15.25,56.15,36.6};
     return true;
 }
 
@@ -181,8 +210,13 @@ public:
     // controller/input/world/focused-movie/context identity, and independently
     // resolves actions through InputActionDefinition + IsActionAvailable.
     // Returns semantic action bits, or zero on malformed/ambiguous data.
+    // Without axes (Assassin Execute, cinematics) movement and look are dropped.
+    // Gameplay observes HUD/weapon/Use/skill state; a vehicle seat observes
+    // nothing and its movement also feeds RawJoyUp/RawJoyRight; a cinematic
+    // observes only the original SkipMatinee rule.
+    enum class Scene : std::uint8_t { Gameplay, Vehicle, Cinematic };
     std::uint64_t prepare(std::uint32_t controller, std::uint32_t input,
-                          std::uint64_t sceneIdentity, std::uint32_t viewport);
+                          std::uint64_t sceneIdentity, std::uint32_t viewport, bool axes, Scene scene);
     bool ready() const;
     // Read-only, input-boundary observations. Unknown counts remain -1; bounds
     // are advertised individually only after native HUD projection succeeds.
@@ -190,7 +224,8 @@ public:
     // No pending payload may survive an input tick without its native consumer.
     void expirePendingAxes();
     // Hooks inside the same input tick. They preserve the native processing:
-    // PIProcessInput entry: normalized movement before game scaling.
+    // PIProcessInput entry: normalized movement before game scaling; in a
+    // vehicle seat also the raw stick PlayerDriving reads after this seam.
     // PIPostAdjustInput +0x114: degrees to Rotator units before ignore clamps.
     void beforeAxisProcessing(std::uint32_t input);
     void beforeLookClamp(std::uint32_t input);

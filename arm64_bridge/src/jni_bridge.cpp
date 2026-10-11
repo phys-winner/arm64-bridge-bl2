@@ -42,6 +42,7 @@
 #include "bl2_program_locals_fastpath.h"
 #include "bl2_perf_hint.h"
 #include "bl2_hitch_report.h"
+#include "bl2_frame_pacer.h"
 #include "bl2_performance_settings.h"
 #include "bl2_audio_decode_fastpath.h"
 #include "bl2_guest_integrity.h"
@@ -158,6 +159,10 @@ constexpr uint32_t kBl2MaxTickRateExpected[] = {
 constexpr uint32_t kBl2MaxTickRateLoad = 0xE59F0000;  // ldr r0,[pc,#0]
 constexpr uint32_t kBl2MaxTickRateReturn = 0xE12FFF1E;  // bx lr
 constexpr float kBl2DiagnosticFpsLimit = 900.0f;
+// While presents are paced, the user's limit is enforced as whole display
+// refreshes on the render thread. The game thread's own sleep limit then sits
+// this much above it, so the two clocks never beat against each other.
+constexpr float kBl2PacedTickHeadroom = 1.1f;
 
 // Horn ships the full Tegra texture/content set, but its 2013 device whitelist
 // sends every unknown modern Android device to SystemSettingsAndroid. That
@@ -1617,6 +1622,15 @@ bool PrepareBl2ShaderStageCache(Bl2ShaderStageCache& cache) {
     return prepared;
 }
 
+// DISPLAY limit plus debug.bl2.fps_limit=900: uncapped and unpaced, for
+// throughput measurements.
+static bool Bl2UncappedDiagnostic(uint32_t requested) {
+    char diagnostic[PROP_VALUE_MAX] = {};
+    return requested == 0 &&
+        __system_property_get("debug.bl2.fps_limit", diagnostic) > 0 &&
+        std::strcmp(diagnostic, "900") == 0;
+}
+
 static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
     ElfLoader& loader = g_host->GetElfLoader();
     if (loader.GetImageSize() != 0x03089000) return true;
@@ -1630,12 +1644,10 @@ static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
 
     const uint32_t requested = bl2::touch::Bl2FrameRateLimit();
     if (requested != 0 && requested != 30 && requested != 60 && requested != 90) return false;
-    char diagnostic[PROP_VALUE_MAX] = {};
-    const bool uncapped_diagnostic =
-        requested == 0 &&
-        __system_property_get("debug.bl2.fps_limit", diagnostic) > 0 &&
-        std::strcmp(diagnostic, "900") == 0;
-    const float limit = requested ? static_cast<float>(requested) :
+    const bool uncapped_diagnostic = Bl2UncappedDiagnostic(requested);
+    const bool paced = requested != 0 && Bl2FramePacerActive();
+    const float limit = requested ?
+        static_cast<float>(requested) * (paced ? cfg::kBl2PacedTickHeadroom : 1.0f) :
         uncapped_diagnostic ? cfg::kBl2DiagnosticFpsLimit : display_refresh_rate;
     uint32_t limit_bits = 0;
     std::memcpy(&limit_bits, &limit, sizeof(limit_bits));
@@ -1676,8 +1688,9 @@ static bool InstallBl2MaxTickRatePatch(float display_refresh_rate) {
     }
     if (original || g_bl2_tick_limit_bits != limit_bits) {
         __android_log_print(ANDROID_LOG_INFO, "BL2_Parity",
-            "ARM64 guest max tick limit %.3f FPS display=%.3f Hz requested=%u diagnostic=%d",
-            limit, display_refresh_rate, requested, uncapped_diagnostic);
+            "ARM64 guest max tick limit %.3f FPS display=%.3f Hz requested=%u diagnostic=%d "
+            "paced=%d",
+            limit, display_refresh_rate, requested, uncapped_diagnostic, paced);
     }
     g_bl2_tick_limit_bits = limit_bits;
     return true;
@@ -1689,13 +1702,20 @@ bool ApplyBl2FrameRateLimit(DynarmicHost& host) {
     // A ready host is pinned for process lifetime. The present boundary already
     // runs on its guest core; only this recursive host lock is needed here.
     std::lock_guard<std::recursive_mutex> host_lock(host.GetMutex());
-    const bool applied = InstallBl2MaxTickRatePatch(
-        g_pending_display_refresh_rate.load(std::memory_order_acquire));
+    const float refresh = g_pending_display_refresh_rate.load(std::memory_order_acquire);
+    const bool applied = InstallBl2MaxTickRatePatch(refresh);
     if (applied && g_bl2_tick_limit_bits) {
         float limit = 0.0f;
         std::memcpy(&limit, &g_bl2_tick_limit_bits, sizeof(limit));
-        Bl2PerfHintFrame(limit);
-        Bl2HitchSetFrameLimit(limit);
+        const uint32_t requested = bl2::touch::Bl2FrameRateLimit();
+        const Bl2FramePace pace = Bl2FramePacerConfigure(
+            refresh, requested,
+            bl2::touch::Bl2FramePacingEnabled() && !Bl2UncappedDiagnostic(requested));
+        // Paced: the CPU hint aims at the next faster pace, so that pace can
+        // still be measured as reachable; hitches are judged by the shown one.
+        const bool paced = pace.paced_fps > 0.0f;
+        Bl2PerfHintFrame(paced ? pace.aim_fps : limit);
+        Bl2HitchSetFrameLimit(paced ? pace.paced_fps : limit);
     }
     return applied;
 }

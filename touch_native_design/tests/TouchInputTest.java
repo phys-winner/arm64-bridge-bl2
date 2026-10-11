@@ -165,11 +165,13 @@ public final class TouchInputTest {
         check(decoded.hudMap() && decoded.hudAmmo() && decoded.weaponCount==3 && decoded.grenadeCount==0,
                 "Version2 packed native Surface rects and actual counts decode independently of render scale");
         near(decoded.mapRect[0],.75f,"packed low-word X");near(decoded.ammoRect[3],.98f,"packed high-word bottom");
-        long[] prompt=java.util.Arrays.copyOf(words,18);prompt[0]=3;prompt[6]|=bit(USE);prompt[9]|=16;
+        long[] prompt=java.util.Arrays.copyOf(words,18);prompt[0]=VERSION;prompt[6]|=bit(USE);prompt[9]|=16;
         prompt[16]=packed(.38f,.49f);prompt[17]=packed(.65f,.55f);
         Context promptContext=Context.decode(prompt);
         check(promptContext.hudUse() && promptContext.hudMap() && promptContext.hudAmmo() && promptContext.known(USE),
                 "v3 appends true native interaction-hint geometry without moving map/ammo fields");
+        long[] stale=java.util.Arrays.copyOf(prompt,18);stale[0]=3;
+        check(VERSION==4 && Context.decode(stale).epoch==0,"a protocol-3 producer without the seat actions is rejected");
         near(promptContext.useRect[1],.49f,"native Use hint is normalized to the full Surface");
         prompt[16]=packed(Float.NaN,.49f);promptContext=Context.decode(prompt);
         check(!promptContext.hudUse() && promptContext.hudMap() && promptContext.hudAmmo() && promptContext.allows(USE),
@@ -236,6 +238,15 @@ public final class TouchInputTest {
         check(gesture.up(14,270,100,5350,noAmmo,true,14)==-1,"a same-epoch vanished ammo bar cannot switch weapons despite an available native route");
         gesture.down(15,TouchInput.HudGesture.AMMO_ZONE,200,100,5400,70,14);gesture.up(15,200,100,5450,c,true,14);
         check(gesture.poll(5500,noAmmo)==-1 && gesture.poll(5800,c)==-1,"ammo target loss before the tap timer expires discards reload rather than reviving it after HUD return");
+        // Native availability already withholds Reload for a full magazine and
+        // while reloading; the preference only decides the extra button.
+        check(NativeTouchControls.reloadButtonShown(c,true,false,true),"a possible reload shows the button by default");
+        check(!NativeTouchControls.reloadButtonShown(c,true,false,false),"Reload button OFF keeps the ammo bar as the reload route");
+        check(NativeTouchControls.reloadButtonShown(c,false,false,false),"without a native ammo bar the button stays the only route");
+        check(NativeTouchControls.reloadButtonShown(hud(70,3,0,actions),true,false,false),"unknown reload need keeps the button");
+        check(NativeTouchControls.reloadButtonShown(c,true,true,false),"the layout editor always shows Reload");
+        Context vehicle=new Context(70,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,actions,1,known,3,0,3,c.mapRect,c.ammoRect);
+        check(NativeTouchControls.reloadButtonShown(vehicle,true,false,false),"vehicles keep their Reload button");
     }
     private static void checkAutoRun() {
         Sink manualSink=new Sink();TouchInput manual=new TouchInput(manualSink);
@@ -283,16 +294,80 @@ public final class TouchInputTest {
         run.down(21,TouchInput.MOVEMENT,-1,50,150);run.move(21,50,20);run.up(21,50,20);
         check(!run.sprintLatched() && sink.last().y==0,"vehicle throttle never inherits on-foot auto-run");
     }
+    private static void checkVehicleSeat() {
+        check(ACTION_COUNT==31 && EXIT_VEHICLE==27 && SWITCH_SEATS==28 && DRIVER_FIRE_TURRET==29 && LOOK_BACK==30,
+                "protocol 4 appends the four shipped seat actions after Chat");
+        long seat=bit(FIRE)|bit(VEHICLE_BOOST)|bit(VEHICLE_BRAKE)|bit(VEHICLE_HORN)|bit(EXIT_VEHICLE)
+                |bit(SWITCH_SEATS)|bit(DRIVER_FIRE_TURRET)|bit(LOOK_BACK)|bit(MAP)|bit(INVENTORY);
+        Context driver=new Context(9,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,seat,1);
+        check(driver.gameplay() && driver.usable() && !driver.legacyFallback(),"a routed seat owns touch input natively");
+        Sink sink=new Sink(); TouchInput input=new TouchInput(sink);
+        input.configure(2,60,.22f,.5f,false); input.aimToggle(true); input.setContext(driver);
+        input.down(1,TouchInput.MOVEMENT,-1,0,0); input.move(1,0,-120);
+        check(sink.last().y>.99f,"the stick reaches the seat as throttle");
+        input.down(2,TouchInput.LOOK,-1,500,300); input.move(2,520,300);
+        check(sink.last().yaw>0,"a look drag turns the seat camera (camera steering)");
+        input.down(3,TouchInput.BUTTON,EXIT_VEHICLE,700,500);
+        check((sink.last().held&bit(EXIT_VEHICLE))!=0,"Exit is a native held button");
+        input.up(3,700,500);
+        input.down(4,TouchInput.BUTTON,DRIVER_FIRE_TURRET,700,500);
+        check((sink.last().held&bit(DRIVER_FIRE_TURRET))!=0,"a second finger holds Turret fire");
+        input.up(4,700,500);
+        check((sink.last().held&bit(DRIVER_FIRE_TURRET))==0,"lifting it stops Turret fire");
+        input.down(5,TouchInput.BUTTON,GRENADE,700,500);input.down(6,TouchInput.BUTTON,ACTION_COUNT,700,500);
+        check((sink.last().held&(bit(GRENADE)|bit(ACTION_COUNT)))==0,"on-foot and unknown actions stay out of a seat");
+        int packets=sink.packets.size(); input.pulse(SWITCH_SEATS);
+        check(sink.packets.size()==packets+2 && (sink.packets.get(packets).held&bit(SWITCH_SEATS))!=0
+                && (sink.last().held&bit(SWITCH_SEATS))==0,"Switch seat is one press/release pulse from the radial");
+        Context turret=new Context(10,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,bit(FIRE)|bit(AIM)|bit(EXIT_VEHICLE)|bit(SWITCH_SEATS),1);
+        Sink turretSink=new Sink(); TouchInput gunner=new TouchInput(turretSink);
+        gunner.configure(2,60,.22f,.5f,false); gunner.aimToggle(true); gunner.setContext(turret);
+        gunner.down(7,TouchInput.BUTTON,AIM,700,500);
+        check((turretSink.last().held&bit(AIM))!=0,"a turret's Aim is held alternate fire even with Aim toggle on");
+        gunner.up(7,700,500);
+        check((turretSink.last().held&bit(AIM))==0,"lifting releases the turret's alternate fire: never latched");
+        int[] seatRadial=NativeTouchControls.radialActions(driver),footRadial=NativeTouchControls.radialActions(play(9));
+        check(seatRadial.length==9 && seatRadial[0]==VEHICLE_HORN && seatRadial[1]==SWITCH_SEATS
+                && seatRadial[2]==LOOK_BACK && seatRadial[3]==DRIVER_FIRE_TURRET && seatRadial[8]==CHAT,
+                "the seat radial carries Horn and Switch seat, then Look back and Turret");
+        for(int action:footRadial) check(action<VEHICLE_BRAKE || action==LAST_WEAPON || action==CHAT,"the on-foot radial has no seat items");
+        check(NativeTouchControls.radialHold(LOOK_BACK) && NativeTouchControls.radialHold(DRIVER_FIRE_TURRET)
+                && !NativeTouchControls.radialHold(VEHICLE_HORN) && !NativeTouchControls.radialHold(SWITCH_SEATS),
+                "only Look back and Turret are held radial items");
+        check(java.util.Arrays.equals(TouchLayout.gameplayAnchor(VEHICLE_BOOST),TouchLayout.gameplayAnchor(GRENADE))
+                && java.util.Arrays.equals(TouchLayout.gameplayAnchor(VEHICLE_BRAKE),TouchLayout.gameplayAnchor(JUMP))
+                && java.util.Arrays.equals(TouchLayout.gameplayAnchor(EXIT_VEHICLE),TouchLayout.gameplayAnchor(USE)),
+                "the seat replaces the cluster: Boost, Brake and Exit take Grenade, Jump and Action places");
+        ArrayList<float[]> occupied=new ArrayList<>(),hud=new ArrayList<>();
+        TouchLayout.reserveGameplayHud(0,0,2424,1080,hud);
+        float[][] foot=TouchLayout.gameplayCluster(0,0,2424,1080,2.6f,1,false,bit(FIRE)|bit(GRENADE)|bit(JUMP),occupied,hud);
+        float[][] car=TouchLayout.gameplayCluster(0,0,2424,1080,2.6f,1,false,
+                new int[]{FIRE,AIM,VEHICLE_BOOST,VEHICLE_BRAKE},seat,occupied,hud);
+        check(foot!=null && car!=null && car[1]==null && java.util.Arrays.equals(car[0],foot[0])
+                && java.util.Arrays.equals(car[2],foot[2]) && java.util.Arrays.equals(car[3],foot[3]),
+                "the driver's Fire, Boost and Brake sit exactly where Fire, Grenade and Jump were; no Aim");
+        float[][] seatGroup=TouchLayout.gameplayCluster(0,0,2424,1080,2.6f,1,false,
+                new int[]{FIRE,AIM,VEHICLE_BOOST,VEHICLE_BRAKE,EXIT_VEHICLE},seat,occupied,hud);
+        check(seatGroup!=null && seatGroup.length==5 && seatGroup[4]!=null && seatGroup[1]==null,
+                "Exit joins the seat group in the Action place");
+        check(seatGroup[4][2]+4*2.6f<=seatGroup[0][0]
+                && Math.abs((seatGroup[4][1]+seatGroup[4][3])/2-(seatGroup[0][1]+seatGroup[0][3])/2)<.01f,
+                "Exit stays left of Fire on its row, never beside Boost or Brake");
+        for(int i:new int[]{2,3}) check(!TouchLayout.overlaps(seatGroup[4],seatGroup[i],4*2.6f),"Exit keeps a finger gap");
+        float[][] mirrored=TouchLayout.gameplayCluster(0,0,2424,1080,2.6f,1,true,
+                new int[]{FIRE,AIM,VEHICLE_BOOST,VEHICLE_BRAKE,EXIT_VEHICLE},seat,new ArrayList<>(),new ArrayList<>());
+        check(mirrored!=null && mirrored[4][0]>=mirrored[0][2]+4*2.6f,"left-handed seats mirror Exit to Fire's right");
+    }
     private static void checkChatEntry() {
         long oldActions=(1L<<26)-1;
-        long[] words={3,91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,oldActions,50,0,-1,-1,0,0,0,0,0,0,0,0,0};
+        long[] words={VERSION,91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,oldActions,50,0,-1,-1,0,0,0,0,0,0,0,0,0};
         Context old=Context.decode(words);
         check(old.usable() && !old.allows(CHAT) && NativeTouchControls.radialActionCount(old,false)==8,
-                "an unchanged v3 native snapshot retains the original eight-sector menu");
+                "a native snapshot without Say retains the original eight-sector menu");
         words[4]|=bit(CHAT);
         Context chat=Context.decode(words);
         check(chat.usable() && chat.allows(CHAT) && NativeTouchControls.radialActionCount(chat,false)==9,
-                "the additive Say bit opens a ninth sector without changing v3 packet length or HUD metadata");
+                "the additive Say bit opens a ninth sector without changing the packet length or HUD metadata");
         check(NativeTouchControls.radialActionCount(chat,true)==8,"legacy fallback cannot invent the original Say entry");
         check(NativeTouchControls.radialActionCount(Context.unknown(),false)==8,"unknown native availability never exposes Chat");
         Context physical=new Context(91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK|PHYSICAL_OWNS_INPUT,words[4],50);
@@ -379,11 +454,12 @@ public final class TouchInputTest {
                 "interface scale is bounded independently of render scale");
         check(TouchPreferences.uiPercent(Float.NaN)==125 && TouchPreferences.uiPercent(Float.POSITIVE_INFINITY)==125,
                 "invalid interface scale restores the 125-percent default");
-        int[] settings={5,1,0,100,Float.floatToIntBits(.42f),Float.floatToIntBits(1),
+        int[] settings={7,1,0,100,Float.floatToIntBits(.42f),Float.floatToIntBits(1),
             Float.floatToIntBits(.22f),Float.floatToIntBits(.55f),0,0,0,0,1,1,
             Float.floatToIntBits(1),Float.floatToIntBits(.4f),0,1,1,0,125,0,0};
-        settings=java.util.Arrays.copyOf(settings,37);
+        settings=java.util.Arrays.copyOf(settings,39);
         java.util.Arrays.fill(settings,24,35,-1);
+        settings[38]=1;
         check(TouchPreferences.validSettingsWire(settings),"native settings protocol admits bounded full vector");
         int[] defaults = settings.clone();
         settings[0]=1;
@@ -395,8 +471,12 @@ public final class TouchInputTest {
         settings[0]=4;
         check(!TouchPreferences.validSettingsWire(settings),"v4 cannot silently accept performance fields");
         settings[0]=5;
-        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,35)),"old field count cannot be accepted as v5");
-        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,38)),"extra fields cannot be accepted as v5");
+        check(!TouchPreferences.validSettingsWire(settings),"v5 cannot silently accept the frame pacing field");
+        settings[0]=6;
+        check(!TouchPreferences.validSettingsWire(settings),"v6 cannot silently accept the Reload button field");
+        settings[0]=7;
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,38)),"old field count cannot be accepted as v7");
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,40)),"extra fields cannot be accepted as v7");
         for(int fps:new int[]{0,30,60,90}) {
             settings[22]=fps;
             check(TouchPreferences.validSettingsWire(settings),"exact selectable FPS mode admitted: "+fps);
@@ -417,6 +497,8 @@ public final class TouchInputTest {
         settings[6]=Float.floatToIntBits(.22f);settings[11]=2;
         check(!TouchPreferences.validSettingsWire(settings),"native settings reject malformed microphone flag");
         settings[11]=0;settings[2]=16;
+        check(TouchPreferences.validSettingsWire(settings),"native video options page state admitted");
+        settings[2]=32;
         check(!TouchPreferences.validSettingsWire(settings),"native settings reject unknown commands");
         settings[2]=8;
         check(TouchPreferences.validSettingsWire(settings),"native debug preference explicitly edited flag admitted");
@@ -426,11 +508,17 @@ public final class TouchInputTest {
         check(preferences.uiPercent==125 && preferences.renderPercent==50 && !preferences.potatoGraphics,
                 "new graphics default is render50 and Potato OFF; UI remains125");
         for (int value : preferences.advancedGraphics) check(value==-1,"absent graphics preference preserves original runtime default");
-        check(preferences.performance[0] && preferences.performance[1],"absent performance choices default ON");
+        check(preferences.performance[0] && preferences.performance[1] && preferences.performance[2],
+                "absent performance and frame pacing choices default ON");
+        check(preferences.reloadButton && preferences.settingsWire(1)[37]==1,"absent Reload button choice defaults ON");
+        settings[19]=0;
+        check(TouchPreferences.validSettingsWire(settings),"toggle checks start from a valid vector");
         for(int invalid:new int[]{-1,2,Float.floatToIntBits(1)}) {
             settings[35]=invalid;check(!TouchPreferences.validSettingsWire(settings),"visibility optimization must be boolean");
             settings[35]=0;settings[36]=invalid;check(!TouchPreferences.validSettingsWire(settings),"audio optimization must be boolean");
-            settings[36]=0;
+            settings[36]=0;settings[37]=invalid;check(!TouchPreferences.validSettingsWire(settings),"frame pacing must be boolean");
+            settings[37]=0;settings[38]=invalid;check(!TouchPreferences.validSettingsWire(settings),"Reload button must be boolean");
+            settings[38]=1;
         }
         settings[23]=2;check(!TouchPreferences.validSettingsWire(settings),"Potato must be boolean");settings[23]=0;
         settings[24]=2;check(!TouchPreferences.validSettingsWire(settings),"graphics toggle must be boolean or original default");settings[24]=-1;
@@ -477,7 +565,7 @@ public final class TouchInputTest {
         check(preferences.uiPercent==130 && preferences.renderPercent==90,"saved UI percentage normalizes independently of rendering");
         preferences.uiPercent=125;preferences.save();preferences.reload();
         check(preferences.uiPercent==125 && "125".equals(store.getProperty("uiPercent")),"125-percent default survives save and reload exactly");
-        check(preferences.settingsWire(1).length==36 && preferences.settingsWire(1)[0]==5
+        check(preferences.settingsWire(1).length==38 && preferences.settingsWire(1)[0]==7
                 && preferences.settingsWire(1)[19]==125,"new FPS fields leave the UI and Debug IDs unchanged");
         int[] edited = defaults.clone();
         edited[1]=2; edited[2]=8; edited[3]=110;
@@ -485,20 +573,23 @@ public final class TouchInputTest {
         edited[6]=Float.floatToIntBits(.8f); edited[7]=Float.floatToIntBits(.8f);
         edited[8]=1; edited[9]=1; edited[10]=0; edited[12]=0; edited[13]=0;
         edited[14]=Float.floatToIntBits(3); edited[15]=Float.floatToIntBits(3);
-        edited[16]=1; edited[17]=0; edited[18]=0; edited[20]=190;
+        edited[16]=1; edited[17]=0; edited[18]=0; edited[20]=190; edited[38]=0;
         check(preferences.applySettingsWire(edited),"native control edits admitted before reset");
+        check(!preferences.reloadButton && preferences.settingsWire(2)[37]==0,"Reload button OFF is applied from the native page");
+        preferences.reload();
+        check(!preferences.reloadButton,"Reload button OFF persists through save and reload");
         preferences.position(FIRE,.15f,.28f);
         int[] editedAndReset=edited.clone();
         editedAndReset[1]=3; editedAndReset[2]=2|8;
         editedAndReset[3]=150; editedAndReset[11]=1; editedAndReset[19]=1; editedAndReset[20]=200;
         editedAndReset[21]=1;editedAndReset[22]=60;
         editedAndReset[23]=1;editedAndReset[24]=0;editedAndReset[34]=2;
-        editedAndReset[35]=0;editedAndReset[36]=1;
+        editedAndReset[35]=0;editedAndReset[36]=1;editedAndReset[37]=0;editedAndReset[38]=0;
         check(preferences.applySettingsWire(editedAndReset),"one poll admits both newer values and Reset");
         int[] expected=defaults.clone(); expected[3]=150; expected[11]=1; expected[19]=1; expected[20]=200;
         expected[21]=1;expected[22]=60;
         expected[23]=1;expected[24]=0;expected[34]=2;
-        expected[35]=0;expected[36]=1;
+        expected[35]=0;expected[36]=1;expected[37]=0;
         int[] applied=preferences.settingsWire(3);
         for(int i=3;i<expected.length;++i)
             check(applied[i-1]==expected[i],"combined Reset restores control defaults and retains non-touch choices field "+(i-3));
@@ -509,7 +600,8 @@ public final class TouchInputTest {
                 && preferences.showFPS && preferences.fpsLimit==60 && preferences.potatoGraphics
                 && preferences.advancedGraphics[0]==0 && preferences.advancedGraphics[10]==2,
                 "Reset persists global UI, graphics, microphone, explicit Debug and FPS while clearing combat preferences");
-        check(!preferences.performance[0] && preferences.performance[1],"performance OFF/ON choices persist across touch reset and reload");
+        check(!preferences.performance[0] && preferences.performance[1] && !preferences.performance[2],
+                "performance and frame pacing OFF/ON choices persist across touch reset and reload");
         int[] invalidReset=editedAndReset.clone(); invalidReset[6]=Float.floatToIntBits(Float.NaN);
         preferences.position(FIRE,.2f,.3f);
         check(!preferences.applySettingsWire(invalidReset),"malformed combined packet cannot reset preferences");
@@ -522,6 +614,39 @@ public final class TouchInputTest {
         check(!Context.unknown().legacyFallback(), "unknown context hides fallback");
         check(!new Context(1,LOADING,0,0,1).legacyFallback(), "loading hides fallback");
         check(!new Context(1,CINEMATIC,0,0,1).legacyFallback(), "cinematic without skip hides fallback");
+        Context skippable=new Context(4,CINEMATIC,CAN_SKIP,bit(SKIP)|bit(PAUSE),1);
+        Context pauseOnly=new Context(4,CINEMATIC,CAN_SKIP,bit(PAUSE),1);
+        check(skippable.usable() && NativeTouchControls.cinematicBackAction(skippable,true)==SKIP,"Back skips a skippable cinematic");
+        check(NativeTouchControls.cinematicBackAction(pauseOnly,true)==PAUSE,"Back pauses an unskippable cinematic");
+        check(NativeTouchControls.cinematicBackAction(new Context(4,CINEMATIC,CAN_SKIP,0,1),true)==-1
+                && NativeTouchControls.cinematicBackAction(new Context(4,CINEMATIC,0,bit(SKIP),1),true)==-1
+                && NativeTouchControls.cinematicBackAction(skippable,false)==-1,
+                "an unrouted or ineligible cinematic leaves Back to the game");
+        check(NativeTouchControls.cinematicBackAction(play(4),true)==-1,"gameplay Back is not a cinematic action");
+        Sink cinematicSink=new Sink(); TouchInput cinematicInput=new TouchInput(cinematicSink);
+        cinematicInput.configure(2,60,.22f,.5f,false); cinematicInput.setContext(skippable);
+        cinematicInput.down(5,TouchInput.BUTTON,SKIP,10,10);
+        check((cinematicSink.last().held&bit(SKIP))!=0,"held Skip reaches the native route");
+        cinematicInput.down(6,TouchInput.MOVEMENT,-1,0,0); cinematicInput.move(6,120,-120);
+        cinematicInput.down(7,TouchInput.LOOK,-1,0,0); cinematicInput.move(7,140,40);
+        check(cinematicSink.last().x==0 && cinematicSink.last().y==0 && cinematicSink.last().yaw==0
+                && cinematicSink.last().pitch==0,"a cinematic never produces movement or look");
+        cinematicInput.up(5,10,10);
+        check((cinematicSink.last().held&bit(SKIP))==0,"lifting the finger releases Skip");
+        checkVehicleSeat();
+        check(!NativeTouchControls.legacyUse(play(4),false,USE),"native Use never needs the virtual controller");
+        check(NativeTouchControls.legacyUse(play(4),true,USE),"the legacy fallback keeps virtual key X");
+        check(!NativeTouchControls.legacyUse(play(4),true,FIRE)
+                && !NativeTouchControls.legacyUse(new Context(4,MENU,UI_NAVIGATION,(1L<<26)-1,1),true,USE),
+                "only gameplay Use takes the fallback key");
+        Sink useSink=new Sink(); TouchInput useInput=new TouchInput(useSink);
+        useInput.configure(2,60,.22f,.5f,false); useInput.setContext(play(5));
+        useInput.down(8,TouchInput.BUTTON,USE,10,10);
+        check((useSink.last().held&bit(USE))!=0,"a held Action finger holds the native Use bit (hold to equip)");
+        useInput.move(8,40,10);
+        check((useSink.last().held&bit(USE))!=0 && useSink.last().yaw==0,"sliding on Action keeps holding without camera look");
+        useInput.up(8,40,10);
+        check((useSink.last().held&bit(USE))==0,"lifting the finger releases Use (tap = pickup)");
         check(new Context(1,FRONTEND,0,0,1).legacyFallback(), "press start keeps stock confirm");
         check(new Context(1,MENU,0,0,1).legacyFallback(), "native canvas menu keeps fallback");
         check(new Context(1,GAMEPLAY,0,0,1).legacyFallback(), "unsupported gameplay keeps stock input");
@@ -694,6 +819,6 @@ public final class TouchInputTest {
         TouchLayout.reserveGameplayHud(22,10,2446,1090,offsetHud);
         for(int i=0;i<hud.size();++i) for(int axis=0;axis<4;++axis)
             near(offsetHud.get(i)[axis],hud.get(i)[axis]+(axis%2==0?22:10),"HUD reservation follows Surface origin independently of safe insets");
-        System.out.println("TouchInputTest: HUD gestures, held action margins, pointer lifecycle, tutorials, settings v5, render50, graphics/performance persistence and reset passed");
+        System.out.println("TouchInputTest: HUD gestures, held action margins, pointer lifecycle, tutorials, settings v7, render50, graphics/performance/pacing/Reload button persistence and reset passed");
     }
 }

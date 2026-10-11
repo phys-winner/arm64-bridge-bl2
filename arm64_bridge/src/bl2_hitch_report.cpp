@@ -1,4 +1,5 @@
 #include "bl2_hitch_report.h"
+#include "bl2_frame_pacer.h"
 
 #include <android/log.h>
 #include <sys/system_properties.h>
@@ -112,14 +113,19 @@ void Bl2HitchFrame() {
         sum_draws += draws;
         if (!window_start) window_start = wall;
         if (wall - window_start >= 10'000'000'000ull && frames) {
+            // pace=0 while presents are unpaced; late = frames shown after
+            // their paced refresh.
+            const Bl2FramePacerStats pace = Bl2FramePacerTakeStats();
             __android_log_print(ANDROID_LOG_INFO, kTag,
                 "summary frames=%u avg=%.2fms worst=%.1fms hitches=%u jit_blocks=%llu "
-                "pipelines=%llu/%.1fms textures=%.1fMiB buffers=%.1fMiB draws/frame=%.0f",
+                "pipelines=%llu/%.1fms textures=%.1fMiB buffers=%.1fMiB draws/frame=%.0f "
+                "pace=%.1fms depth=%.1fms late=%u",
                 frames, sum_ms / frames, worst_ms, hitches,
                 static_cast<unsigned long long>(sum_jit),
                 static_cast<unsigned long long>(sum_pipelines), sum_pipeline_ns / 1e6,
                 sum_texture_bytes / 1048576.0, sum_buffer_bytes / 1048576.0,
-                static_cast<double>(sum_draws) / frames);
+                static_cast<double>(sum_draws) / frames, pace.interval_ns / 1e6,
+                pace.depth_ns / 1e6, pace.late);
             window_start = wall;
             frames = hitches = 0;
             worst_ms = sum_ms = 0;

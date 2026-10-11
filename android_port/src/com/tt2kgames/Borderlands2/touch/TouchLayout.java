@@ -16,9 +16,11 @@ public final class TouchLayout {
         switch (action) {
             case FIRE: return new float[]{.858f,.784f};
             case AIM: return new float[]{.957f,.934f};
-            case GRENADE: return new float[]{.957f,.784f};
-            case JUMP: return new float[]{.858f,.944f};
-            case USE: return new float[]{.75f,.784f};
+            // A vehicle seat replaces the cluster: Boost, Brake and Exit take
+            // the Grenade, Jump and Use places.
+            case GRENADE: case VEHICLE_BOOST: return new float[]{.957f,.784f};
+            case JUMP: case VEHICLE_BRAKE: return new float[]{.858f,.944f};
+            case USE: case EXIT_VEHICLE: return new float[]{.75f,.784f};
             case RELOAD: return new float[]{.75f,.944f};
             case PAUSE: return new float[]{.035f,.055f};
             default: return new float[]{.13f,.32f};
@@ -46,18 +48,29 @@ public final class TouchLayout {
     /** Move the four default FPS controls together so HUD clearance keeps their relationships. */
     public static float[][] gameplayCluster(float left,float top,float right,float bottom,float density,float scale,
             boolean leftHanded,long actions,List<float[]> occupied,List<float[]> reserved) {
+        return gameplayCluster(left,top,right,bottom,density,scale,leftHanded,new int[]{FIRE,AIM,GRENADE,JUMP},
+                actions,occupied,reserved);
+    }
+    /**
+     * The same places for other ids: primary, Aim, Grenade and Jump slots in that
+     * order, and optionally a fifth in the Use place left of the primary, so a
+     * seat's Exit keeps its distance from Fire whenever HUD clearance moves the group.
+     */
+    public static float[][] gameplayCluster(float left,float top,float right,float bottom,float density,float scale,
+            boolean leftHanded,int[] ids,long actions,List<float[]> occupied,List<float[]> reserved) {
         if (!Float.isFinite(density) || density <= 0 || !Float.isFinite(scale) || scale <= 0
                 || !Float.isFinite(left) || !Float.isFinite(top) || !Float.isFinite(right) || !Float.isFinite(bottom)
-                || right <= left || bottom <= top) return null;
-        int[] ids={FIRE,AIM,GRENADE,JUMP};float[][] base=new float[4][];
+                || right <= left || bottom <= top || ids == null || (ids.length != 4 && ids.length != 5)) return null;
+        float[][] base=new float[ids.length][];
         // Leave subpixel room so common float translations preserve the minimum finger gap.
-        float primary=gameplaySize(FIRE,bottom-top,density,scale),secondary=gameplaySize(AIM,bottom-top,density,scale),gap=4*density+.05f;
+        float primary=gameplaySize(ids[0],bottom-top,density,scale),secondary=gameplaySize(AIM,bottom-top,density,scale),gap=4*density+.05f;
         float xRight=left+(right-left)*.957f,xLeft=Math.min(left+(right-left)*.858f,xRight-(primary+secondary)/2-gap);
         float aimY=top+(bottom-top)*.934f,jumpY=top+(bottom-top)*.944f;
         float upperY=Math.min(top+(bottom-top)*.784f,Math.min(aimY-secondary-gap,jumpY-(primary+secondary)/2-gap));
         float minX=Float.POSITIVE_INFINITY,minY=Float.POSITIVE_INFINITY,maxX=Float.NEGATIVE_INFINITY,maxY=Float.NEGATIVE_INFINITY;
-        for (int i=0;i<4;++i) if ((actions&bit(ids[i]))!=0) {
-            float size=i==0?primary:secondary,cx=i==0||i==3?xLeft:xRight,cy=i==1?aimY:i==3?jumpY:upperY;
+        float useX=Math.min(xLeft-(right-left)*(.858f-.75f),xLeft-(primary+secondary)/2-gap);
+        for (int i=0;i<ids.length;++i) if (ids[i]>=0 && (actions&bit(ids[i]))!=0) {
+            float size=i==0?primary:secondary,cx=i==4?useX:i==0||i==3?xLeft:xRight,cy=i==1?aimY:i==3?jumpY:upperY;
             if (leftHanded) cx=left+right-cx;
             base[i]=new float[]{cx-size/2,cy-size/2,cx+size/2,cy+size/2};
             minX=Math.min(minX,base[i][0]);maxX=Math.max(maxX,base[i][2]);minY=Math.min(minY,base[i][1]);maxY=Math.max(maxY,base[i][3]);

@@ -6,6 +6,7 @@
 #include "perf_probe.h"
 #include "bl2_native_resolution.h"
 #include "bl2_hitch_report.h"
+#include "bl2_frame_pacer.h"
 
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
@@ -545,6 +546,9 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
         AuditBl2NativeResolutionPresent(host);
         // Bl2FogAuditPresent();  // Pixel readback diagnosis paused.
         Bl2DirectoryCacheReportStartup();
+#if !defined(BL2_NATIVE_ARM32)
+        Bl2FramePacerBeforeSwap(display, surface);
+#endif
         EGLBoolean result;
         {
             HornPerfScope perf(HornPerfCategory::Swap);
@@ -558,8 +562,11 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
             extern void RefreshSceneAuditMode();
             RefreshSceneAuditMode();
 #if !defined(BL2_NATIVE_ARM32)
-            // Renderer idle slice for learned JIT warmup, only after a frame
-            // that left the thread mostly idle (frame-limited, not render-bound).
+            const uint64_t next_start = Bl2FramePacerAfterSwap();
+            // Renderer idle slice for learned JIT warmup: the paced wait before
+            // the next frame except its last millisecond, else only after a
+            // frame that left the thread mostly idle (frame-limited, not
+            // render-bound).
             static thread_local uint64_t last_wall = 0, last_cpu = 0;
             const auto clock_ns = [](clockid_t clock) {
                 timespec value{};
@@ -569,8 +576,14 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
             };
             const uint64_t wall = clock_ns(CLOCK_MONOTONIC);
             const uint64_t cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
-            if (last_wall && wall > last_wall && (cpu - last_cpu) * 10 < (wall - last_wall) * 7)
+            if (next_start) {
+                if (next_start > wall + 2000000)
+                    host.WarmLearnedBlocksInCallback(jit, next_start - wall - 1000000);
+            } else if (last_wall && wall > last_wall &&
+                       (cpu - last_cpu) * 10 < (wall - last_wall) * 7) {
                 host.WarmLearnedBlocksInCallback(jit, 1000000);
+            }
+            Bl2FramePacerWait(next_start);
             last_wall = clock_ns(CLOCK_MONOTONIC);
             last_cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
             Bl2HitchFrame();
@@ -599,6 +612,9 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
     });
     manager.RegisterThunkIfAbsent("eglDestroySurface", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {
         const uint32_t surface_handle = jit.Regs()[1];
+#if !defined(BL2_NATIVE_ARM32)
+        Bl2FramePacerSurfaceDestroyed(surfaces.Get(surface_handle));
+#endif
         const EGLBoolean ok = eglDestroySurface(displays.Get(jit.Regs()[0]),
                                                 surfaces.Get(surface_handle));
         if (ok) {

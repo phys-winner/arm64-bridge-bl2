@@ -16,8 +16,9 @@ import java.util.Properties;
 public final class TouchPreferences {
     private static final String TAG = "BL2TouchPreferences";
     private static final int MAX_SETTINGS_BYTES = 64 * 1024;
-    static final int SETTINGS_VERSION = 5, SETTINGS_FIELDS = 34;
-    private static final String[] PERFORMANCE_KEYS = {"fasterVisibility", "fasterAudioLimiter"};
+    static final int SETTINGS_VERSION = 7, SETTINGS_FIELDS = 36;
+    /** Settings 32 onward, all ON by default. */
+    private static final String[] PERFORMANCE_KEYS = {"fasterVisibility", "fasterAudioLimiter", "framePacing"};
     private static final String[] GRAPHICS_KEYS = {"bloom", "motionBlur", "lensFlares", "dynamicShadows",
             "lightEnvironmentShadows", "staticDecals", "unbatchedDecals", "lightShafts", "distortion",
             "radialBlur", "anisotropy"};
@@ -38,6 +39,8 @@ public final class TouchPreferences {
     public volatile boolean microphoneEnabled;
     public boolean leftHanded, invertY, autoSprint;
     public boolean gyroEnabled, gyroAdsOnly, gyroInvertY, haptics, aimToggle;
+    /** Show Reload while the native route reports that a reload is possible. */
+    public boolean reloadButton;
     public boolean debugMenuVisible;
     public boolean mapTapHintSeen, weaponGestureHintSeen;
     public boolean gameMoreHintSeen, menuMoreHintSeen, debugMoreHintSeen, autoRunHintSeen;
@@ -104,6 +107,7 @@ public final class TouchPreferences {
         gyroInvertY = Boolean.parseBoolean(store.getProperty("gyroInvertY", "false"));
         haptics = Boolean.parseBoolean(store.getProperty("haptics", "true"));
         aimToggle = Boolean.parseBoolean(store.getProperty("aimToggle", "true"));
+        reloadButton = Boolean.parseBoolean(store.getProperty("reloadButton", "true"));
         debugMenuStored = store.containsKey("debugMenuVisible");
         debugMenuVisible = Boolean.parseBoolean(store.getProperty("debugMenuVisible", "false"));
         mapTapHintSeen = Boolean.parseBoolean(store.getProperty("mapTapHintSeen", "false"));
@@ -148,6 +152,7 @@ public final class TouchPreferences {
         store.setProperty("gyroInvertY", Boolean.toString(gyroInvertY));
         store.setProperty("haptics", Boolean.toString(haptics));
         store.setProperty("aimToggle", Boolean.toString(aimToggle));
+        store.setProperty("reloadButton", Boolean.toString(reloadButton));
         if (debugMenuStored) store.setProperty("debugMenuVisible", Boolean.toString(debugMenuVisible));
         store.setProperty("gyroSensitivity", Float.toString(gyroSensitivity));
         store.setProperty("gyroDeadzone", Float.toString(gyroDeadzone));
@@ -211,7 +216,7 @@ public final class TouchPreferences {
             else store.setProperty(GRAPHICS_KEYS[i], Integer.toString(advancedGraphics[i]));
         }
     }
-    /** Shared with bl2_touch_settings: version 5, acknowledged revision, 34 fixed fields. */
+    /** Shared with bl2_touch_settings: version 7, acknowledged revision, 36 fixed fields. */
     public int[] settingsWire(int revision) {
         int[] controls = new int[]{SETTINGS_VERSION, revision, renderPercent, Float.floatToIntBits(opacity), Float.floatToIntBits(scale),
             Float.floatToIntBits(look), Float.floatToIntBits(ads), leftHanded?1:0, invertY?1:0,
@@ -222,6 +227,7 @@ public final class TouchPreferences {
         values[22] = potatoGraphics ? 1 : 0;
         System.arraycopy(advancedGraphics, 0, values, 23, advancedGraphics.length);
         for (int i = 0; i < performance.length; ++i) values[34+i] = performance[i] ? 1 : 0;
+        values[37] = reloadButton ? 1 : 0;
         return values;
     }
     private static boolean wireFloat(int bits, float low, float high) {
@@ -229,7 +235,8 @@ public final class TouchPreferences {
         return Float.isFinite(value) && value >= low && value <= high;
     }
     public static boolean validSettingsWire(int[] words) {
-        if (words == null || words.length != SETTINGS_FIELDS+3 || words[0] != SETTINGS_VERSION || words[1] < 1 || (words[2]&~15) != 0)
+        // Command bits 1-8, plus 16 while the native video options page is shown.
+        if (words == null || words.length != SETTINGS_FIELDS+3 || words[0] != SETTINGS_VERSION || words[1] < 1 || (words[2]&~31) != 0)
             return false;
         int base = 3;
         if (words[base] < 50 || words[base] > 150 || words[base]%10 != 0
@@ -260,6 +267,7 @@ public final class TouchPreferences {
         potatoGraphics=words[23]!=0;
         System.arraycopy(words, 24, advancedGraphics, 0, advancedGraphics.length);
         for (int i = 0; i < performance.length; ++i) performance[i] = words[35+i] != 0;
+        reloadButton = words[38] != 0;
         debugMenuStored |= (words[2]&8)!=0;
         // Reset wins over edits returned in the same poll, preserving non-touch choices.
         if ((words[2]&2)!=0) resetTouch(); else save();
