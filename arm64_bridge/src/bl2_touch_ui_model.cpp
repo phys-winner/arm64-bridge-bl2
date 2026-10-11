@@ -398,9 +398,21 @@ bool Bl2TouchReviewedUiMovie(std::string_view name) {
         "ConfirmCharacterLobbyGFxMovie","CustomizationGFxMovie","GearboxAccountGFxMovie",
         "LobbyGFxMovie","MatchmakingLobbyGFxMovie","PlayerDetailsGFxMovie","TextChatGFxMovie",
         "WillowGFxColiseumOverlayMovie","HashDisplayGFxMovie","WillowGFxEditDialog",
-        "WillowGFxLobbyLoadCharacter","WillowGFxTrainingDialogBox","WillowGFxTrainingDialogBox_NoPause"
+        "WillowGFxLobbyLoadCharacter","WillowGFxTrainingDialogBox","WillowGFxTrainingDialogBox_NoPause",
+        // GearboxFramework: Up/Down scroll the text (NavigateUp/Down), Enter/A
+        // accepts, Escape/B declines, and both are mouse-clickable CLIK Buttons.
+        "GearboxEULAGFxMovie"
     };
     return std::find(std::begin(screens),std::end(screens),name) != std::end(screens);
+}
+bool Bl2TouchSwipeTabsMovie(std::string_view name) {
+    // StatusMenuExGFxMovie.HandleInputKey: LB/RB -> GotoPrevTab/GotoNextTab.
+    // TwoPanelInterfaceGFxObject.NormalInputKey (Bank, Stash): SwitchToLeft/RightPanel.
+    // VendingMachineExGFxMovie.MainInputKey: buyback, storage and item of the day.
+    // Character selection binds LB/RB to stand-in debug offsets, Frontend to
+    // party and login UI: never a swipe target.
+    return name == "StatusMenuExGFxMovie" || name == "TwoPanelInterfaceGFxMovie" ||
+        name == "BankGFxMovie" || name == "StashGFxMovie" || name == "VendingMachineExGFxMovie";
 }
 bool Bl2TouchNativeDialogMovie(std::string_view name) {
     return name == "WillowGFxDialogBox"

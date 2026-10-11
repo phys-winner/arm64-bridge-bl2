@@ -7,9 +7,9 @@
 
 namespace bl2::touch {
 
-constexpr std::uint64_t kProtocolVersion = 4;
-constexpr std::size_t kSnapshotWords = 18;
-constexpr std::size_t kActionCount = 31;
+constexpr std::uint64_t kProtocolVersion = 6;
+constexpr std::size_t kSnapshotWords = 25;
+constexpr std::size_t kActionCount = 43;
 constexpr std::size_t kTransitionsPerAction = 16;
 constexpr std::size_t kMaxPointers = 10;
 constexpr std::size_t kPointerQueueCapacity = 64;
@@ -34,7 +34,13 @@ enum class Action : std::uint8_t {
     VehicleBrake, VehicleBoost, VehicleHorn, UiUp, UiDown, UiLeft, UiRight,
     LastWeapon, Chat,
     // Protocol 4: the remaining shipped vehicle seat actions.
-    ExitVehicle, SwitchSeats, DriverFireTurret, LookBack
+    ExitVehicle, SwitchSeats, DriverFireTurret, LookBack,
+    // Protocol 5: InputSet_QuickSelect weapon slots, the FFYL give-up and the
+    // InputSet_MenuActions status tabs.
+    Slot1, Slot2, Slot3, Slot4, Suicide, Skills, Logs, Challenges,
+    // Protocol 6: the menu X/Y keys (More panel Action/Other) and LB/RB (the
+    // TalkBack tab buttons), sent to the focused movie without a virtual pad.
+    UiAction, UiOther, UiPreviousTab, UiNextTab
 };
 constexpr std::uint64_t actionBit(Action action) {
     return std::uint64_t{1} << static_cast<unsigned>(action);
@@ -49,9 +55,14 @@ enum ResetReason : std::uint32_t {
 enum HudRegion : std::uint32_t {
     HudMinimap = 1u << 0, HudAmmo = 1u << 1,
     HudObjectives = 1u << 2, HudObjectivesEmpty = 1u << 3,
-    HudUse = 1u << 4
+    HudUse = 1u << 4, HudSkill = 1u << 5, HudExperience = 1u << 6, HudChallenge = 1u << 7
 };
 struct SurfaceRect { float left = 0, top = 0, right = 0, bottom = 0; };
+// Context::weaponSlots: bits 0-3 mark slots 1-4 holding a readied weapon,
+// bits 8-10 the equipped weapon's slot (0 none), bit 15 a known word, and
+// bits 16-31 one 4-bit code per slot: EWeaponType + 1 (WT_Pistol 1 ..
+// WT_RocketLauncher 6), 0 when unknown. Anything else publishes as 0.
+constexpr std::uint32_t kWeaponSlotsKnown = 1u << 15;
 
 struct Context {
     Mode mode = Mode::Unknown;
@@ -68,6 +79,9 @@ struct Context {
     // Objective flags are mutually exclusive. Empty means a successful native
     // visibility query, not a failed projection or a missing movie.
     SurfaceRect mapRect{}, ammoRect{}, objectiveRect{}, useRect{};
+    // Protocol 5 tap targets: action skill icon, XP bar, challenge notice.
+    SurfaceRect skillRect{}, experienceRect{}, challengeRect{};
+    std::uint32_t weaponSlots = 0;
 };
 
 struct Snapshot {

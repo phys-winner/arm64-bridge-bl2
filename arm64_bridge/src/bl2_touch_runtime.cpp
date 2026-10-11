@@ -298,7 +298,10 @@ Observation observe(Reader& read, std::uint32_t viewport) {
             nativeMenuOpen = nativeUi.nativeMenuOpen;
         }
     }
-    if (nativeMenuOpen || (out.movie && out.movieClass != "WillowHUDGFxMovie")) out.mode = bl2::touch::Mode::Menu;
+    if (out.movie && out.movieClass != "WillowHUDGFxMovie") {
+        out.mode = bl2::touch::Bl2TouchFocusedMovieMode(out.movieClass);
+        if (out.mode == bl2::touch::Mode::Loading) out.reason = "blocking-online-message";
+    } else if (nativeMenuOpen) out.mode = bl2::touch::Mode::Menu;
     else {
         out.mode = bl2::touch::Bl2TouchContextMode(out.contexts);
         if (out.mode == bl2::touch::Mode::Unknown)
@@ -505,9 +508,17 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         }
         if (gameplayActions && gameplaySink->ready()) {
             context.capabilities = bl2::touch::GameplayInput | (gameplayAxes ? bl2::touch::RelativeLook : 0u);
+            // Protocol 5: weapon slot cells over the ammo strip, the FFYL
+            // give-up and the status tabs opened by HUD taps.
             context.availableActions = mask & (((std::uint64_t{1} << 15) - 1) |
                 bl2::touch::actionBit(bl2::touch::Action::LastWeapon) |
-                bl2::touch::actionBit(bl2::touch::Action::Chat));
+                bl2::touch::actionBit(bl2::touch::Action::Chat) |
+                bl2::touch::actionBit(bl2::touch::Action::Slot1) | bl2::touch::actionBit(bl2::touch::Action::Slot2) |
+                bl2::touch::actionBit(bl2::touch::Action::Slot3) | bl2::touch::actionBit(bl2::touch::Action::Slot4) |
+                bl2::touch::actionBit(bl2::touch::Action::Suicide) |
+                bl2::touch::actionBit(bl2::touch::Action::Skills) |
+                bl2::touch::actionBit(bl2::touch::Action::Logs) |
+                bl2::touch::actionBit(bl2::touch::Action::Challenges));
             gameplaySink->telemetry(context);
         }
         if (vehicleActions && gameplaySink->ready()) {

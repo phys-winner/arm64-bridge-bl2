@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace bl2::touch {
 namespace {
@@ -34,6 +35,17 @@ std::uint64_t floatPair(float low, float high) {
     std::memcpy(&b, &high, sizeof(b));
     return a | (std::uint64_t{b} << 32);
 }
+// The equipped slot and every type code must belong to an occupied slot.
+std::uint32_t validWeaponSlots(std::uint32_t word) {
+    if ((word & kWeaponSlotsKnown) == 0 || (word & 0x78F0u) != 0) return 0;
+    const auto occupied = word & 15u, equipped = (word >> 8) & 7u;
+    if (equipped > 4 || (equipped && (occupied & (1u << (equipped - 1))) == 0)) return 0;
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        const auto type = (word >> (16 + 4 * slot)) & 15u;
+        if (type > 6 || (type && (occupied & (1u << slot)) == 0)) return 0;
+    }
+    return word;
+}
 } // namespace
 
 std::array<std::uint64_t, kSnapshotWords> Snapshot::wire() const {
@@ -48,7 +60,14 @@ std::array<std::uint64_t, kSnapshotWords> Snapshot::wire() const {
             floatPair(context.objectiveRect.left, context.objectiveRect.top),
             floatPair(context.objectiveRect.right, context.objectiveRect.bottom),
             floatPair(context.useRect.left, context.useRect.top),
-            floatPair(context.useRect.right, context.useRect.bottom)};
+            floatPair(context.useRect.right, context.useRect.bottom),
+            floatPair(context.skillRect.left, context.skillRect.top),
+            floatPair(context.skillRect.right, context.skillRect.bottom),
+            floatPair(context.experienceRect.left, context.experienceRect.top),
+            floatPair(context.experienceRect.right, context.experienceRect.bottom),
+            floatPair(context.challengeRect.left, context.challengeRect.top),
+            floatPair(context.challengeRect.right, context.challengeRect.bottom),
+            context.weaponSlots};
 }
 
 std::uint64_t Mailbox::publishContext(Context context, bool forceNewScene) {
@@ -61,7 +80,8 @@ std::uint64_t Mailbox::publishContext(Context context, bool forceNewScene) {
     context.knownActions &= kKnownActions;
     if (context.weaponCount < -1 || context.weaponCount > 64) context.weaponCount = -1;
     if (context.grenadeCount < -1 || context.grenadeCount > 65535) context.grenadeCount = -1;
-    context.hudValidMask &= HudMinimap | HudAmmo | HudObjectives | HudObjectivesEmpty | HudUse;
+    context.hudValidMask &= HudMinimap | HudAmmo | HudObjectives | HudObjectivesEmpty | HudUse |
+        HudSkill | HudExperience | HudChallenge;
     if ((context.hudValidMask & HudMinimap) == 0 || !validSurfaceRect(context.mapRect)) {
         context.hudValidMask &= ~HudMinimap;
         context.mapRect = {};
@@ -80,6 +100,14 @@ std::uint64_t Mailbox::publishContext(Context context, bool forceNewScene) {
         context.hudValidMask &= ~HudUse;
         context.useRect = {};
     }
+    for (const auto& [region, rect] : {std::pair{HudSkill, &context.skillRect},
+             std::pair{HudExperience, &context.experienceRect}, std::pair{HudChallenge, &context.challengeRect}}) {
+        if ((context.hudValidMask & region) == 0 || !validSurfaceRect(*rect)) {
+            context.hudValidMask &= ~region;
+            *rect = {};
+        }
+    }
+    context.weaponSlots = validWeaponSlots(context.weaponSlots);
     if (!sameSceneContext(context, context_) || forceNewScene) {
         context_ = context;
         invalidateLocked(ContextChanged);

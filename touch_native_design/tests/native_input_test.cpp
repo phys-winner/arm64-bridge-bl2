@@ -34,7 +34,7 @@ static bool send(Mailbox& box, std::uint64_t epoch, std::uint64_t held,
 static void testUnknownAndWire() {
     Mailbox box;
     const auto wire = box.snapshot().wire();
-    CHECK(wire.size() == 18 && wire[0] == 4 && wire[0] == kProtocolVersion && wire[1] != 0 && wire[2] == 0 && wire[3] == 0);
+    CHECK(wire.size() == 25 && wire[0] == 6 && wire[0] == kProtocolVersion && wire[1] != 0 && wire[2] == 0 && wire[3] == 0);
     CHECK(wire[4] == 0 && wire[5] == 0 && wire[6] == 0);
     CHECK(wire[7] == std::numeric_limits<std::uint64_t>::max() && wire[8] == wire[7]);
     for (std::size_t i = 9; i != wire.size(); ++i) CHECK(wire[i] == 0);
@@ -138,11 +138,11 @@ static void testOriginalChatEntryAndRevocation() {
     auto context = gameplay();
     constexpr auto chat = actionBit(Action::Chat);
     constexpr auto fire = actionBit(Action::Fire);
-    CHECK(chat == (std::uint64_t{1} << 26) && kActionCount == 31);
+    CHECK(chat == (std::uint64_t{1} << 26) && kActionCount == 43);
     CHECK(std::strcmp(shippedActionName(Action::Chat), "Say") == 0);
     context.availableActions &= ~chat; // A producer without Chat keeps the original 26 actions.
     const auto epoch = ready(box, context);
-    CHECK(box.snapshot().wire().size() == 18 && box.snapshot().wire()[0] == kProtocolVersion);
+    CHECK(box.snapshot().wire().size() == 25 && box.snapshot().wire()[0] == kProtocolVersion);
     CHECK(box.submit(epoch, .25f, .75f, 0, 0, fire | chat, 101));
     const auto old = box.consumeFrame(2, 101);
     CHECK(old.actionEdgeCount == 1 && old.actionEdges[0].action == Action::Fire && old.heldActions == fire);
@@ -354,7 +354,7 @@ static void testVehicleSeatActionsAndAxes() {
     constexpr auto turret = actionBit(Action::DriverFireTurret), back = actionBit(Action::LookBack);
     constexpr auto seat = actionBit(Action::Fire) | actionBit(Action::VehicleBoost) | actionBit(Action::VehicleBrake) |
         actionBit(Action::VehicleHorn) | exit | seats | turret | back;
-    CHECK(kActionCount == 31 && back == (std::uint64_t{1} << 30) && (kKnownActions & seat) == seat);
+    CHECK(kActionCount == 43 && back == (std::uint64_t{1} << 30) && (kKnownActions & seat) == seat);
     CHECK(std::strcmp(shippedActionName(Action::ExitVehicle), "ExitVehicle") == 0);
     CHECK(std::strcmp(shippedActionName(Action::SwitchSeats), "SwitchSeats") == 0);
     CHECK(std::strcmp(shippedActionName(Action::DriverFireTurret), "DriverFireTurret") == 0);
@@ -659,7 +659,7 @@ static void testUseHudRegionIsIndependent() {
     context.useRect={.38f,.49f,.65f,.55f};
     const auto epoch=ready(box,context);
     const auto words=box.snapshot().wire();
-    CHECK(words.size()==18 && words[0]==kProtocolVersion && words[9]==(HudMinimap|HudUse));
+    CHECK(words.size()==25 && words[0]==kProtocolVersion && words[9]==(HudMinimap|HudUse));
     CHECK(near(unpackFloat(words[16],false),.38f) && near(unpackFloat(words[16],true),.49f));
     CHECK(near(unpackFloat(words[17],false),.65f) && near(unpackFloat(words[17],true),.55f));
     CHECK(send(box,epoch,actionBit(Action::Fire)|actionBit(Action::Use)));
@@ -674,6 +674,82 @@ static void testUseHudRegionIsIndependent() {
     const auto revoked=box.consumeFrame(3,102);
     CHECK(revoked.actionEdgeCount==1 && revoked.actionEdges[0].action==Action::Use && !revoked.actionEdges[0].down);
     CHECK(revoked.heldActions==actionBit(Action::Fire));
+}
+
+// Protocol 5: skill icon, XP bar and challenge notice rectangles, the weapon
+// slot word, and the slot/give-up/status-tab actions.
+static void testStageFiveTapTargetsAndSlots() {
+    CHECK(kProtocolVersion >= 5 && kSnapshotWords == 25 && kActionCount >= 39);
+    CHECK(static_cast<unsigned>(Action::Slot1) == 31 && static_cast<unsigned>(Action::Challenges) == 38);
+    const char* names[]{"Slot1", "Slot2", "Slot3", "Slot4", "Suicide", "Skills", "Logs", "Challenges"};
+    for (unsigned i = 0; i != 8; ++i)
+        CHECK(std::strcmp(shippedActionName(static_cast<Action>(31 + i)), names[i]) == 0);
+    Mailbox box;
+    auto context = gameplay(41);
+    context.hudValidMask = HudSkill | HudExperience | HudChallenge;
+    context.skillRect = {.05f, .78f, .11f, .84f};
+    context.experienceRect = {.34f, .88f, .66f, .92f};
+    context.challengeRect = {.06f, .68f, .26f, .75f};
+    // Slots 1, 2 and 4: SMG, pistol, launcher; slot 2 equipped.
+    const std::uint32_t slots = kWeaponSlotsKnown | 0xBu | (2u << 8) | (3u << 16) | (1u << 20) | (6u << 28);
+    context.weaponSlots = slots;
+    const auto epoch = ready(box, context);
+    auto words = box.snapshot().wire();
+    CHECK(words[9] == (HudSkill | HudExperience | HudChallenge) && words[24] == slots);
+    CHECK(near(unpackFloat(words[18], false), .05f) && near(unpackFloat(words[19], true), .84f));
+    CHECK(near(unpackFloat(words[20], false), .34f) && near(unpackFloat(words[21], false), .66f));
+    CHECK(near(unpackFloat(words[22], true), .68f) && near(unpackFloat(words[23], true), .75f));
+    // Each region is validated alone; a bad slot word publishes as unknown.
+    context.experienceRect.right = std::numeric_limits<float>::quiet_NaN();
+    context.challengeRect = {.3f, .7f, .2f, .75f};
+    for (const auto bad : {std::uint32_t{0xBu | (2u << 8)}, kWeaponSlotsKnown | 0xBu | (3u << 8),
+                           kWeaponSlotsKnown | 0x1u | (1u << 20), kWeaponSlotsKnown | 0x1u | (7u << 16),
+                           kWeaponSlotsKnown | 0x1u | (5u << 8), kWeaponSlotsKnown | 0x1u | 0x10u}) {
+        context.weaponSlots = bad;
+        CHECK(box.publishContext(context) == epoch);
+        words = box.snapshot().wire();
+        CHECK(words[24] == 0 && words[9] == HudSkill && words[20] == 0 && words[21] == 0 && words[22] == 0 && words[23] == 0);
+    }
+    // A pulse of each new action reaches the engine as one edge pair.
+    for (unsigned i = 0; i != 8; ++i) {
+        const auto bit = actionBit(static_cast<Action>(31 + i));
+        CHECK(send(box, epoch, bit, 102 + i * 2));
+        const auto down = box.consumeFrame(2 + i * 2, 102 + i * 2);
+        CHECK(down.actionEdgeCount == 1 && down.actionEdges[0].down && down.heldActions == bit);
+        CHECK(send(box, epoch, 0, 103 + i * 2));
+        const auto up = box.consumeFrame(3 + i * 2, 103 + i * 2);
+        CHECK(up.actionEdgeCount == 1 && !up.actionEdges[0].down && up.heldActions == 0);
+    }
+}
+
+// Protocol 6: the menu X/Y and LB/RB keys are synthetic UI actions without a
+// shipped InputActionDefinition; a menu delivers each as one edge pair. A
+// blocking online message publishes Loading, which refuses every input.
+static void testStageSixMenuKeysAndBlockingMessage() {
+    CHECK(kProtocolVersion == 6 && kSnapshotWords == 25 && kActionCount == 43);
+    CHECK(static_cast<unsigned>(Action::UiAction) == 39 && static_cast<unsigned>(Action::UiOther) == 40);
+    CHECK(static_cast<unsigned>(Action::UiPreviousTab) == 41 && static_cast<unsigned>(Action::UiNextTab) == 42);
+    const Action keys[]{Action::UiAction, Action::UiOther, Action::UiPreviousTab, Action::UiNextTab};
+    std::uint64_t mask = 0;
+    for (const auto key : keys) { CHECK(shippedActionName(key) == nullptr); mask |= actionBit(key); }
+    CHECK((kKnownActions & mask) == mask && (kKnownActions >> kActionCount) == 0);
+    Mailbox box;
+    const auto epoch = ready(box, {Mode::Menu, UiNavigation | UiTapTest, mask | actionBit(Action::Back), 61});
+    for (unsigned i = 0; i != 4; ++i) {
+        const auto bit = actionBit(keys[i]);
+        CHECK(send(box, epoch, bit, 102 + i * 2));
+        const auto down = box.consumeFrame(2 + i * 2, 102 + i * 2);
+        CHECK(down.actionEdgeCount == 1 && down.actionEdges[0].action == keys[i] && down.actionEdges[0].down);
+        CHECK(send(box, epoch, 0, 103 + i * 2));
+        const auto up = box.consumeFrame(3 + i * 2, 103 + i * 2);
+        CHECK(up.actionEdgeCount == 1 && up.actionEdges[0].action == keys[i] && !up.actionEdges[0].down);
+    }
+    const auto loading = box.publishContext({Mode::Loading, 0, 0, 62});
+    CHECK(loading != epoch && box.snapshot().wire()[2] == static_cast<std::uint64_t>(Mode::Loading));
+    CHECK(!box.submit(loading, 0, 0, 0, 0, 0, 120) && !send(box, loading, mask, 121));
+    CHECK(!box.uiPointer(loading, 3, PointerPhase::Down, .5f, .5f, 122));
+    const auto blocked = box.consumeFrame(20, 123);
+    CHECK(blocked.resetReasons == ContextChanged && blocked.actionEdgeCount == 0 && blocked.pointerEventCount == 0);
 }
 
 static void testNativeMapTwoPointerTransport() {
@@ -726,6 +802,8 @@ int main() {
     testConcurrentSnapshotIsCoherent();
     testNativeMapTwoPointerTransport();
     testUseHudRegionIsIndependent();
-    std::cout << "PASS: 27 native touch contract scenarios\n";
+    testStageFiveTapTargetsAndSlots();
+    testStageSixMenuKeysAndBlockingMessage();
+    std::cout << "PASS: 29 native touch contract scenarios\n";
     return 0;
 }

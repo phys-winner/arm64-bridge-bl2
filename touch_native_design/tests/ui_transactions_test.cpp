@@ -130,19 +130,62 @@ int main() {
     state.begin(3,12,true,false,2400,1080);
     for (int i=0;i<10;++i) { pointer(i,PointerPhase::Down); assert(pointer(i,PointerPhase::Up)); }
     state.begin(3,12,true,false,2400,1080,true);
-    pointer(1,PointerPhase::Down,.3f,.6f); pointer(1,PointerPhase::Move,.3f,.35f);
-    const auto next = pointer(1,PointerPhase::Up,.3f,.3f);
-    assert(next && next->scrollDirection == 1);
+    // Continuous list scroll: one step per kUiScrollPitch (6% of 1080 = 64.8 px)
+    // while the finger moves, the remainder carried; never a tap afterwards.
+    pointer(1,PointerPhase::Down,.3f,.6f);
+    assert(!state.dragging());
+    assert(!pointer(1,PointerPhase::Move,.3f,.59f) && !state.dragging()); // Inside the 1.5% slop.
+    assert(!pointer(1,PointerPhase::Move,.3f,.55f) && state.dragging()); // 54 px: vertical, no whole step yet.
+    auto step = pointer(1,PointerPhase::Move,.3f,.53f);
+    assert(step && step->scrollDirection == 1 && !step->tabDirection && step->x == .3f && step->y == .6f);
+    assert(!pointer(1,PointerPhase::Move,.3f,.50f)); // 1.67 pitches from the start: the carried remainder.
+    step = pointer(1,PointerPhase::Move,.3f,.29f);
+    assert(step && step->scrollDirection == 4); // 334.8 px = 5.17 pitches: 4 more after the first.
+    assert(state.dragging() && state.ownsPointer(1));
+    step = pointer(1,PointerPhase::Move,.4f,.40f); // Locked vertical even when it drifts sideways.
+    assert(step && step->scrollDirection == -1);
+    assert(!pointer(1,PointerPhase::Up,.4f,.41f) && !state.dragging()); // No tap after a scroll.
     pointer(1,PointerPhase::Down,.3f,.3f);
-    const auto previous = pointer(1,PointerPhase::Up,.3f,.6f);
-    assert(previous && previous->scrollDirection == -1);
+    step = pointer(1,PointerPhase::Up,.3f,.62f); // A fast flick reports its whole distance at UP.
+    assert(step && step->scrollDirection == -5);
+    pointer(1,PointerPhase::Down,.3f,.95f);
+    // 982.8 px is 15.2 pitches; one sample yields at most 8, the next sample the rest.
+    step = pointer(1,PointerPhase::Move,.3f,.04f);
+    assert(step && step->scrollDirection == 8);
+    step = pointer(1,PointerPhase::Move,.3f,.04f);
+    assert(step && step->scrollDirection == 7);
+    pointer(1,PointerPhase::Up,.3f,.04f);
+    // Horizontal swipe: one tab at UP, + when the finger moves left.
+    pointer(1,PointerPhase::Down,.5f,.5f);
+    assert(!pointer(1,PointerPhase::Move,.42f,.51f) && state.dragging());
+    const auto nextTab = pointer(1,PointerPhase::Up,.35f,.52f); // 360 px left.
+    assert(nextTab && nextTab->tabDirection == 1 && !nextTab->scrollDirection && nextTab->x == .5f && nextTab->y == .5f);
     pointer(1,PointerPhase::Down,.3f,.3f); pointer(1,PointerPhase::Move,.5f,.4f);
-    assert(!pointer(1,PointerPhase::Up,.5f,.4f)); // Horizontal/diagonal gestures cannot activate buttons.
+    const auto previousTab = pointer(1,PointerPhase::Up,.5f,.4f);
+    assert(previousTab && previousTab->tabDirection == -1);
+    pointer(1,PointerPhase::Down,.5f,.5f);
+    assert(!pointer(1,PointerPhase::Up,.47f,.5f)); // 72 px < 8% of 1080: neither a tab nor a tap.
+    pointer(1,PointerPhase::Down,.3f,.3f); pointer(1,PointerPhase::Move,.4f,.31f);
+    assert(!pointer(1,PointerPhase::Up,.5f,.6f)); // Ends steeper than 1.5:1: no tab, never a scroll.
     pointer(1,PointerPhase::Down,.3f,.6f); pointer(2,PointerPhase::Down,.4f,.6f);
+    assert(!pointer(1,PointerPhase::Move,.3f,.3f)); // A second finger cancels steps too.
     assert(!pointer(1,PointerPhase::Up,.3f,.3f) && !pointer(2,PointerPhase::Up));
+    pointer(1,PointerPhase::Down,.3f,.6f); state.action({Action::UiAction,true,3,21});
+    assert(!pointer(1,PointerPhase::Move,.3f,.3f) && !pointer(1,PointerPhase::Up,.3f,.3f)); // Key + drag cancel.
+    assert(!state.action({Action::UiAction,false,3,22}));
+    pointer(1,PointerPhase::Down,.3f,.6f); pointer(1,PointerPhase::Move,.3f,.5f);
+    assert(!pointer(1,PointerPhase::Cancel,.3f,.3f)); // Cancel commits nothing more.
     pointer(1,PointerPhase::Down,.3f,.6f);
     state.begin(3,13,true,false,2400,1080,true);
     assert(!pointer(1,PointerPhase::Up,.3f,.3f)); // No swipe into a replacement movie.
+    state.begin(3,13,true,false,2400,1080,false);
+    pointer(1,PointerPhase::Down,.3f,.6f);
+    assert(!pointer(1,PointerPhase::Move,.3f,.3f) && !state.dragging()); // Dialogs: no swipe navigation.
+    assert(!pointer(1,PointerPhase::Up,.3f,.3f));
+    for (Action action : {Action::UiAction,Action::UiOther,Action::UiPreviousTab,Action::UiNextTab}) {
+        assert(!state.action({action,true,3,30}));
+        assert(state.action({action,false,3,31}) == action); // Protocol 6 menu keys commit like Confirm.
+    }
     {
         UiMapGesture map;
         const auto start = [&] { map.begin(7,70,true,false,2400,1080); };

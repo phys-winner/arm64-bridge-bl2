@@ -33,7 +33,7 @@ std::optional<float> Bl2MapZoomDelta(float logarithmicRatio,float speed,float de
 void UiMapDeferredPoint::store(UiTap point,std::uint64_t epoch,std::uint64_t scene,std::uint64_t now) {
     clear();
     if (!epoch || !scene || !std::isfinite(point.x) || !std::isfinite(point.y) ||
-        point.x<0 || point.x>1 || point.y<0 || point.y>1 || point.scrollDirection) return;
+        point.x<0 || point.x>1 || point.y<0 || point.y>1 || point.scrollDirection || point.tabDirection) return;
     point_=point;epoch_=epoch;scene_=scene;started_=now;
 }
 std::optional<UiTap> UiMapDeferredPoint::take(std::uint64_t epoch,std::uint64_t scene,std::uint64_t now,bool sameOwner) {
@@ -101,7 +101,7 @@ std::optional<UiMapUpdate> UiMapGesture::pointer(const PointerEvent& e,bool insi
     return out;
 }
 void UiTransactions::clear() {
-    held_ = 0; pointers_.fill(-1); primary_ = -1; cancelled_ = keysCancelled_ = moved_ = false;
+    held_ = 0; pointers_.fill(-1); primary_ = -1; cancelled_ = keysCancelled_ = moved_ = false; axis_ = 0;
 }
 void UiTransactions::begin(std::uint64_t epoch, std::uint64_t scene, bool valid,
                            bool reset, std::uint32_t width, std::uint32_t height, bool swipeNavigation) {
@@ -144,7 +144,7 @@ std::optional<UiTap> UiTransactions::pointer(const PointerEvent& event) {
         pointers_[static_cast<std::size_t>(slot)] = event.pointerId;
         if (empty) {
             primary_ = event.pointerId; startX_ = event.surfaceX; startY_ = event.surfaceY;
-            moved_ = false;
+            anchorY_ = startY_; moved_ = false; axis_ = 0;
             cancelled_ = held_ != 0 || !std::isfinite(startX_) || !std::isfinite(startY_) ||
                 startX_ < 0 || startX_ > 1 || startY_ < 0 || startY_ > 1;
         } else cancelled_ = true; // No second-finger click or ownership transfer.
@@ -156,22 +156,37 @@ std::optional<UiTap> UiTransactions::pointer(const PointerEvent& event) {
     if (event.phase == PointerPhase::Cancel) cancelled_ = true;
     const float dx = (event.surfaceX - startX_) * static_cast<float>(width_);
     const float dy = (event.surfaceY - startY_) * static_cast<float>(height_);
+    const float side = static_cast<float>(std::min(width_, height_));
+    std::optional<UiTap> steps;
     if (event.pointerId == primary_) {
-        const float slop = .015f * static_cast<float>(std::min(width_, height_));
         if (!std::isfinite(dx) || !std::isfinite(dy)) cancelled_ = true;
-        else if (std::hypot(dx, dy) > slop) moved_ = true;
+        else if (std::hypot(dx, dy) > .015f * side) moved_ = true;
+        // The first direction past the slop decides once: a list scroll or a
+        // tab swipe. A second finger or a held overlay key still cancels both.
+        if (swipeNavigation_ && moved_ && !axis_ && !cancelled_) axis_ = std::abs(dx) > std::abs(dy) ? 1 : 2;
+        if (axis_ == 2 && !cancelled_ && (event.phase == PointerPhase::Move || event.phase == PointerPhase::Up)) {
+            // Whole steps by distance while the finger moves, as the Debug menu
+            // does; the remainder carries over to the next sample.
+            const float pitch = kUiScrollPitch * static_cast<float>(height_);
+            const int count = std::clamp(static_cast<int>((anchorY_ - event.surfaceY) * static_cast<float>(height_) / pitch), -8, 8);
+            if (count) {
+                anchorY_ -= static_cast<float>(count) * pitch / static_cast<float>(height_);
+                steps = UiTap{startX_, startY_, count, 0};
+            }
+        }
     }
-    if (event.phase != PointerPhase::Up && event.phase != PointerPhase::Cancel) return {};
-    const bool swipe = swipeNavigation_ && moved_ &&
-        std::abs(dy) >= .08f * static_cast<float>(std::min(width_,height_)) && std::abs(dy) > std::abs(dx) * 1.5f;
-    const bool commit = event.phase == PointerPhase::Up && event.pointerId == primary_ && !cancelled_ && (!moved_ || swipe);
+    if (event.phase != PointerPhase::Up && event.phase != PointerPhase::Cancel) return steps;
+    const bool commit = event.phase == PointerPhase::Up && event.pointerId == primary_ && !cancelled_;
+    const bool tap = commit && !moved_;
+    const bool tab = commit && axis_ == 1 && std::abs(dx) >= .08f * side && std::abs(dx) > std::abs(dy) * 1.5f;
     pointers_[static_cast<std::size_t>(slot)] = -1;
+    if (std::all_of(pointers_.begin(), pointers_.end(), [](int id) { return id < 0; })) {
+        primary_ = -1; cancelled_ = moved_ = false; axis_ = 0;
+    }
     // Commit at the original coordinate. A small finger slip must not select an
     // adjacent row. Widget identity during same-movie mutations is a later gate.
-    const UiTap result{startX_, startY_,swipe ? (dy < 0 ? 1 : -1) : 0};
-    if (std::all_of(pointers_.begin(), pointers_.end(), [](int id) { return id < 0; })) {
-        primary_ = -1; cancelled_ = moved_ = false;
-    }
-    return commit ? std::optional<UiTap>(result) : std::nullopt;
+    if (tap) return UiTap{startX_, startY_, 0, 0};
+    if (tab) return UiTap{startX_, startY_, 0, dx < 0 ? 1 : -1};
+    return commit ? steps : std::nullopt;
 }
 } // namespace bl2::touch

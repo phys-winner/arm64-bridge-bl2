@@ -87,6 +87,10 @@ struct Ue3GameplaySink::State {
     } hudSource{};
     Context hudObservation{};
     std::uint64_t hudSampleTime = 0;
+    // The skill icon and XP bar only move with a HUD layout: sampled every
+    // 500ms and kept between the 100ms samples of the other regions.
+    Context tapObservation{};
+    std::uint64_t tapSampleTime = 0;
     struct AvailabilityCache {
         Target target{};
         std::uint64_t pawn = 0, time = 0;
@@ -107,6 +111,7 @@ struct Ue3GameplaySink::State {
     const char* objectiveReason = "objective-unobserved";
     const char* useReason = "use-unobserved";
     const char* skillReason = "skill-unobserved";
+    const char* tapReason = "tap-unobserved";
     std::array<double,7> ammoMetrics{};
     std::uint64_t diagnosticTime = 0;
     unsigned diagnosticLogs = 0;
@@ -703,6 +708,39 @@ struct Ue3GameplaySink::State {
         if (knownState) *knownState = true;
         return true;
     }
+    // WillowWeapon.DefinitionData is WillowWeaponTypes.WeaponDefinitionData;
+    // its WeaponTypeDefinition.WeaponType is EWeaponType (WT_Pistol 0 ..
+    // WT_RocketLauncher 5). Returns the type + 1, or 0 when unreadable.
+    std::uint8_t weaponType(std::uint32_t weapon) const {
+        const auto data = field(weapon, "DefinitionData", "StructProperty");
+        if (!data || data.dimension != 1 || objectName(data.extra) != "WeaponDefinitionData") return 0;
+        const auto member = property(data.extra, "WeaponTypeDefinition", "ObjectProperty");
+        if (!member || member.size != 4 || member.dimension != 1 || member.offset + 4 > data.size ||
+            !span(weapon + data.offset + member.offset, 4)) return 0;
+        const auto definition = read(weapon + data.offset + member.offset);
+        if (!isA(definition, "WeaponTypeDefinition")) return 0;
+        const auto type = field(definition, "WeaponType", "ByteProperty");
+        if (!type || type.size != 1 || type.dimension != 1 || !span(definition + type.offset, 1)) return 0;
+        const auto value = host.MemoryRead8(definition + type.offset);
+        return value < 6 ? static_cast<std::uint8_t>(value + 1) : 0;
+    }
+    // Slot1..Slot4 run "EquipWeaponFromSlot QuickSelectUp".."QuickSelectRight",
+    // i.e. QuickSelectSlot 1..4 of the readied weapons. An empty slot is known
+    // unavailable; an unreadable or duplicate assignment leaves the word
+    // unknown and the actions as the input context resolved them.
+    void observeSlots(const Target& target, const std::vector<std::uint32_t>& weapons, std::uint32_t equipped) {
+        std::vector<WeaponSlotEntry> entries;
+        for (const auto item : weapons) {
+            const auto quick = field(item, "QuickSelectSlot", "ByteProperty");
+            if (!quick || quick.size != 1 || quick.dimension != 1 || !span(item + quick.offset, 1)) return;
+            entries.push_back({host.MemoryRead8(item + quick.offset), weaponType(item), item == equipped});
+        }
+        const auto word = Bl2WeaponSlotsWord(entries);
+        if (!word || !targetUnchanged(target)) return;
+        observation.weaponSlots = word;
+        for (unsigned slot = 0; slot < 4; ++slot)
+            known(static_cast<Action>(static_cast<unsigned>(Action::Slot1) + slot), (word & (1u << slot)) != 0);
+    }
     std::uint32_t lastWeaponCommand(std::uint32_t controller) const {
         const auto fn = function(controller, "EquipWeaponFromSlot", "WillowPlayerController");
         const auto arg = fn ? property(fn, "QuickSlot", "ByteProperty") : Property{};
@@ -841,14 +879,14 @@ struct Ue3GameplaySink::State {
             hudSource.armed==next.armed && hudSource.usable==next.usable &&
             hudSource.target.scene==target.scene && hudSource.target.generation==target.generation;
         hudSource=next;
-        if (!same) {hudObservation={};hudSampleTime=0;}
+        if (!same) {hudObservation={};hudSampleTime=0;tapObservation={};tapSampleTime=0;}
         if (const auto reason=hudRejectReason()) {
 #if HORN_ENABLE_LOGGING
             hudReason=reason;objectiveReason="objective-native-source";
 #else
             (void)reason;
 #endif
-            hudObservation={};hudSampleTime=0;return;
+            hudObservation={};hudSampleTime=0;tapObservation={};tapSampleTime=0;return;
         }
         const auto now=monotonicMilliseconds();
         if (!hudSampleTime || now-hudSampleTime>=100) {
@@ -935,11 +973,54 @@ struct Ue3GameplaySink::State {
                 hint.release(hintP1);hint.release(hintRoot);hint.close();
                 if (!hint.cleanupOkay() || !hudCurrent()) hudObservation={};
             }
+            if (hudCurrent()) observeTapTargets(next,now);
+            else {tapObservation={};tapSampleTime=0;}
+            hudObservation.hudValidMask|=tapObservation.hudValidMask;
+            hudObservation.skillRect=tapObservation.skillRect;
+            hudObservation.experienceRect=tapObservation.experienceRect;
+            hudObservation.challengeRect=tapObservation.challengeRect;
         }
         observation.hudValidMask=hudObservation.hudValidMask;
         observation.mapRect=hudObservation.mapRect;observation.ammoRect=hudObservation.ammoRect;
         observation.objectiveRect=hudObservation.objectiveRect;
         observation.useRect=hudObservation.useRect;
+        observation.skillRect=hudObservation.skillRect;
+        observation.experienceRect=hudObservation.experienceRect;
+        observation.challengeRect=hudObservation.challengeRect;
+    }
+    // Protocol 5 tap targets, own budget and value lifetime, so a missing or
+    // sliding one never discards the map/ammo/mission/hint regions.
+    void observeTapTargets(const HudSource& source,std::uint64_t now) {
+        const bool slow=!tapSampleTime || now-tapSampleTime>=500;
+        GfxSession taps(*hudTransport,base,source.interface,hudTransport->scratch(),256);
+        const auto root=taps.variable("_root"),p1=taps.member(root,"p1");
+        GfxRect frame;GfxViewport viewport;
+        Context sample=tapObservation;
+        sample.hudValidMask&=slow ? 0u : (HudSkill|HudExperience);
+        sample.challengeRect={};
+        if (taps.frameRect(frame) && taps.viewport(viewport) && visibleClip(taps,root) && visibleClip(taps,p1)) {
+            struct TapRegion { const char* name; std::uint32_t region; SurfaceRect* rect; bool (*observe)(GfxSession&,GfxHandle,GfxRect&); };
+            const TapRegion regions[]{{"character",HudSkill,&sample.skillRect,ObserveBl2SkillIcon},
+                {"xpbar",HudExperience,&sample.experienceRect,ObserveBl2ExperienceBar},
+                {"challenges",HudChallenge,&sample.challengeRect,ObserveBl2ChallengeNotice}};
+            for (const auto& item:regions) {
+                if (!slow && item.region!=HudChallenge) continue;
+                const auto clip=taps.member(p1,item.name);GfxRect stage;
+                if (item.observe(taps,clip,stage) &&
+                    surfaceRegion(stage,frame,viewport,source.width,source.height,*item.rect))
+                    sample.hudValidMask|=item.region;
+                else *item.rect={};
+                taps.release(clip);
+                if (!taps.good()) break;
+            }
+        } else sample={};
+#if HORN_ENABLE_LOGGING
+        tapReason=taps.reason() ? taps.reason() : "observed";
+#endif
+        taps.release(p1);taps.release(root);taps.close();
+        if (!taps.cleanupOkay() || !hudCurrent()) sample={};
+        if (slow) tapSampleTime=now;
+        tapObservation=sample;
     }
     void diagnostic() {
 #if HORN_ENABLE_LOGGING
@@ -950,10 +1031,13 @@ struct Ue3GameplaySink::State {
         };
         const auto changed=lastDiagnosticOwner!=hudSource.owner || lastDiagnostic.weaponCount!=observation.weaponCount || lastDiagnostic.grenadeCount!=observation.grenadeCount ||
             lastDiagnostic.knownActions!=observation.knownActions || lastDiagnostic.availableActions!=available ||
-            lastDiagnostic.hudValidMask!=observation.hudValidMask ||
+            lastDiagnostic.hudValidMask!=observation.hudValidMask || lastDiagnostic.weaponSlots!=observation.weaponSlots ||
             rectChanged(lastDiagnostic.mapRect,observation.mapRect) || rectChanged(lastDiagnostic.ammoRect,observation.ammoRect) ||
-            rectChanged(lastDiagnostic.objectiveRect,observation.objectiveRect) || rectChanged(lastDiagnostic.useRect,observation.useRect);
-        if (diagnosticLogs>=32 || (!changed && now-diagnosticTime<5000)) return;
+            rectChanged(lastDiagnostic.objectiveRect,observation.objectiveRect) || rectChanged(lastDiagnostic.useRect,observation.useRect) ||
+            rectChanged(lastDiagnostic.skillRect,observation.skillRect) ||
+            rectChanged(lastDiagnostic.experienceRect,observation.experienceRect) ||
+            rectChanged(lastDiagnostic.challengeRect,observation.challengeRect);
+        if (diagnosticLogs>=96 || (!changed && now-diagnosticTime<5000)) return;
         ++diagnosticLogs;diagnosticTime=now;lastDiagnosticOwner=hudSource.owner;
         lastDiagnostic=observation;lastDiagnostic.availableActions=available;
         HORN_LOGI("BL2TouchDiagnostics","gameplay telemetry owner=%08X known=%llX available=%llX weapons=%d grenades=%d hud=%u reason=%s "
@@ -966,6 +1050,13 @@ struct Ue3GameplaySink::State {
             observation.objectiveRect.left,observation.objectiveRect.top,observation.objectiveRect.right,observation.objectiveRect.bottom,
             observation.useRect.left,observation.useRect.top,observation.useRect.right,observation.useRect.bottom,
             objectiveReason,useReason,skillReason);
+        HORN_LOGI("BL2TouchDiagnostics","gameplay taps owner=%08X slots=%08X skill=(%.6f,%.6f,%.6f,%.6f) "
+            "xp=(%.6f,%.6f,%.6f,%.6f) challenge=(%.6f,%.6f,%.6f,%.6f) tapReason=%s",
+            static_cast<std::uint32_t>(hudSource.owner>>32),observation.weaponSlots,
+            observation.skillRect.left,observation.skillRect.top,observation.skillRect.right,observation.skillRect.bottom,
+            observation.experienceRect.left,observation.experienceRect.top,observation.experienceRect.right,observation.experienceRect.bottom,
+            observation.challengeRect.left,observation.challengeRect.top,observation.challengeRect.right,observation.challengeRect.bottom,
+            tapReason);
         if (!(observation.hudValidMask & HudAmmo)) HORN_LOGI("BL2TouchDiagnostics",
             "ammo counter metrics x=%.4f y=%.4f width=%.4f height=%.4f scale=(%.4f,%.4f) rotation=%.4f",
             ammoMetrics[0],ammoMetrics[1],ammoMetrics[2],ammoMetrics[3],ammoMetrics[4],ammoMetrics[5],ammoMetrics[6]);
@@ -1125,6 +1216,7 @@ struct Ue3GameplaySink::State {
                     observation.weaponCount = static_cast<std::int32_t>(count);
                     known(Action::NextWeapon, count >= 2);
                     known(Action::PreviousWeapon, count >= 2);
+                    observeSlots(target, weapons, weapon);
                     if (lastWeaponCommand(target.controller)) {
                         std::uint8_t slot = 0;
                         bool lastKnown = false;
@@ -1405,6 +1497,10 @@ void Ue3GameplaySink::telemetry(Context& context) const {
     context.ammoRect = s.observation.ammoRect;
     context.objectiveRect = s.observation.objectiveRect;
     context.useRect = s.observation.useRect;
+    context.skillRect = s.observation.skillRect;
+    context.experienceRect = s.observation.experienceRect;
+    context.challengeRect = s.observation.challengeRect;
+    context.weaponSlots = s.observation.weaponSlots;
 }
 void Ue3GameplaySink::expirePendingAxes() {
     state_->movementPending = state_->lookPending = false;

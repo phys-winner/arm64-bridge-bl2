@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 class DynarmicHost;
 
@@ -192,6 +193,119 @@ inline bool Bl2AmmoStripLocalRect(const std::array<double,7>& v,std::array<doubl
         std::abs(v[3]-38.55)>.02 || std::abs(v[4]-100)>.01 || std::abs(v[5]-100)>.01 || v[6]!=0) return false;
     out={-212.85,-15.25,56.15,36.6};
     return true;
+}
+
+// Protocol 5 HUD tap targets. A clip counts only while it and its alpha are
+// shown; metrics are [x,y,width,height,xscale,yscale,rotation] in the parent.
+inline bool Bl2HudClipShown(GfxSession& session,GfxHandle clip) {
+    if (session.type(clip)!=10) return false;
+    const auto v=session.member(clip,"_visible"),a=session.member(clip,"_alpha");
+    bool shown=false;double alpha=0;
+    const bool okay=v && a && session.boolean(v,shown) && shown && session.number(a,alpha) && alpha>0 && alpha<=100;
+    session.release(v);session.release(a);return okay;
+}
+inline bool Bl2HudClipMetrics(GfxSession& session,GfxHandle clip,std::array<double,7>& v) {
+    constexpr const char* names[]{"_x","_y","_width","_height","_xscale","_yscale","_rotation"};
+    for (std::size_t i=0;i<v.size();++i) {
+        const auto value=session.member(clip,names[i]);
+        const bool okay=value && session.number(value,v[i]) && std::isfinite(v[i]);
+        session.release(value);
+        if (!okay) return false;
+    }
+    return true;
+}
+// p1.character is the action skill portrait (UpdateActionSkill/-Portrait).
+// Its frames 1-6 hold `cooldown` (sprite399): the skill image is loaded into
+// cooldown.icon (sprite384), and circle shape378 [-2.05,37.8]x[-4.65,35.05]
+// sits at (-0.5,3.1); both stay on all 101 cooldown frames. The "_none"
+// frames 7-11 and the "vehicle" frame 12 have no cooldown clip. The icon's
+// authored unscaled placement (16.7,17.95) proves that layout.
+constexpr GfxRect kBl2SkillIconLocal{-2.55,-1.55,37.3,38.15};
+inline bool Bl2SkillIconPlacement(const std::array<double,7>& icon) {
+    return std::abs(icon[0]-16.7)<=.05 && std::abs(icon[1]-17.95)<=.05 &&
+        std::abs(icon[4]-100)<=.01 && std::abs(icon[5]-100)<=.01 && icon[6]==0;
+}
+inline bool ObserveBl2SkillIcon(GfxSession& session,GfxHandle character,GfxRect& out) {
+    out={};
+    if (!Bl2HudClipShown(session,character)) return false;
+    const auto cooldown=session.member(character,"cooldown"),icon=session.member(cooldown,"icon");
+    std::array<double,7> metrics{};
+    const bool okay=Bl2HudClipShown(session,cooldown) && session.type(icon)==10 &&
+        Bl2HudClipMetrics(session,icon,metrics) && Bl2SkillIconPlacement(metrics) &&
+        session.projectedRect(cooldown,kBl2SkillIconLocal,out);
+    session.release(icon);session.release(cooldown);
+    if (okay && session.good()) return true;
+    out={};return false;
+}
+// p1.xpbar (sprite191, 100 progress frames): background shape183
+// [-200.5,200.5]x[-6.9,20.1] stays at depth1 on every frame. The fill morph
+// char185 ([-195.7,-190.45..193.3]x[-6.9,7.1]), frame-100 art and xpbkgd lie
+// inside it; only the "go" flash reaches y=-8. Unscaled width 401 and height
+// 27..28.1 prove that art.
+constexpr GfxRect kBl2ExperienceBarLocal{-200.5,-6.9,200.5,20.1};
+inline bool Bl2ExperienceBarShape(const std::array<double,7>& v) {
+    if (v[4]<=0 || v[4]>1000 || v[5]<=0 || v[5]>1000 || v[6]!=0) return false;
+    const double width=v[2]*100/v[4],height=v[3]*100/v[5];
+    return std::abs(width-401)<=.2 && height>=26.8 && height<=28.3;
+}
+inline bool ObserveBl2ExperienceBar(GfxSession& session,GfxHandle bar,GfxRect& out) {
+    out={};
+    std::array<double,7> metrics{};
+    const bool okay=Bl2HudClipShown(session,bar) && Bl2HudClipMetrics(session,bar,metrics) &&
+        Bl2ExperienceBarShape(metrics) && session.projectedRect(bar,kBl2ExperienceBarLocal,out);
+    if (okay && session.good()) return true;
+    out={};return false;
+}
+// p1.challenges (sprite851): frame 1 "off", 2-13 slide `inner` in (x -240..0,
+// alpha 0..100%) and stop, 14-24 "out". inner.bkgd (sprite842, authored at
+// (-16.75,-27)) holds two shape841 copies spanning [0,254]x[-26,27.5] behind
+// the header and subtext; the subtext clip's frame-2 script stretches it with
+// _parent.bkgd._width from the caption's textWidth, i.e. through _xscale.
+// Frames 8-13 are at least 79% opaque and within 50px of rest; the sliding or
+// fading notice is not a target.
+constexpr GfxRect kBl2ChallengeLocal{0,-26,254,27.5};
+inline bool Bl2ChallengeFrame(double frame) {
+    return std::isfinite(frame) && frame==std::floor(frame) && frame>=8 && frame<=13;
+}
+inline bool Bl2ChallengeBackground(const std::array<double,7>& v) {
+    if (v[4]<=0 || v[4]>1000 || std::abs(v[5]-100)>.01 || v[6]!=0) return false;
+    return std::abs(v[0]+16.75)<=.05 && std::abs(v[1]+27)<=.05 &&
+        std::abs(v[2]*100/v[4]-254)<=.2 && std::abs(v[3]-53.5)<=.2;
+}
+inline bool ObserveBl2ChallengeNotice(GfxSession& session,GfxHandle challenges,GfxRect& out) {
+    out={};
+    if (!Bl2HudClipShown(session,challenges)) return false;
+    const auto frame=session.member(challenges,"_currentframe");
+    double current=0;
+    const bool active=frame && session.number(frame,current) && Bl2ChallengeFrame(current);
+    session.release(frame);
+    if (!active) return false;
+    const auto inner=session.member(challenges,"inner"),background=session.member(inner,"bkgd");
+    std::array<double,7> metrics{};
+    const bool okay=Bl2HudClipShown(session,inner) && Bl2HudClipShown(session,background) &&
+        Bl2HudClipMetrics(session,background,metrics) && Bl2ChallengeBackground(metrics) &&
+        session.projectedRect(background,kBl2ChallengeLocal,out);
+    session.release(background);session.release(inner);
+    if (okay && session.good()) return true;
+    out={};return false;
+}
+
+// Context::weaponSlots from the readied weapons. QuickSelectSlot is
+// EQuickWeaponSlot (QuickSelectUp 1 .. QuickSelectRight 4: the Slot1..Slot4
+// actions); type is EWeaponType + 1, or 0 when unreadable. The original
+// command addresses a slot, not an item: a duplicate or out-of-range slot, or
+// two equipped weapons, leaves the word unknown (0).
+struct WeaponSlotEntry { std::uint8_t slot = 0, type = 0; bool equipped = false; };
+inline std::uint32_t Bl2WeaponSlotsWord(const std::vector<WeaponSlotEntry>& entries) {
+    std::uint32_t word=kWeaponSlotsKnown;
+    for (const auto& entry:entries) {
+        if (entry.slot<1 || entry.slot>4 || entry.type>6) return 0;
+        const auto bit=1u<<(entry.slot-1);
+        if ((word & bit) || (entry.equipped && (word & 0x700u))) return 0;
+        word|=bit | (std::uint32_t{entry.type}<<(16+4*(entry.slot-1)));
+        if (entry.equipped) word|=std::uint32_t{entry.slot}<<8;
+    }
+    return word;
 }
 
 // Concrete semantic gameplay delivery for the immutable A0B06E... guest.

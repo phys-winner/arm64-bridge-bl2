@@ -107,14 +107,42 @@ public final class TouchLayout {
     public static int radialSector(float x, float y, float cx, float cy, float radius) {
         return radialSector(x,y,cx,cy,radius,8);
     }
+    /** The adaptive radial has one to twelve equal sectors, the first at twelve o'clock. */
     public static int radialSector(float x, float y, float cx, float cy, float radius,int sectors) {
         double dx=x-cx, dy=y-cy, distance=Math.hypot(dx,dy);
-        if ((sectors!=8 && sectors!=9) || !Double.isFinite(distance) || !Float.isFinite(radius)
+        if (sectors<1 || sectors>12 || !Double.isFinite(distance) || !Float.isFinite(radius)
                 || radius<=0 || distance<radius*.48 || distance>radius*1.65) return -1;
         double width=Math.PI*2/sectors;
         double angle=Math.atan2(dy,dx)+Math.PI/2+width/2;
         if(angle<0) angle+=Math.PI*2;
         return (int)Math.floor(angle/width)%sectors;
+    }
+    /**
+     * Four transient weapon-slot cells, Slot1..Slot4 from left to right, in one
+     * row just above the ammo strip and inside the safe area. Null without room.
+     */
+    public static float[][] slotCells(float[] ammo,float left,float top,float right,float bottom,float density) {
+        if (ammo == null || ammo.length != 4 || !Float.isFinite(density) || density <= 0) return null;
+        for (float value:ammo) if (!Float.isFinite(value)) return null;
+        float width=72*density,height=56*density,gap=6*density,row=4*width+3*gap;
+        if (!(right-left >= row) || !(bottom-top >= height) || ammo[2] <= ammo[0]) return null;
+        float cx=Math.max(left+row/2,Math.min(right-row/2,(ammo[0]+ammo[2])/2));
+        float y=Math.max(top,Math.min(bottom,ammo[1]-8*density)-height);
+        float[][] cells=new float[4][];
+        for (int i=0;i<4;++i) {
+            float x=cx-row/2+i*(width+gap);
+            cells[i]=new float[]{x,y,x+width,y+height};
+        }
+        return cells;
+    }
+    /** The cell column a finger is over within the row's band, or -1 (cancel). */
+    public static int slotAt(float x,float y,float[][] cells,float density) {
+        if (cells == null || !Float.isFinite(x) || !Float.isFinite(y)) return -1;
+        for (int i=0;i<cells.length;++i) {
+            float[] c=cells[i];
+            if (c != null && x >= c[0]-3*density && x <= c[2]+3*density && y >= c[1]-24*density && y <= c[3]+4*density) return i;
+        }
+        return -1;
     }
     public static boolean overlaps(float[] a,float[] b,float gap) {
         return a[0]<b[2]+gap && a[2]+gap>b[0] && a[1]<b[3]+gap && a[3]+gap>b[1];

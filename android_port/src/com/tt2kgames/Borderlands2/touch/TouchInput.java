@@ -189,9 +189,11 @@ public final class TouchInput {
     /** Native HUD hit targets own their gesture; they never become a camera drag. */
     public static final class HudGesture {
         public static final int MAP_ZONE = 1, AMMO_ZONE = 2, NONE = -1;
+        /** A still press this long on the ammo strip opens the weapon-slot cells. */
+        public static final long SLOT_HOLD_MS = 400;
         private final Map<Integer, Pointer> contacts = new HashMap<>();
         private int primary = -1;
-        private boolean cancelled, secondTap, reloadRequested;
+        private boolean cancelled, secondTap, reloadRequested, slotsOpen;
         private long epoch, started, reloadAfter, reloadEpoch;
         private float distance, tapX, tapY;
         public boolean owns(int id) { return contacts.containsKey(id); }
@@ -215,11 +217,36 @@ public final class TouchInput {
             p.x = x; p.y = y;
             if (id == primary) distance = Math.max(distance, (float)Math.hypot(x-p.startX, y-p.startY));
         }
+        /** True once, when a still single press on the ammo strip opens the slot cells. */
+        public boolean slotHoldDue(long now, Context current, float slop) {
+            Pointer p = contacts.get(primary);
+            if (slotsOpen || p == null || cancelled || contacts.size() != 1 || p.role != AMMO_ZONE
+                    || distance > slop || now - started < SLOT_HOLD_MS || epoch != current.epoch
+                    || !current.usable() || current.mode != GAMEPLAY || !current.hudAmmo()) return false;
+            boolean any = false;
+            for (int slot = 0; slot < 4; ++slot) any |= slotSelectable(current, slot);
+            if (!any) return false;
+            slotsOpen = true; reloadAfter = 0; reloadRequested = false;
+            return true;
+        }
+        public boolean slotsOpen() { return slotsOpen; }
+        /** A cell selects an allowed slot other than the equipped weapon's. */
+        public static boolean slotSelectable(Context current, int slot) {
+            return slot >= 0 && slot < 4 && current.allows(SLOT1 + slot) && current.equippedSlot() != slot + 1;
+        }
         public int up(int id, float x, float y, long now, Context current, boolean inside, float slop) {
+            return up(id, x, y, now, current, inside, slop, -1);
+        }
+        /** slot: the cell under the finger once the cells are open, else -1. */
+        public int up(int id, float x, float y, long now, Context current, boolean inside, float slop, int slot) {
             move(id, x, y);
             Pointer p = contacts.remove(id);
             int action = NONE;
-            if (p != null && id == primary && !cancelled && inside && current.usable()
+            if (p != null && id == primary && slotsOpen) {
+                // Lifting off a cell picks that slot; anywhere else, nothing.
+                if (!cancelled && current.usable() && current.mode == GAMEPLAY && epoch == current.epoch
+                        && current.hudAmmo() && slotSelectable(current, slot)) action = SLOT1 + slot;
+            } else if (p != null && id == primary && !cancelled && inside && current.usable()
                     && current.gameplay() && epoch == current.epoch && now >= started) {
                 if (p.role == MAP_ZONE) {
                     if (current.hudMap() && distance <= slop && now-started < 500 && current.allows(MAP)) action = MAP;
@@ -239,7 +266,7 @@ public final class TouchInput {
                     }
                 }
             }
-            if (contacts.isEmpty()) { primary = -1; cancelled = secondTap = false; }
+            if (contacts.isEmpty()) { primary = -1; cancelled = secondTap = slotsOpen = false; }
             return action;
         }
         private static boolean canReload(Context context) { return context.known(RELOAD) && context.allows(RELOAD); }
@@ -253,7 +280,59 @@ public final class TouchInput {
             reloadAfter = 0; boolean requested=reloadRequested;reloadRequested=false;
             return requested && canReload(current) ? RELOAD : NONE;
         }
-        public void cancel() { contacts.clear(); primary = -1; cancelled = secondTap = reloadRequested = false; reloadAfter = 0; }
+        public void cancel() { contacts.clear(); primary = -1; cancelled = secondTap = reloadRequested = slotsOpen = false; reloadAfter = 0; }
+    }
+    /**
+     * Tap-only HUD targets: the skill icon, the objectives block, the XP bar
+     * and a challenge notice. A still tap acts; once the finger leaves the
+     * slop it becomes the stick or camera drag it would have started, from
+     * where it went down, so these targets never block movement or look.
+     */
+    public static final class HudTaps {
+        public static final int SKILL_ZONE = 3, OBJECTIVES_ZONE = 4, EXPERIENCE_ZONE = 5, CHALLENGE_ZONE = 6, NONE = -1;
+        public static final long TAP_MS = 400;
+        private static final class Contact {
+            final int zone, role;
+            final float startX, startY;
+            final long started, epoch;
+            Contact(int zone, int role, float x, float y, long started, long epoch) {
+                this.zone = zone; this.role = role; startX = x; startY = y; this.started = started; this.epoch = epoch;
+            }
+        }
+        private final Map<Integer, Contact> contacts = new HashMap<>();
+        public boolean owns(int id) { return contacts.containsKey(id); }
+        /** role: MOVEMENT or LOOK, what the touch becomes when it is dragged. */
+        public void down(int id, int zone, int role, float x, float y, long now, long epoch) {
+            if (id < 0 || !Float.isFinite(x) || !Float.isFinite(y) || contacts.size() >= 10 || action(zone) < 0) return;
+            contacts.put(id, new Contact(zone, role, x, y, now, epoch));
+        }
+        /** {role, startX, startY} once this contact turns into a drag, else null. */
+        public float[] move(int id, float x, float y, float slop) {
+            Contact c = contacts.get(id);
+            if (c == null) return null;
+            if (!Float.isFinite(x) || !Float.isFinite(y)) { contacts.remove(id); return null; }
+            if (Math.hypot(x - c.startX, y - c.startY) <= slop) return null;
+            contacts.remove(id);
+            return new float[]{c.role, c.startX, c.startY};
+        }
+        public int up(int id, float x, float y, long now, Context current, float slop) {
+            Contact c = contacts.remove(id);
+            if (c == null || !Float.isFinite(x) || !Float.isFinite(y) || Math.hypot(x - c.startX, y - c.startY) > slop
+                    || now < c.started || now - c.started >= TAP_MS || c.epoch != current.epoch
+                    || !current.usable() || current.mode != GAMEPLAY) return NONE;
+            int action = action(c.zone);
+            return current.allows(action) ? action : NONE;
+        }
+        public static int action(int zone) {
+            switch (zone) {
+                case SKILL_ZONE: return SKILL;
+                case OBJECTIVES_ZONE: return LOGS;
+                case EXPERIENCE_ZONE: return SKILLS;
+                case CHALLENGE_ZONE: return CHALLENGES;
+                default: return NONE;
+            }
+        }
+        public void cancel() { contacts.clear(); }
     }
     public static float finiteClamp(float n, float lo, float hi) {
         return Float.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : lo;

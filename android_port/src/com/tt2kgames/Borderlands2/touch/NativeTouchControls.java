@@ -46,20 +46,21 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private static final String TAG = "BL2NativeTouch";
     private static final int MORE = -2, DONE = -3;
     private static final int LEGACY = 1000;
-    private static final int[] RADIAL = {NEXT_WEAPON, SKILL, CROUCH, MELEE, INVENTORY, MAP, PREV_WEAPON, RELOAD, CHAT};
-    private static final String[] RADIAL_EN = {"Weapon", "Skill", "Crouch", "Melee", "Inventory", "Map", "Previous", "Reload", "Chat"};
-    private static final String[] RADIAL_RU = {"Оружие", "Навык", "Присесть", "Удар", "Рюкзак", "Карта", "Предыдущее", "Зарядить", "Чат"};
+    // On foot; Give up exists only where InputSet_Injured offers Suicide (FFYL).
+    private static final int[] RADIAL = {NEXT_WEAPON, SKILL, CROUCH, MELEE, INVENTORY, MAP, PREV_WEAPON, RELOAD, SUICIDE, CHAT};
     // A vehicle seat's radial (review 4.4): Horn and Switch seat. Look back and
     // Turret are holds: a second finger on the open radial keeps them pressed.
     private static final int[] RADIAL_VEHICLE = {VEHICLE_HORN, SWITCH_SEATS, LOOK_BACK, DRIVER_FIRE_TURRET,
             INVENTORY, MAP, NEXT_WEAPON, RELOAD, CHAT};
-    private static final String[] RADIAL_VEHICLE_EN = {"Horn", "Switch seat", "Look back", "Turret", "Inventory", "Map", "Weapon", "Reload", "Chat"};
-    private static final String[] RADIAL_VEHICLE_RU = {"Сигнал", "Пересесть", "Оглянуться", "Турель", "Рюкзак", "Карта", "Оружие", "Зарядить", "Чат"};
+    /** Give up acts only after its sector is held this long. */
+    private static final long CONFIRM_HOLD_MS = 1000;
     private static final long STALE_MS = 1000;
     private static final int HINT_MAP = TouchPreferences.HINT_MAP, HINT_WEAPON = TouchPreferences.HINT_WEAPON,
             HINT_GAME_MORE = TouchPreferences.HINT_GAME_MORE, HINT_MENU_MORE = TouchPreferences.HINT_MENU_MORE,
             HINT_DEBUG_MORE = TouchPreferences.HINT_DEBUG_MORE, HINT_AUTORUN = TouchPreferences.HINT_AUTORUN,
-            HINT_MAP_NAVIGATION = TouchPreferences.HINT_MAP_NAVIGATION, HINT_LAYOUT = TouchPreferences.HINT_LAYOUT;
+            HINT_MAP_NAVIGATION = TouchPreferences.HINT_MAP_NAVIGATION, HINT_LAYOUT = TouchPreferences.HINT_LAYOUT,
+            HINT_SLOTS = TouchPreferences.HINT_SLOTS, HINT_SKILL_TAP = TouchPreferences.HINT_SKILL_TAP,
+            HINT_STATUS_TAPS = TouchPreferences.HINT_STATUS_TAPS;
     private static volatile WeakReference<NativeTouchControls> active = new WeakReference<>(null);
     private static final class Button {
         final int action;
@@ -87,8 +88,14 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     });
     private final TouchPreferences preferences;
     private final TouchInput.HudGesture hudGesture = new TouchInput.HudGesture();
+    private final TouchInput.HudTaps hudTaps = new TouchInput.HudTaps();
     private final SparseArray<RectF> hudPointers = new SparseArray<>();
     private final RectF mapTarget = new RectF(), ammoTarget = new RectF(), useTarget = new RectF();
+    private final RectF skillTarget = new RectF(), experienceTarget = new RectF(),
+            challengeTarget = new RectF(), objectiveTarget = new RectF();
+    /** Weapon-slot cells while a hold on the ammo strip keeps them open. */
+    private float[][] slotCells;
+    private int slotSelection = -1;
     private final SensorManager sensorManager;
     private final Sensor aimSensor;
     private final TouchGyro gyro = new TouchGyro();
@@ -99,7 +106,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private final ArrayList<Button> buttons = new ArrayList<>();
     private final ArrayList<Button> radialButtons = new ArrayList<>();
     private final SparseArray<Button> utilityPointers = new SparseArray<>();
-    private final int[] moveVisualBefore = new int[8], moveVisualAfter = new int[8];
+    private final int[] moveVisualBefore = new int[9], moveVisualAfter = new int[9];
     private final SparseArray<Integer> legacyPointers = new SparseArray<>();
     private final SparseArray<Boolean> legacyKeys = new SparseArray<>();
     private final ArrayList<float[]> occupied = new ArrayList<>();
@@ -129,10 +136,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private boolean nativeRoute, imeVisible;
     private boolean fallback, radialOpen, radialDragged;
     private long legacyHeld;
-    private float fallbackYaw, fallbackPitch, radialX,radialY,radialRadius,radialStartX,radialStartY;
+    private float fallbackYaw, fallbackPitch, radialX,radialY,radialRadius,radialItemRadius,radialStartX,radialStartY;
     private int radialPointer=-1, radialSelection=-1, radialCount=8;
     private int[] radial=RADIAL;
-    private long radialStarted;
+    private long radialStarted, radialSelectedAt;
     private String hintText;
     private long hintUntil;
     private int hintKind;
@@ -292,7 +299,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 uiPointers.clear(); menuPointer = -1; editPointer = -1; editButton = null;
                 if(!next.gameplay()) editing=false;
                 closeRadial(); utilityPointers.clear(); legacyPointers.clear();
-                hudGesture.cancel(); hudPointers.clear(); hintUntil = 0;
+                hudGesture.cancel(); hudTaps.cancel(); closeSlots(); hudPointers.clear(); hintUntil = 0;
                 LaunchControls.cancel(activity);
             }
             fallback=nextFallback;
@@ -307,7 +314,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                     || context.grenadeCount != next.grenadeCount || context.hudValidMask != next.hudValidMask
                     || !Arrays.equals(context.mapRect,next.mapRect) || !Arrays.equals(context.ammoRect,next.ammoRect)
                     || !Arrays.equals(context.objectiveRect,next.objectiveRect)
-                    || !Arrays.equals(context.useRect,next.useRect)) layoutDirty = true;
+                    || !Arrays.equals(context.useRect,next.useRect) || !Arrays.equals(context.skillRect,next.skillRect)
+                    || !Arrays.equals(context.experienceRect,next.experienceRect)
+                    || !Arrays.equals(context.challengeRect,next.challengeRect)
+                    || context.weaponSlots != next.weaponSlots) layoutDirty = true;
             context = next; eligible = nextEligible;
             // Main menu versus a loaded world, for the restart warning.
             if (context.mode == FRONTEND) inWorld = false;
@@ -329,12 +339,17 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if ((hintKind == HINT_MAP && (!context.gameplay() || mapTarget.isEmpty() || !context.allows(MAP)))
                     || (hintKind == HINT_WEAPON && (context.mode != GAMEPLAY || ammoTarget.isEmpty() || context.weaponCount < 2
                     || !context.allows(NEXT_WEAPON) || !context.allows(PREV_WEAPON)))
-                    || (hintKind == HINT_MAP_NAVIGATION && !context.has(MAP_GESTURES))) {
+                    || (hintKind == HINT_MAP_NAVIGATION && !context.has(MAP_GESTURES))
+                    || ((hintKind == HINT_SLOTS || hintKind == HINT_SKILL_TAP || hintKind == HINT_STATUS_TAPS)
+                    && context.mode != GAMEPLAY)) {
                 hintKind = 0; hintUntil = 0; invalidate();
             }
             if (eligible && !editing) {
                 int hudAction = hudGesture.poll(now,context);
                 if (hudAction >= 0) activate(nextLegacyId++,hudAction,0,0);
+                if (hudGesture.slotHoldDue(now,context,dp(14))) openSlots();
+                if (!hudGesture.slotsOpen() && slotCells != null) { closeSlots(); invalidate(); }
+                confirmRadialHold(now);
                 offerHudHint(now);
             }
         } catch (UnsatisfiedLinkError error) {
@@ -477,6 +492,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         hudTarget(mapTarget,context.mapRect,context.hudMap());
         hudTarget(ammoTarget,context.ammoRect,context.hudAmmo());
         hudTarget(useTarget,context.useRect,context.hudUse() && context.known(USE) && context.allows(USE));
+        hudTarget(skillTarget,context.skillRect,context.hudSkill());
+        hudTarget(experienceTarget,context.experienceRect,context.hudExperience());
+        hudTarget(challengeTarget,context.challengeRect,context.hudChallenge());
+        hudTarget(objectiveTarget,context.objectiveRect,context.hudObjectives());
         if (!eligible) return;
         if (context.gameplay()) {
             // HUD follows the full Surface; insets and left-hand mode affect
@@ -485,9 +504,9 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                     !ammoTarget.isEmpty() || confirmedUnarmed(context),context.hudObjectivesKnown() && context.hudMap());
             if (context.hudObjectives()) TouchLayout.reserveSurfaceRect(context.objectiveRect,
                     viewport.left,viewport.top,viewport.right,viewport.bottom,hudReserved);
-            // The Action caption comes and goes with the aimed object. It stays
-            // tappable but never displaces controls: hovering only adds Action.
-            for (RectF rect : new RectF[]{mapTarget,ammoTarget}) if (!rect.isEmpty())
+            // The Action caption comes and goes with the aimed object, as does a
+            // challenge notice. They stay tappable but never displace controls.
+            for (RectF rect : new RectF[]{mapTarget,ammoTarget,skillTarget,experienceTarget}) if (!rect.isEmpty())
                 hudReserved.add(new float[]{rect.left,rect.top,rect.right,rect.bottom});
             addGameplay(PAUSE,label("Pause", "Пауза"));
             addGameplay(editing ? DONE : MORE,editing ? label("Done", "Готово") : label("More", "Ещё"));
@@ -517,56 +536,178 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             }
             add(CONFIRM,label("Select", "Выбрать"),110,36,56);
             if (expanded && context.has(UI_NAVIGATION)) {
-                add(UI_UP, label("Up", "Вверх"), 176, 96, 48); add(UI_DOWN, label("Down", "Вниз"), 176, 36, 48);
-                add(UI_LEFT, label("Left", "Влево"), 236, 36, 48); add(UI_RIGHT, label("Right", "Вправо"), 116, 36, 48);
-                if (context.has(DEBUG_CANVAS)) {
-                    add(RELOAD,label("Action X", "Действие X"),300,36,48); add(NEXT_WEAPON,label("Action Y", "Действие Y"),300,96,48);
-                    add(SKILL,label("Action R", "Действие R"),360,36,48); add(SPRINT,label("Action L", "Действие L"),360,96,48);
-                    add(PREV_WEAPON,label("Tab −", "Вкладка −"),236,156,48); add(INVENTORY,label("Tab +", "Вкладка +"),176,156,48);
-                } else {
-                    add(LEGACY+99,label("Action", "Действие"),300,36,48); add(LEGACY+100,label("Other", "Другое"),300,96,48);
-                    add(LEGACY+102,label("Tab −", "Вкладка −"),360,36,48); add(LEGACY+103,label("Tab +", "Вкладка +"),360,96,48);
+                int[] commands=menuCommands(context,fallback,touchExploration());
+                for (int i=0;i<commands.length;i++) {
+                    float[] at=menuCommandPlace(commands,i);
+                    add(commands[i],menuCommandLabel(commands[i]),at[0],at[1],48);
                 }
             }
         }
         if(radialOpen) buildRadial();
     }
+    /**
+     * More-panel keys in a menu: only what no gesture expresses. A drag scrolls
+     * lists and a sideways swipe changes tabs (native; the fallback swipes the
+     * D-pad), so X/Y stay (Debug: X/Y/R/L) plus the fallback's shoulder keys.
+     * TalkBack consumes swipes, so with touch exploration every key stays.
+     */
+    static int[] menuCommands(Context c,boolean fallback,boolean touchExploration) {
+        if (c.has(DEBUG_CANVAS)) return touchExploration
+                ? new int[]{UI_UP,UI_DOWN,UI_LEFT,UI_RIGHT,RELOAD,NEXT_WEAPON,SKILL,SPRINT,PREV_WEAPON,INVENTORY}
+                : new int[]{RELOAD,NEXT_WEAPON,SKILL,SPRINT};
+        if (fallback) return touchExploration
+                ? new int[]{UI_UP,UI_DOWN,UI_LEFT,UI_RIGHT,LEGACY+99,LEGACY+100,LEGACY+102,LEGACY+103}
+                : new int[]{LEGACY+99,LEGACY+100,LEGACY+102,LEGACY+103};
+        return touchExploration
+                ? new int[]{UI_UP,UI_DOWN,UI_LEFT,UI_RIGHT,UI_ACTION,UI_OTHER,UI_PREVIOUS_TAB,UI_NEXT_TAB}
+                : new int[]{UI_ACTION,UI_OTHER};
+    }
+    /** dp from the right and bottom edges: two columns beside Select, or the full TalkBack panel. */
+    static float[] menuCommandPlace(int[] commands,int index) {
+        if (commands.length == 0 || commands[0] != UI_UP) return new float[]{176+60*(index/2),36+60*(index%2)};
+        switch (commands[index]) {
+            case UI_UP: return new float[]{176,96};
+            case UI_DOWN: return new float[]{176,36};
+            case UI_LEFT: return new float[]{236,36};
+            case UI_RIGHT: return new float[]{116,36};
+            case PREV_WEAPON: return new float[]{236,156};
+            case INVENTORY: return new float[]{176,156};
+            default: return new float[]{300+60*((index-4)/2),36+60*((index-4)%2)};
+        }
+    }
+    private String menuCommandLabel(int action) {
+        switch (action) {
+            case UI_UP: return label("Up", "Вверх");
+            case UI_DOWN: return label("Down", "Вниз");
+            case UI_LEFT: return label("Left", "Влево");
+            case UI_RIGHT: return label("Right", "Вправо");
+            case RELOAD: return label("Action X", "Действие X");
+            case NEXT_WEAPON: return label("Action Y", "Действие Y");
+            case SKILL: return label("Action R", "Действие R");
+            case SPRINT: return label("Action L", "Действие L");
+            case UI_ACTION: case LEGACY+99: return label("Action", "Действие");
+            case UI_OTHER: case LEGACY+100: return label("Other", "Другое");
+            case PREV_WEAPON: case UI_PREVIOUS_TAB: case LEGACY+102: return label("Tab −", "Вкладка −");
+            default: return label("Tab +", "Вкладка +");
+        }
+    }
+    private boolean touchExploration() {
+        AccessibilityManager manager=(AccessibilityManager)activity.getSystemService(android.content.Context.ACCESSIBILITY_SERVICE);
+        return manager != null && manager.isTouchExplorationEnabled();
+    }
     private void buildRadial() {
         radialButtons.clear();
-        String[] labels=radial==RADIAL_VEHICLE ? (russian?RADIAL_VEHICLE_RU:RADIAL_VEHICLE_EN) : (russian?RADIAL_RU:RADIAL_EN);
         for(int i=0;i<radialCount;i++) {
             int a=radial[i];
             if (!radialAvailable(a)) continue;
             double angle=i*Math.PI*2/radialCount-Math.PI/2;
-            float x=radialX+(float)Math.cos(angle)*radialRadius,y=radialY+(float)Math.sin(angle)*radialRadius,s=dp(25);
-            radialButtons.add(new Button(a,labels[i],new RectF(x-s,y-s,x+s,y+s),dp(2)));
+            float x=radialX+(float)Math.cos(angle)*radialRadius,y=radialY+(float)Math.sin(angle)*radialRadius,s=radialItemRadius;
+            radialButtons.add(new Button(a,radialLabel(a,russian),new RectF(x-s,y-s,x+s,y+s),dp(2)));
         }
     }
-    private boolean radialAvailable(int action) {
+    private boolean radialAvailable(int action) { return radialAvailable(context,fallback,action); }
+    static boolean radialAvailable(Context context,boolean fallback,int action) {
         return context.allows(action) && !(fallback && action == PREV_WEAPON)
                 && !(action == CHAT && (fallback || !context.gameplay()))
                 && !(context.weaponCount >= 0 && context.weaponCount < 2 && (action == NEXT_WEAPON || action == PREV_WEAPON));
     }
     static int[] radialActions(Context context) { return context.mode == VEHICLE ? RADIAL_VEHICLE : RADIAL; }
+    /**
+     * The radial adapts to the ways that already work (review section 5): no
+     * unavailable item, no Map while the minimap tap opens it, no Reload while
+     * its button or the ammo strip reloads; seat items exist only in a seat and
+     * Give up only where FFYL offers it. Fewer sectors make larger targets.
+     */
+    static int[] radialItems(Context context,boolean fallback,boolean mapTap,boolean reloadElsewhere) {
+        int[] base=radialActions(context),items=new int[base.length];
+        int count=0;
+        if (!context.usable()) return new int[0];
+        for (int action:base) {
+            if (!radialAvailable(context,fallback,action) || (action == MAP && mapTap)
+                    || (action == RELOAD && reloadElsewhere)) continue;
+            items[count++]=action;
+        }
+        return Arrays.copyOf(items,count);
+    }
+    static String radialLabel(int action,boolean ru) {
+        switch (action) {
+            case NEXT_WEAPON: return ru ? "Оружие" : "Weapon";
+            case SKILL: return ru ? "Навык" : "Skill";
+            case CROUCH: return ru ? "Присесть" : "Crouch";
+            case MELEE: return ru ? "Удар" : "Melee";
+            case INVENTORY: return ru ? "Рюкзак" : "Inventory";
+            case MAP: return ru ? "Карта" : "Map";
+            case PREV_WEAPON: return ru ? "Предыдущее" : "Previous";
+            case RELOAD: return ru ? "Зарядить" : "Reload";
+            case SUICIDE: return ru ? "Сдаться" : "Give up";
+            case CHAT: return ru ? "Чат" : "Chat";
+            case VEHICLE_HORN: return ru ? "Сигнал" : "Horn";
+            case SWITCH_SEATS: return ru ? "Пересесть" : "Switch seat";
+            case LOOK_BACK: return ru ? "Оглянуться" : "Look back";
+            case DRIVER_FIRE_TURRET: return ru ? "Турель" : "Turret";
+            default: return "";
+        }
+    }
     /** Radial items a second finger holds like a button (Turret fire, Look back). */
     static boolean radialHold(int action) { return action == LOOK_BACK || action == DRIVER_FIRE_TURRET; }
-    static int radialActionCount(Context context,boolean fallback) {
-        return !fallback && context.usable() && context.gameplay() && context.allows(CHAT) ? 9 : 8;
+    /** Radial items that act only after their sector is held (Give up). */
+    static boolean radialConfirm(int action) { return action == SUICIDE; }
+    /** Item radius: 25dp at nine sectors, growing as fewer share the ring, up to 32dp. */
+    static float radialItemRadius(float ringRadius,int count,float density) {
+        float spacing=(float)(Math.PI*ringRadius/Math.max(1,count))-4*density;
+        return Math.max(25*density,Math.min(32*density,spacing));
     }
     private void openRadial(int id,float x,float y) {
-        radialOpen=true; radialPointer=id; radialSelection=-1; radialDragged=false;
-        radialStartX=x; radialStartY=y; radialStarted=SystemClock.uptimeMillis();
-        // Capture the count once: a live availability change must not rotate
+        // Capture the items once: a live availability change must not rotate
         // the other sectors underneath an already held finger.
-        radialCount=radialActionCount(context,fallback);
-        radial=radialActions(context);
+        boolean mapTap=!fallback && !mapTarget.isEmpty() && context.allows(MAP);
+        boolean ammoBar=!ammoTarget.isEmpty();
+        boolean reloadElsewhere=reloadButtonShown(context,ammoBar,false,preferences.reloadButton)
+                || (!fallback && context.mode == GAMEPLAY && ammoBar && context.known(RELOAD));
+        int[] items=radialItems(context,fallback,mapTap,reloadElsewhere);
+        if (items.length == 0) return;
+        radialOpen=true; radialPointer=id; radialSelection=-1; radialDragged=false; radialSelectedAt=0;
+        radialStartX=x; radialStartY=y; radialStarted=SystemClock.uptimeMillis();
+        radial=items; radialCount=items.length;
         radialRadius=Math.min(dp(94),Math.min(safe.width(),safe.height())/2-dp(30));
-        float margin=radialRadius+dp(27);
+        radialItemRadius=radialItemRadius(radialRadius,radialCount,dp(1));
+        float margin=radialRadius+radialItemRadius+dp(2);
         radialX=Math.max(safe.left+margin,Math.min(safe.right-margin,x));
         radialY=Math.max(safe.top+margin,Math.min(safe.bottom-margin,y));
         buildRadial(); haptic(HapticFeedbackConstants.VIRTUAL_KEY);
     }
-    private void closeRadial() { radialOpen=false;radialPointer=-1;radialSelection=-1;radialButtons.clear(); }
+    private void closeRadial() { radialOpen=false;radialPointer=-1;radialSelection=-1;radialSelectedAt=0;radialButtons.clear(); }
+    /** Give up acts once the finger has stayed on its sector for a second. */
+    private void confirmRadialHold(long now) {
+        if (!radialOpen || radialPointer<0 || radialSelection<0 || radialSelectedAt==0
+                || !radialConfirm(radial[radialSelection])) return;
+        if (now-radialSelectedAt < CONFIRM_HOLD_MS) { invalidate(); return; }
+        int action=radial[radialSelection];
+        closeRadial();
+        if (radialAvailable(action)) activate(nextLegacyId++,action,0,0);
+        haptic(HapticFeedbackConstants.LONG_PRESS);
+        invalidate();
+    }
+    private void openSlots() {
+        slotCells=TouchLayout.slotCells(new float[]{ammoTarget.left,ammoTarget.top,ammoTarget.right,ammoTarget.bottom},
+                safe.left,safe.top,safe.right,safe.bottom,dp(1));
+        slotSelection=-1;
+        if (slotCells == null) { hudGesture.cancel(); return; }
+        haptic(HapticFeedbackConstants.LONG_PRESS);
+        invalidate();
+    }
+    private void closeSlots() { slotCells=null; slotSelection=-1; }
+    static String slotTypeLabel(int type,boolean ru) {
+        switch (type) {
+            case 1: return ru ? "Пистолет" : "Pistol";
+            case 2: return ru ? "Дробовик" : "Shotgun";
+            case 3: return ru ? "ПП" : "SMG";
+            case 4: return ru ? "Снайперская" : "Sniper";
+            case 5: return ru ? "Штурмовая" : "Rifle";
+            case 6: return ru ? "РПГ" : "Launcher";
+            default: return "";
+        }
+    }
     private void clearMenuMoreHold() { menuMorePointer=-1;menuMoreButton=null;menuMoreStarted=menuMoreEpoch=0; }
     private void clearMenuMore() { clearMenuMoreHold();expanded=false;menuExpandedUntil=0; }
     private void openMenuCommands(long now) {
@@ -589,7 +730,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (context.has(MAP_GESTURES)) showHint("Drag the map, pinch to zoom. Waypoint marks the centre; hold a place to mark it",
                 "Двигайте карту, щипок — масштаб. «Маршрутная точка» — метка в центре, удержание — под пальцем",HINT_MAP_NAVIGATION);
         else if (context.has(DEBUG_CANVAS)) showHint("Tap rows; swipe lists and tabs. Hold More for actions", "Тапы — выбор; свайпы — списки и вкладки. Удерживайте «Ещё» для действий",HINT_DEBUG_MORE);
-        else showHint("Tap to select, tap again to change. Swipe lists; hold More for actions", "Тап — выбор, повторный — изменение. Свайп — список; удерживайте «Ещё» для действий",HINT_MENU_MORE);
+        else showHint("Tap to select, tap again to change. Drag lists, swipe sideways for tabs; hold More for actions",
+                "Тап — выбор, повторный — изменение. Ведите по списку, свайп вбок — вкладки; удерживайте «Ещё» для действий",HINT_MENU_MORE);
     }
     private Button hit(float x, float y) {
         if(radialOpen) for(Button b:radialButtons) if(b.contains(x,y)) return b;
@@ -607,7 +749,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         hintText=label(english,ru); hintKind=kind; hintUntil=SystemClock.uptimeMillis()+4500;
         invalidate(); postInvalidateDelayed(4500);
     }
-    private void moreHint() { showHint("Crouch, melee, reload, inventory: hold More and drag", "Присесть, удар, перезарядка, рюкзак: удерживайте «Ещё» и сдвиньте палец",HINT_GAME_MORE); }
+    private void moreHint() { showHint("Crouch, melee, inventory: hold More and drag", "Присесть, удар, рюкзак: удерживайте «Ещё» и сдвиньте палец",HINT_GAME_MORE); }
     private void offerHudHint(long now) {
         if (!context.gameplay() || fallback || radialOpen || now < hintUntil) return;
         if (!preferences.mapTapHintSeen && !mapTarget.isEmpty() && context.allows(MAP))
@@ -615,6 +757,43 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         else if (!preferences.weaponGestureHintSeen && context.mode == GAMEPLAY && context.weaponCount >= 2 && !ammoTarget.isEmpty()
                 && context.allows(NEXT_WEAPON) && context.allows(PREV_WEAPON))
             showHint("Ammo: swipe to switch; double-tap returns after a switch", "Патроны: свайп — смена; двойной тап — возврат после смены",HINT_WEAPON);
+        else if (!preferences.weaponSlotsHintSeen && preferences.weaponGestureHintSeen && context.mode == GAMEPLAY
+                && context.weaponCount >= 2 && !ammoTarget.isEmpty() && context.slotsKnown())
+            showHint("Hold the ammo strip to pick a weapon slot", "Удерживайте полосу патронов, чтобы выбрать слот оружия",HINT_SLOTS);
+        else if (!preferences.skillTapHintSeen && context.mode == GAMEPLAY && !skillTarget.isEmpty() && context.allows(SKILL))
+            showHint("Tap the skill icon to use your action skill", "Тап по значку навыка применяет навык",HINT_SKILL_TAP);
+        else if (!preferences.statusTapsHintSeen && context.mode == GAMEPLAY && !objectiveTarget.isEmpty()
+                && !experienceTarget.isEmpty() && context.allows(LOGS) && context.allows(SKILLS))
+            showHint("Tap the missions for the log, the XP bar for skills", "Тап по заданиям — журнал, по полосе опыта — навыки",HINT_STATUS_TAPS);
+    }
+    private void drawSlots(Canvas canvas) {
+        if (slotCells == null || !hudGesture.slotsOpen()) return;
+        paint.setTextAlign(Paint.Align.CENTER);
+        for (int i=0;i<slotCells.length;++i) {
+            float[] c=slotCells[i];
+            boolean selectable=TouchInput.HudGesture.slotSelectable(context,i);
+            boolean equipped=context.equippedSlot()==i+1, chosen=i==slotSelection && selectable;
+            boolean empty=context.slotsKnown() && !context.slotOccupied(i);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(chosen ? 0xFFFFD569 : Color.BLACK);
+            paint.setAlpha(chosen ? 255 : empty ? 120 : 210);
+            canvas.drawRoundRect(c[0],c[1],c[2],c[3],dp(10),dp(10),paint);
+            if (equipped) {
+                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(dp(2)); paint.setColor(0xFFFFD569); paint.setAlpha(255);
+                canvas.drawRoundRect(c[0],c[1],c[2],c[3],dp(10),dp(10),paint);
+                paint.setStyle(Paint.Style.FILL);
+            }
+            int ink=chosen ? Color.BLACK : Color.WHITE, alpha=selectable || equipped ? 255 : 110;
+            paint.setColor(ink); paint.setAlpha(alpha); paint.setTextSize(dp(18));
+            float cx=(c[0]+c[2])/2;
+            canvas.drawText(Integer.toString(i+1),cx,c[1]+dp(24),paint);
+            String type=empty ? "—" : slotTypeLabel(context.slotType(i),russian);
+            if (!type.isEmpty()) {
+                paint.setTextSize(dp(10));
+                float measured=paint.measureText(type),available=c[2]-c[0]-dp(6);
+                if (measured > available) paint.setTextSize(dp(10)*available/measured);
+                canvas.drawText(type,cx,c[3]-dp(10),paint);
+            }
+        }
     }
     private void drawHint(Canvas canvas) {
         if (hintText == null || SystemClock.uptimeMillis() >= hintUntil) return;
@@ -660,10 +839,18 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
         if(radialOpen) {
             paint.setStyle(Paint.Style.FILL);paint.setColor(0xE6222830);paint.setAlpha(235);
-            canvas.drawCircle(radialX,radialY,radialRadius+dp(29),paint);
+            canvas.drawCircle(radialX,radialY,radialRadius+radialItemRadius+dp(4),paint);
             for(Button b:radialButtons) {
                 boolean selected=radialSelection>=0 && radial[radialSelection]==b.action;
                 paint.setColor(selected?0xFFFFD569:0xFF454F5D);canvas.drawCircle(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,paint);
+                if (selected && radialConfirm(b.action) && radialSelectedAt>0) {
+                    // Give up fills a ring while it is held; lifting early cancels.
+                    float progress=Math.min(1f,(SystemClock.uptimeMillis()-radialSelectedAt)/(float)CONFIRM_HOLD_MS);
+                    paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(dp(3));paint.setColor(0xFFE0483A);
+                    RectF ring=new RectF(b.rect);ring.inset(-dp(3),-dp(3));
+                    canvas.drawArc(ring,-90,360*progress,false,paint);
+                    paint.setStyle(Paint.Style.FILL);
+                }
                 paint.setColor(selected?Color.BLACK:Color.WHITE);paint.setTextSize(dp(10));paint.setTextAlign(Paint.Align.CENTER);
                 float measured=paint.measureText(b.label),available=b.rect.width()-dp(8);
                 if (measured > available) paint.setTextSize(dp(10)*available/measured);
@@ -673,6 +860,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             canvas.drawText(label("Choose", "Выберите"),radialX,radialY-dp(3),paint);
             canvas.drawText(label("action", "действие"),radialX,radialY+dp(12),paint);
         }
+        drawSlots(canvas);
         drawHint(canvas);
         canvas.restore();
     }
@@ -713,12 +901,20 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 int selected=radialDragged?TouchLayout.radialSector(x,y,radialX,radialY,radialRadius,radialCount):-1;
                 boolean tap=!radialDragged && SystemClock.uptimeMillis()-radialStarted<300;
                 closeRadial();
-                if (selected >= 0 && radialAvailable(radial[selected])) activate(id,radial[selected],x,y);
+                // Give up acts only from confirmRadialHold; an early release explains why.
+                if (selected >= 0 && radialConfirm(radial[selected]))
+                    showHint("Hold Give up for a second", "Удерживайте «Сдаться» секунду",0);
+                else if (selected >= 0 && radialAvailable(radial[selected])) activate(id,radial[selected],x,y);
                 else if (tap) moreHint();
             } else if (hudGesture.owns(id)) {
                 RectF rect=hudPointers.get(id); hudPointers.remove(id);
                 boolean inside=rect != null && (hudGesture.zone(id) == TouchInput.HudGesture.AMMO_ZONE ? safe.contains(x,y) : rect.contains(x,y));
-                int command=hudGesture.up(id,x,y,SystemClock.uptimeMillis(),context,inside,dp(14));
+                int slot=hudGesture.slotsOpen() ? TouchLayout.slotAt(x,y,slotCells,dp(1)) : -1;
+                int command=hudGesture.up(id,x,y,SystemClock.uptimeMillis(),context,inside,dp(14),slot);
+                if (!hudGesture.slotsOpen()) closeSlots();
+                if (command >= 0) activate(id,command,x,y);
+            } else if (hudTaps.owns(id)) {
+                int command=hudTaps.up(id,x,y,SystemClock.uptimeMillis(),context,dp(14));
                 if (command >= 0) activate(id,command,x,y);
             } else if(utilityPointers.get(id)!=null) {
                 Button b=utilityPointers.get(id);
@@ -821,8 +1017,25 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                     input.stickX(),input.stickY(),dp(60*preferences.scale),dp(8));
             if (stopTarget) input.stopRunning();
             boolean movement = stopTarget || (nx < .40f && y > safe.top + safe.height()*.35f);
+            int zone = stopTarget || fallback ? 0 : tapZone(x,y);
+            if (zone > 0) {
+                // Still tap: skill or a status tab. Dragged: the same stick or
+                // camera this touch would have started, from where it went down.
+                hudTaps.down(id,zone,movement ? TouchInput.MOVEMENT : TouchInput.LOOK,x,y,
+                        SystemClock.uptimeMillis(),context.epoch);
+                return;
+            }
             input.down(id, movement ? TouchInput.MOVEMENT : TouchInput.LOOK, -1, x, y);
         }
+    }
+    /** Tap-only HUD target under a new touch, while its action is available. */
+    private int tapZone(float x,float y) {
+        if (context.mode != GAMEPLAY) return 0;
+        if (challengeTarget.contains(x,y) && context.allows(CHALLENGES)) return TouchInput.HudTaps.CHALLENGE_ZONE;
+        if (skillTarget.contains(x,y) && context.allows(SKILL)) return TouchInput.HudTaps.SKILL_ZONE;
+        if (objectiveTarget.contains(x,y) && context.allows(LOGS)) return TouchInput.HudTaps.OBJECTIVES_ZONE;
+        if (experienceTarget.contains(x,y) && context.allows(SKILLS)) return TouchInput.HudTaps.EXPERIENCE_ZONE;
+        return 0;
     }
     // What onDraw shows that a touch move can change: held buttons, the radial
     // selection, utility holds, and the stick with its knob in whole pixels.
@@ -837,9 +1050,24 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         out[5] = moving ? Math.round(input.stickY()) : 0;
         out[6] = moving ? Math.round(input.moveX() * reach) : 0;
         out[7] = moving ? Math.round(input.moveY() * reach) : 0;
+        out[8] = slotCells != null ? slotSelection : -2;
     }
     private void move(int id, float x, float y) {
-        if (hudGesture.owns(id)) { hudGesture.move(id,x,y); return; }
+        if (hudGesture.owns(id)) {
+            hudGesture.move(id,x,y);
+            if (hudGesture.slotsOpen() && slotCells != null) {
+                int slot=TouchLayout.slotAt(x,y,slotCells,dp(1));
+                if (!TouchInput.HudGesture.slotSelectable(context,slot)) slot=-1;
+                if (slot != slotSelection && slot >= 0) haptic(HapticFeedbackConstants.CLOCK_TICK);
+                slotSelection=slot;
+            }
+            return;
+        }
+        if (hudTaps.owns(id)) {
+            float[] drag=hudTaps.move(id,x,y,dp(14));
+            if (drag != null) { input.down(id,(int)drag[0],-1,drag[1],drag[2]); input.move(id,x,y); }
+            return;
+        }
         if (id==menuMorePointer) {
             if (menuMoreButton==null || !menuMoreButton.contains(x,y)) {utilityPointers.remove(id);clearMenuMoreHold();}
             return;
@@ -848,7 +1076,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if(Math.hypot(x-radialStartX,y-radialStartY)>dp(12)) radialDragged=true;
             int selected=radialDragged?TouchLayout.radialSector(x,y,radialX,radialY,radialRadius,radialCount):-1;
             if(selected>=0 && !radialAvailable(radial[selected])) selected=-1;
-            if(selected!=radialSelection && selected>=0) haptic(HapticFeedbackConstants.CLOCK_TICK);
+            if(selected!=radialSelection) {
+                if (selected>=0) haptic(HapticFeedbackConstants.CLOCK_TICK);
+                radialSelectedAt=selected>=0 && radialConfirm(radial[selected]) ? SystemClock.uptimeMillis() : 0;
+            }
             radialSelection=selected;return;
         }
         if(utilityPointers.get(id)!=null || legacyPointers.get(id)!=null) return;
@@ -870,8 +1101,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private void activate(int id,int action,float x,float y) {
         if(action==MORE) {
             if(context.gameplay()) {
-                AccessibilityManager manager=(AccessibilityManager)activity.getSystemService(android.content.Context.ACCESSIBILITY_SERVICE);
-                if (manager != null && manager.isTouchExplorationEnabled()) openRadial(-1,x,y); else moreHint();
+                if (touchExploration()) openRadial(-1,x,y); else moreHint();
             } else {clearMenuMore();buildButtons();menuMoreHint();}
             return;
         }
@@ -1083,7 +1313,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         stopSensor();
         accessibilityFocus=hoverTarget=View.NO_ID;
         closeRadial();clearMenuMore();utilityPointers.clear();legacyPointers.clear();
-        hudGesture.cancel(); hudPointers.clear(); hintUntil = 0;
+        hudGesture.cancel(); hudTaps.cancel(); closeSlots(); hudPointers.clear(); hintUntil = 0;
         uiPointers.clear(); menuPointer = -1; editPointer=-1; editButton=null; eligible=false; layoutDirty=true;
         if (!linkageFailed) {
             try { input.cancel(); } catch (UnsatisfiedLinkError error) {

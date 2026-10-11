@@ -15,9 +15,17 @@ constexpr std::uint32_t kUiNavigation = 1u << 5;
 constexpr std::uint32_t kUiTapTest = 1u << 6;
 constexpr std::uint64_t kUiActions = actionBit(Action::Back) | actionBit(Action::Confirm) |
     actionBit(Action::UiUp) | actionBit(Action::UiDown) |
-    actionBit(Action::UiLeft) | actionBit(Action::UiRight);
+    actionBit(Action::UiLeft) | actionBit(Action::UiRight) |
+    actionBit(Action::UiAction) | actionBit(Action::UiOther) |
+    actionBit(Action::UiPreviousTab) | actionBit(Action::UiNextTab);
+// A vertical menu drag sends one list step per this share of the Surface height.
+constexpr float kUiScrollPitch = .06f;
 
-struct UiTap { float x = 0, y = 0; int scrollDirection = 0; };
+// One menu command from a pointer sequence, always at the DOWN point: a tap;
+// whole list steps while a vertical drag moves (+ = next row: the finger moved
+// up and the content follows it); or one tab when a horizontal swipe ends
+// (+ = next: the finger moved left).
+struct UiTap { float x = 0, y = 0; int scrollDirection = 0; int tabDirection = 0; };
 
 struct UiPauseResumeIdentity {
     std::uint64_t engine=0,local=0,controller=0,pawn=0,world=0,owner=0,list=0;
@@ -95,6 +103,9 @@ public:
     std::optional<Action> action(const ActionEdge& edge);
     std::optional<UiTap> pointer(const PointerEvent& event);
     bool ownsPointer(std::int32_t id) const { return valid_ && primary_ == id && !cancelled_ && !held_; }
+    // Past the slop a swipe-navigation drag scrolls or changes tabs; it no
+    // longer points at a widget under the finger.
+    bool dragging() const { return axis_ != 0; }
     void clear();
 private:
     int find(std::int32_t id) const;
@@ -104,7 +115,8 @@ private:
     std::uint64_t epoch_ = 0, scene_ = 0, held_ = 0;
     std::uint32_t width_ = 0, height_ = 0;
     std::int32_t primary_ = -1;
-    float startX_ = 0, startY_ = 0;
+    float startX_ = 0, startY_ = 0, anchorY_ = 0;
+    int axis_ = 0; // 0 undecided, 1 horizontal, 2 vertical
     bool valid_ = false, cancelled_ = false, keysCancelled_ = false;
     bool moved_ = false, swipeNavigation_ = false;
 };

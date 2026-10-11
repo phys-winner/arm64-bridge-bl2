@@ -67,6 +67,13 @@ int main() {
     assert(!Bl2TouchCinematicActions(Mode::Gameplay,0,Names{"InputContext_OnFoot"}));
     assert(!Bl2TouchCinematicActions(Mode::Cinematic,0,Names{"InputContext_Cinematic","InputContext_InjuredClient"}));
     assert(!Bl2TouchGameplayActions(Mode::Cinematic,0,Names{"InputContext_Cinematic"}));
+    // A focused blocking online message is Loading (no overlay, no fallback);
+    // every other focused movie, reviewed or not, stays a menu.
+    assert(Bl2TouchFocusedMovieMode("OnlineMessageGFxMovie")==Mode::Loading);
+    for (const auto* movie:{"StatusMenuExGFxMovie","GearboxEULAGFxMovie","GammaScreenGFxMovie","onlinemessagegfxmovie",""})
+        assert(Bl2TouchFocusedMovieMode(movie)==Mode::Menu);
+    assert(!Bl2TouchGameplayActions(Mode::Loading,0x10000,Names{"InputContext_OnFoot"}));
+    assert(!Bl2TouchCinematicActions(Mode::Loading,0x10000,Names{"InputContext_Cinematic"}));
     // Empty, three or more, and foreign/fixture names (absent from the shipped
     // data, compared case-sensitively) publish nothing.
     for (const auto& rejected:{Names{},Names{"InputContext_OnFoot","InputContext_SirenOnFoot","InputContext_Injured"},

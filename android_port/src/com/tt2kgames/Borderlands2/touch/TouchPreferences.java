@@ -24,10 +24,10 @@ public final class TouchPreferences {
             "radialBlur", "anisotropy"};
     static final int HINT_MAP = 1, HINT_WEAPON = 2, HINT_GAME_MORE = 3,
             HINT_MENU_MORE = 4, HINT_DEBUG_MORE = 5, HINT_AUTORUN = 6,
-            HINT_MAP_NAVIGATION = 7, HINT_LAYOUT = 8;
+            HINT_MAP_NAVIGATION = 7, HINT_LAYOUT = 8, HINT_SLOTS = 9, HINT_SKILL_TAP = 10, HINT_STATUS_TAPS = 11;
     private static final String[] HINT_KEYS = {"", "mapTapHintSeen", "weaponGestureHintSeen",
             "gameMoreHintSeen", "menuMoreHintSeen", "debugMoreHintSeen", "autoRunHintSeen",
-            "mapNavigationHintSeen", "layoutHintSeen"};
+            "mapNavigationHintSeen", "layoutHintSeen", "weaponSlotsHintSeen", "skillTapHintSeen", "statusTapsHintSeen"};
     private final Activity activity;
     private final Properties store = new Properties();
     public float opacity, scale, look, ads;
@@ -45,6 +45,7 @@ public final class TouchPreferences {
     public boolean mapTapHintSeen, weaponGestureHintSeen;
     public boolean gameMoreHintSeen, menuMoreHintSeen, debugMoreHintSeen, autoRunHintSeen;
     public boolean mapNavigationHintSeen, layoutHintSeen;
+    public boolean weaponSlotsHintSeen, skillTapHintSeen, statusTapsHintSeen;
     private boolean debugMenuStored;
     public float gyroSensitivity, gyroDeadzone;
     /** In-memory preferences for host protocol checks. */
@@ -118,6 +119,9 @@ public final class TouchPreferences {
         autoRunHintSeen = Boolean.parseBoolean(store.getProperty("autoRunHintSeen", "false"));
         mapNavigationHintSeen = Boolean.parseBoolean(store.getProperty("mapNavigationHintSeen", "false"));
         layoutHintSeen = Boolean.parseBoolean(store.getProperty("layoutHintSeen", "false"));
+        weaponSlotsHintSeen = Boolean.parseBoolean(store.getProperty("weaponSlotsHintSeen", "false"));
+        skillTapHintSeen = Boolean.parseBoolean(store.getProperty("skillTapHintSeen", "false"));
+        statusTapsHintSeen = Boolean.parseBoolean(store.getProperty("statusTapsHintSeen", "false"));
         gyroSensitivity = TouchInput.finiteClamp(number("gyroSensitivity", 1), .25f, 3);
         gyroDeadzone = TouchInput.finiteClamp(number("gyroDeadzone", .4f), 0, 3);
     }
@@ -173,6 +177,9 @@ public final class TouchPreferences {
             case HINT_AUTORUN: return autoRunHintSeen;
             case HINT_MAP_NAVIGATION: return mapNavigationHintSeen;
             case HINT_LAYOUT: return layoutHintSeen;
+            case HINT_SLOTS: return weaponSlotsHintSeen;
+            case HINT_SKILL_TAP: return skillTapHintSeen;
+            case HINT_STATUS_TAPS: return statusTapsHintSeen;
             default: return false;
         }
     }
@@ -186,6 +193,9 @@ public final class TouchPreferences {
             case HINT_AUTORUN: autoRunHintSeen = true; break;
             case HINT_MAP_NAVIGATION: mapNavigationHintSeen = true; break;
             case HINT_LAYOUT: layoutHintSeen = true; break;
+            case HINT_SLOTS: weaponSlotsHintSeen = true; break;
+            case HINT_SKILL_TAP: skillTapHintSeen = true; break;
+            case HINT_STATUS_TAPS: statusTapsHintSeen = true; break;
             default: return;
         }
         store.setProperty(HINT_KEYS[kind], "true");

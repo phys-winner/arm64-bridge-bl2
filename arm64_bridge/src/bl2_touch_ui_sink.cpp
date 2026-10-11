@@ -852,7 +852,33 @@ struct Ue3UiSink::State {
         }
     }
     void key(Action action) {
+        // The gamepad face and shoulder keys keep the footer's case-insensitive
+        // spelling check; the six navigation keys were matched exactly in prepare.
+        switch(action) {
+        case Action::UiAction:keyName(0x0300A340,"XboxTypeS_X");return;
+        case Action::UiOther:keyName(0x0300A348,"XboxTypeS_Y");return;
+        case Action::UiPreviousTab:keyName(0x0300A350,"XboxTypeS_LeftShoulder");return;
+        case Action::UiNextTab:keyName(0x0300A358,"XboxTypeS_RightShoulder");return;
+        default:break;
+        }
         for(const auto& key:keys) if(key.action==action) {keyName(key.rva,key.name);return;}
+    }
+    // Vertical drag: one Up/Down per pitch. The age gate and a footer word own
+    // the gesture they started on; their UP clears them without a command.
+    void scroll(int steps) {
+        if (!current() || !(frameTarget.capabilities & kUiTapTest) || ageGateGesture || footerTarget) return;
+        const auto target=frameTarget;
+        for (int i=0;i<std::abs(steps) && current();++i) key(steps>0 ? Action::UiDown : Action::UiUp);
+        networkDiagnostic(target,"swipe",steps);
+    }
+    // Horizontal swipe: LB/RB where the movie's own handler pages tabs or
+    // panels with them, otherwise Left/Right as on the D-pad.
+    void tab(int direction) {
+        if (!current() || !(frameTarget.capabilities & kUiTapTest) || ageGateGesture || footerTarget) return;
+        const auto target=frameTarget;
+        if (Bl2TouchSwipeTabsMovie(target.direct.movieClass)) key(direction>0 ? Action::UiNextTab : Action::UiPreviousTab);
+        else key(direction>0 ? Action::UiRight : Action::UiLeft);
+        networkDiagnostic(target,"tab",direction);
     }
     bool advanceStartTitle(const Target& target) {
         if (physicalOwnership().ownsInput(monotonicMilliseconds()) ||
@@ -1854,10 +1880,10 @@ struct Ue3UiSink::State {
     void tap(const UiTap& point) {
         if (!current() || !(frameTarget.capabilities & kUiTapTest)) return;
         const auto target = frameTarget;
-        if(ageGateGesture) {ageGateUp(point.x,point.y,point.scrollDirection!=0);return;}
+        if(ageGateGesture) {ageGateUp(point.x,point.y,false);return;}
         if (footerTarget) {
             bool dispatched=false;
-            if(!point.scrollDirection && SameBl2MapLegend(footerTarget,footerHit(point.x,point.y))) {
+            if(SameBl2MapLegend(footerTarget,footerHit(point.x,point.y))) {
                 switch(footerTarget.command) {
                 case NativeFooterCommand::Legend:
                     dispatched=originalMethod(static_cast<std::uint32_t>(target.direct.clip>>32),target.direct.legend,{});break;
@@ -1877,11 +1903,6 @@ struct Ue3UiSink::State {
             }
             mapDiagnostic("Legend-Up",{},0,0,point.x,point.y,footerTarget.bounds,dispatched);
             clearFooter();return;
-        }
-        if (point.scrollDirection) {
-            key(point.scrollDirection > 0 ? Action::UiDown : Action::UiUp);
-            networkDiagnostic(target,"swipe",point.scrollDirection);
-            return;
         }
         const float x = std::floor(point.x * static_cast<float>(target.width - 1));
         const float y = std::floor(point.y * static_cast<float>(target.height - 1));
@@ -2136,13 +2157,17 @@ void Ue3UiSink::pointer(const PointerEvent& event) {
         } else if(s.frameTarget.direct.movieClass=="GearboxAccountGFxMovie" &&
             (s.ageGateGesture || (event.phase==PointerPhase::Down && s.ageGateDown(event.surfaceX,event.surfaceY)))) {
             if(event.phase==PointerPhase::Move) s.ageGateMove(event.surfaceX,event.surfaceY);
-        } else if(s.frameTarget.direct.trainingPrompt) hover(event);
+        } else if(s.frameTarget.direct.trainingPrompt) { if (!s.transactions.dragging()) hover(event); }
         else if (Bl2TouchNativeDialogMovie(s.frameTarget.direct.movieClass)) {
             const auto hit = s.dialogHit(event.surfaceX,event.surfaceY);
             if (hit >= 0) { s.dialogAtDown = hit;s.originalMethod(s.frameTarget.owner,s.frameTarget.direct.hover,{static_cast<std::uint32_t>(hit)}); }
-        } else hover(event);
+        } else if (!s.transactions.dragging()) hover(event); // A rollover would reselect rows under a scrolling finger.
     }
-    if (tap) s.tap(*tap);
+    if (tap) {
+        if (tap->scrollDirection) s.scroll(tap->scrollDirection);
+        else if (tap->tabDirection) s.tab(tap->tabDirection);
+        else s.tap(*tap);
+    }
     if (!s.transactions.ownsPointer(event.pointerId)) { s.clearCharacter();s.clearAgeGate();s.clearFooter(); }
 }
 void Ue3UiSink::hover(const PointerEvent& event) {

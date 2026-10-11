@@ -9,6 +9,9 @@
 namespace bl2::touch {
 bool Bl2TouchReviewedUiMovie(std::string_view);
 bool Bl2TouchNativeDialogMovie(std::string_view);
+// Movies whose shipped HandleInputKey switches tabs or panels on LB/RB, where a
+// horizontal swipe sends those keys; elsewhere it sends Left/Right.
+bool Bl2TouchSwipeTabsMovie(std::string_view);
 
 // A read-only bridge. The implementation never stores this view or guest pointers
 // after capture and never calls guest code. Only use at the input-thread boundary.

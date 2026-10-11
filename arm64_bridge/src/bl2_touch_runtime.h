@@ -80,6 +80,14 @@ inline bool Bl2TouchVehicleAxes(Mode mode, std::uint32_t movie, const std::vecto
     for (const auto& name : names) if (!Bl2TouchContext(name)->axes) return false;
     return true;
 }
+// Mode for a focused movie other than the HUD. OnlineMessageGFxMovie takes
+// focus only through SetBlocking(true), which also sets bInputAllKeys: a busy
+// message ("loading last save", "signing in", "updating session") that
+// swallows every key and has no control. It reads as Loading, like a level
+// load: no overlay, no legacy fallback, Back kept. Every other movie is a menu.
+inline Mode Bl2TouchFocusedMovieMode(std::string_view movieClass) {
+    return movieClass == "OnlineMessageGFxMovie" ? Mode::Loading : Mode::Menu;
+}
 // This admits axes, not actions. The original injured Pawn state still owns
 // crawl/immobile GroundSpeed and the injured view sensitivity/pitch clamp.
 inline bool Bl2TouchGameplayAxes(Mode mode, std::uint32_t movie, const std::vector<std::string>& names) {

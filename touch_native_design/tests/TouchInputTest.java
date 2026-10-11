@@ -93,6 +93,199 @@ public final class TouchInputTest {
         return new Context(epoch,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,actions,1,known,weapons,0,3,
                 new float[]{.75f,.05f,.96f,.3f},new float[]{.7f,.88f,.94f,.98f});
     }
+    private static boolean contains(int[] values,int wanted) {
+        for(int value:values) if(value==wanted) return true;
+        return false;
+    }
+    /** Protocol 6: native menu X/Y and LB/RB keys; the More panel holds only what no gesture expresses. */
+    private static void checkStageSix() {
+        check(VERSION==6 && ACTION_COUNT==43 && UI_ACTION==39 && UI_OTHER==40 && UI_PREVIOUS_TAB==41 && UI_NEXT_TAB==42,
+                "protocol 6 appends the menu X/Y and LB/RB keys after the status tabs");
+        long ui=bit(BACK)|bit(CONFIRM)|bit(UI_UP)|bit(UI_DOWN)|bit(UI_LEFT)|bit(UI_RIGHT)
+                |bit(UI_ACTION)|bit(UI_OTHER)|bit(UI_PREVIOUS_TAB)|bit(UI_NEXT_TAB);
+        long[] words=new long[25];
+        long[] head={5,90,MENU,UI_NAVIGATION|UI_TAP_TEST,ui,60,0,-1,-1,0};
+        System.arraycopy(head,0,words,0,head.length);
+        check(Context.decode(words).epoch==0,"a protocol-5 producer without the menu keys is rejected");
+        words[0]=VERSION;
+        Context menu=Context.decode(words);
+        check(menu.epoch==90 && menu.menu() && menu.usable() && menu.allows(UI_ACTION) && menu.allows(UI_NEXT_TAB),
+                "v6 menus publish the four native keys");
+        int[] compact=NativeTouchControls.menuCommands(menu,false,false);
+        check(java.util.Arrays.equals(compact,new int[]{UI_ACTION,UI_OTHER}),
+                "a native menu keeps only Action and Other: drags scroll and sideways swipes change tabs");
+        int[] talkBack=NativeTouchControls.menuCommands(menu,false,true);
+        check(java.util.Arrays.equals(talkBack,new int[]{UI_UP,UI_DOWN,UI_LEFT,UI_RIGHT,UI_ACTION,UI_OTHER,UI_PREVIOUS_TAB,UI_NEXT_TAB}),
+                "TalkBack consumes swipes, so it keeps every key, all native");
+        Context debug=new Context(91,MENU,UI_NAVIGATION|DEBUG_CANVAS,(1L<<25)-1,61);
+        check(java.util.Arrays.equals(NativeTouchControls.menuCommands(debug,false,false),new int[]{RELOAD,NEXT_WEAPON,SKILL,SPRINT}),
+                "the Debug canvas keeps X/Y/R/L; its own swipes scroll rows and change tabs");
+        check(NativeTouchControls.menuCommands(debug,false,true).length==10,"Debug with TalkBack keeps directions and tabs");
+        Context legacy=new Context(92,MENU,UI_NAVIGATION,(1L<<25)-1,62);
+        check(java.util.Arrays.equals(NativeTouchControls.menuCommands(legacy,true,false),new int[]{1099,1100,1102,1103}),
+                "the fallback keeps the virtual pad's Action, Other and shoulder keys; its swipes are the D-pad");
+        check(NativeTouchControls.menuCommands(legacy,true,true)[0]==UI_UP,"fallback with TalkBack adds the D-pad keys");
+        float[] action=NativeTouchControls.menuCommandPlace(compact,0),other=NativeTouchControls.menuCommandPlace(compact,1);
+        check(action[0]==176 && action[1]==36 && other[0]==176 && other[1]==96,"two keys stack beside Select");
+        float[] r=NativeTouchControls.menuCommandPlace(new int[]{RELOAD,NEXT_WEAPON,SKILL,SPRINT},2);
+        check(r[0]==236 && r[1]==36,"a third and fourth key form the next column");
+        float[] up=NativeTouchControls.menuCommandPlace(talkBack,0),right=NativeTouchControls.menuCommandPlace(talkBack,3);
+        float[] x=NativeTouchControls.menuCommandPlace(talkBack,4),next=NativeTouchControls.menuCommandPlace(talkBack,7);
+        check(up[0]==176 && up[1]==96 && right[0]==116 && right[1]==36 && x[0]==300 && x[1]==36 && next[0]==360 && next[1]==96,
+                "the TalkBack panel keeps the earlier places");
+        int[] debugFull=NativeTouchControls.menuCommands(debug,false,true);
+        float[] tab=NativeTouchControls.menuCommandPlace(debugFull,8),tabNext=NativeTouchControls.menuCommandPlace(debugFull,9);
+        check(tab[0]==236 && tab[1]==156 && tabNext[0]==176 && tabNext[1]==156,"Debug tab keys keep their upper row");
+        // A key is one held-bit edge pair: a press packet, then its release.
+        Sink sink=new Sink();TouchInput input=new TouchInput(sink);
+        input.configure(2,60,.22f,.5f,false);input.setContext(menu);
+        for (int key:new int[]{UI_ACTION,UI_OTHER,UI_PREVIOUS_TAB,UI_NEXT_TAB}) {
+            int before=sink.packets.size();
+            input.pulse(key);
+            check(sink.packets.size()==before+2 && (sink.packets.get(before).held&bit(key))!=0
+                    && (sink.last().held&bit(key))==0,"a native menu key presses and releases: "+key);
+        }
+        input.setContext(play(93));int count=sink.packets.size();input.pulse(UI_ACTION);
+        check(sink.packets.size()==count,"gameplay never sends a menu key");
+    }
+    /** Protocol 5: slot cells over the ammo strip, HUD status taps, give-up and the adaptive radial. */
+    private static void checkStageFive() {
+        check(VERSION>=5 && ACTION_COUNT>=39 && SLOT1==31 && SLOT2==32 && SLOT3==33 && SLOT4==34
+                && SUICIDE==35 && SKILLS==36 && LOGS==37 && CHALLENGES==38,
+                "protocol 5 appends four slots, the give-up and three status tabs after the seat actions");
+        long actions=((1L<<27)-1)|bit(SLOT1)|bit(SLOT2)|bit(SLOT4)|bit(LOGS)|bit(SKILLS)|bit(CHALLENGES);
+        // Slots 1, 2 and 4 hold an SMG, a pistol and a launcher; slot 2 is equipped.
+        int slots=WEAPON_SLOTS_KNOWN|0b1011|(2<<8)|(3<<16)|(1<<20)|(6<<28);
+        long[] words=new long[25];
+        long[] head={VERSION,80,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,actions,3,
+                bit(SLOT1)|bit(SLOT2)|bit(SLOT3)|bit(SLOT4)|bit(RELOAD),3,2,2|4|32|64|128};
+        System.arraycopy(head,0,words,0,head.length);
+        words[12]=packed(.75f,.88f);words[13]=packed(.98f,.96f);
+        words[14]=packed(.72f,.2f);words[15]=packed(.97f,.4f);
+        words[18]=packed(.05f,.78f);words[19]=packed(.11f,.84f);
+        words[20]=packed(.34f,.88f);words[21]=packed(.66f,.92f);
+        words[22]=packed(.06f,.68f);words[23]=packed(.26f,.75f);
+        words[24]=slots&0xFFFFFFFFL;
+        Context c=Context.decode(words);
+        check(c.epoch==80 && c.hudSkill() && c.hudExperience() && c.hudChallenge() && c.hudObjectives() && c.hudAmmo(),
+                "v5 decodes the skill icon, XP bar and challenge notice beside the earlier regions");
+        near(c.skillRect[1],.78f,"skill icon top");near(c.experienceRect[2],.66f,"XP bar right");near(c.challengeRect[3],.75f,"challenge bottom");
+        check(c.slotsKnown() && c.slotOccupied(0) && c.slotOccupied(1) && !c.slotOccupied(2) && c.slotOccupied(3)
+                && c.equippedSlot()==2 && c.slotType(0)==3 && c.slotType(1)==1 && c.slotType(2)==0 && c.slotType(3)==6,
+                "the slot word names occupied slots, the equipped one and each weapon type");
+        check(NativeTouchControls.slotTypeLabel(3,true).equals("ПП") && NativeTouchControls.slotTypeLabel(6,false).equals("Launcher")
+                && NativeTouchControls.slotTypeLabel(0,true).isEmpty(),"slot cells use the game's own weapon category names");
+        words[19]=packed(Float.NaN,.84f);
+        check(!Context.decode(words).hudSkill() && Context.decode(words).hudExperience() && Context.decode(words).hudChallenge(),
+                "one malformed tap target leaves the others live");
+        words[19]=packed(.11f,.84f);words[24]=0b1011|(2<<8);
+        check(!Context.decode(words).slotsKnown() && Context.decode(words).equippedSlot()==0 && !Context.decode(words).slotOccupied(0),
+                "a slot word without its known bit is ignored");
+        words[24]=slots&0xFFFFFFFFL;
+
+        // Hold the ammo strip: four transient cells; lift over one to pick its slot.
+        TouchInput.HudGesture gesture=new TouchInput.HudGesture();
+        gesture.down(3,TouchInput.HudGesture.AMMO_ZONE,1900,980,1000,80,14);
+        check(!gesture.slotHoldDue(1399,c,14) && !gesture.slotsOpen(),"a press under 400ms keeps tap, double-tap and swipe");
+        check(gesture.slotHoldDue(1400,c,14) && gesture.slotsOpen() && !gesture.slotHoldDue(1500,c,14),
+                "a still 400ms press opens the cells exactly once");
+        check(TouchInput.HudGesture.slotSelectable(c,0) && !TouchInput.HudGesture.slotSelectable(c,1)
+                && !TouchInput.HudGesture.slotSelectable(c,2) && TouchInput.HudGesture.slotSelectable(c,3)
+                && !TouchInput.HudGesture.slotSelectable(c,-1) && !TouchInput.HudGesture.slotSelectable(c,4),
+                "only an occupied slot other than the equipped weapon's can be chosen");
+        check(gesture.up(3,1900,700,1700,c,true,14,3)==SLOT4 && !gesture.slotsOpen(),"lifting over cell 4 selects Slot4 and closes the cells");
+        gesture.down(4,TouchInput.HudGesture.AMMO_ZONE,1900,980,2000,80,14);
+        check(gesture.slotHoldDue(2400,c,14),"the next hold opens the cells again");
+        check(gesture.up(4,1900,980,2500,c,true,14,-1)==TouchInput.HudGesture.NONE && gesture.poll(3000,c)==TouchInput.HudGesture.NONE,
+                "lifting off the cells cancels without a reload");
+        gesture.down(5,TouchInput.HudGesture.AMMO_ZONE,1900,980,4000,80,14);gesture.slotHoldDue(4400,c,14);
+        check(gesture.up(5,1900,700,4500,c,true,14,1)==TouchInput.HudGesture.NONE,"the equipped weapon's cell does nothing");
+        gesture.down(6,TouchInput.HudGesture.AMMO_ZONE,1900,980,5000,80,14);gesture.move(6,1990,982);
+        check(!gesture.slotHoldDue(5500,c,14),"a swipe never turns into the slot hold");
+        check(gesture.up(6,1990,982,5500,c,true,14)==NEXT_WEAPON,"a slow swipe still switches to the next weapon");
+        gesture.down(7,TouchInput.HudGesture.AMMO_ZONE,1900,980,6000,80,14);gesture.down(8,TouchInput.HudGesture.AMMO_ZONE,1950,990,6100,80,14);
+        check(!gesture.slotHoldDue(6500,c,14),"two fingers on the strip never open the cells");
+        gesture.cancel();
+        long[] lone=words.clone();lone[4]=actions&~(bit(SLOT2)|bit(SLOT4));lone[24]=WEAPON_SLOTS_KNOWN|1|(1<<8)|(3<<16);
+        gesture.down(9,TouchInput.HudGesture.AMMO_ZONE,1900,980,7000,80,14);
+        check(!gesture.slotHoldDue(7500,Context.decode(lone),14),"a single weapon has no slot to switch to");
+        gesture.cancel();
+        Context vehicle=new Context(80,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,actions,1);
+        gesture.down(10,TouchInput.HudGesture.AMMO_ZONE,1900,980,8000,80,14);
+        check(!gesture.slotHoldDue(8500,vehicle,14),"a vehicle seat has no slot cells");
+        gesture.cancel();
+        float[][] cells=TouchLayout.slotCells(new float[]{1820,950,2380,1030},0,0,2424,1080,2.6f);
+        check(cells!=null && cells.length==4,"four slot cells");
+        for(int i=0;i<4;++i) {
+            check(cells[i][3]<=950-8*2.6f+.01f && cells[i][0]>=0 && cells[i][2]<=2424+.01f,"cell "+i+" sits above the strip inside the screen");
+            if(i>0) check(cells[i][0]>=cells[i-1][2]+6*2.6f-.01f,"cells keep a finger gap in slot order "+i);
+            check(cells[i][2]-cells[i][0]>=48*2.6f && cells[i][3]-cells[i][1]>=48*2.6f,"cell "+i+" is a full touch target");
+        }
+        float middle=(cells[2][0]+cells[2][2])/2;
+        check(TouchLayout.slotAt(middle,cells[2][1]+5,cells,2.6f)==2 && TouchLayout.slotAt(middle,cells[2][1]-20*2.6f,cells,2.6f)==2,
+                "a finger over or just above cell 3 picks it");
+        check(TouchLayout.slotAt(middle,990,cells,2.6f)==-1 && TouchLayout.slotAt(Float.NaN,700,cells,2.6f)==-1,
+                "a finger still on the strip, or an invalid one, cancels");
+        check(TouchLayout.slotCells(new float[]{1820,950,2380,1030},0,0,600,1080,2.6f)==null
+                && TouchLayout.slotCells(new float[]{1820,950,Float.NaN,1030},0,0,2424,1080,2.6f)==null,"no room or no strip, no cells");
+
+        // Tap-only targets: a still tap acts, a drag becomes the stick or camera.
+        TouchInput.HudTaps taps=new TouchInput.HudTaps();
+        taps.down(11,TouchInput.HudTaps.SKILL_ZONE,TouchInput.MOVEMENT,200,860,9000,80);
+        check(taps.owns(11) && taps.move(11,205,862,14)==null,"a still finger on the skill icon remains a tap");
+        check(taps.up(11,205,862,9300,c,14)==SKILL && !taps.owns(11),"tapping the skill icon uses the action skill");
+        taps.down(12,TouchInput.HudTaps.SKILL_ZONE,TouchInput.MOVEMENT,200,860,9400,80);
+        float[] drag=taps.move(12,260,860,14);
+        check(drag!=null && drag[0]==TouchInput.MOVEMENT && drag[1]==200 && drag[2]==860 && !taps.owns(12),
+                "dragging off the icon hands the touch to the stick from where it went down");
+        Sink sink=new Sink();TouchInput input=new TouchInput(sink);input.configure(2.6f,60,.22f,.55f,false);input.setContext(c);
+        input.down(12,(int)drag[0],-1,drag[1],drag[2]);input.move(12,330,860);
+        check(sink.last().x>.5f && Math.abs(sink.last().y)<.01f,"the handed-off stick moves at once");
+        int[][] zones={{TouchInput.HudTaps.OBJECTIVES_ZONE,LOGS},{TouchInput.HudTaps.EXPERIENCE_ZONE,SKILLS},
+                {TouchInput.HudTaps.CHALLENGE_ZONE,CHALLENGES}};
+        for(int[] zone:zones) {
+            taps.down(13,zone[0],TouchInput.LOOK,1900,300,10000,80);
+            check(taps.up(13,1903,300,10200,c,14)==zone[1],"a still tap on HUD zone "+zone[0]+" opens its status tab");
+        }
+        taps.down(14,TouchInput.HudTaps.OBJECTIVES_ZONE,TouchInput.LOOK,1900,300,11000,80);
+        check(taps.up(14,1900,300,11400,c,14)==TouchInput.HudTaps.NONE,"a 400ms press is not a tap");
+        taps.down(15,TouchInput.HudTaps.OBJECTIVES_ZONE,TouchInput.LOOK,1900,300,12000,79);
+        check(taps.up(15,1900,300,12100,c,14)==TouchInput.HudTaps.NONE,"a tap from a stale epoch does nothing");
+        long[] noTabs=words.clone();noTabs[4]&=~bit(LOGS);
+        taps.down(16,TouchInput.HudTaps.OBJECTIVES_ZONE,TouchInput.LOOK,1900,300,13000,80);
+        check(taps.up(16,1900,300,13100,Context.decode(noTabs),14)==TouchInput.HudTaps.NONE,"an unavailable status tab does nothing");
+        taps.down(17,TouchInput.HudTaps.EXPERIENCE_ZONE,TouchInput.LOOK,1900,300,14000,80);
+        check(taps.up(17,1900,300,14100,vehicle,14)==TouchInput.HudTaps.NONE,"HUD taps act only on foot");
+        taps.down(18,99,TouchInput.LOOK,1900,300,15000,80);
+        check(!taps.owns(18),"an unknown zone is never captured");
+        taps.down(19,TouchInput.HudTaps.SKILL_ZONE,TouchInput.MOVEMENT,200,860,16000,80);taps.cancel();
+        check(!taps.owns(19),"cancel drops every pending tap");
+
+        // The adaptive radial (review section 5).
+        long foot=(1L<<27)-1;
+        Context walk=new Context(5,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,foot,1,foot,3,2,0,new float[4],new float[4]);
+        int[] all=NativeTouchControls.radialItems(walk,false,false,false);
+        check(contains(all,MAP) && contains(all,RELOAD) && contains(all,CHAT) && !contains(all,SUICIDE),
+                "without other routes the radial keeps Map and Reload, and no Give up on foot");
+        int[] lean=NativeTouchControls.radialItems(walk,false,true,true);
+        check(!contains(lean,MAP) && !contains(lean,RELOAD) && lean.length==all.length-2,
+                "a working minimap tap and Reload button remove their radial duplicates");
+        long injured=bit(FIRE)|bit(MELEE)|bit(RELOAD)|bit(NEXT_WEAPON)|bit(PREV_WEAPON)|bit(GRENADE)|bit(SUICIDE)|bit(CHAT)|bit(PAUSE);
+        Context ffyl=new Context(6,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,injured,1,injured,3,2,0,new float[4],new float[4]);
+        check(java.util.Arrays.equals(NativeTouchControls.radialItems(ffyl,false,true,true),
+                new int[]{NEXT_WEAPON,MELEE,PREV_WEAPON,SUICIDE,CHAT}),"the FFYL radial: Weapon, Melee, Previous, Give up and Chat");
+        check(NativeTouchControls.radialConfirm(SUICIDE) && !NativeTouchControls.radialConfirm(MELEE)
+                && !NativeTouchControls.radialHold(SUICIDE) && NativeTouchControls.radialLabel(SUICIDE,true).equals("Сдаться"),
+                "only Give up waits for a held sector");
+        long seatActions=bit(FIRE)|bit(VEHICLE_HORN)|bit(SWITCH_SEATS)|bit(RELOAD)|bit(INVENTORY)|bit(MAP)|bit(SUICIDE);
+        Context seat=new Context(7,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,seatActions,1);
+        int[] ride=NativeTouchControls.radialItems(seat,false,false,true);
+        check(ride[0]==VEHICLE_HORN && ride[1]==SWITCH_SEATS && contains(ride,MAP) && !contains(ride,RELOAD) && !contains(ride,SUICIDE),
+                "a seat keeps its own items and drops the Reload duplicate");
+        float nine=NativeTouchControls.radialItemRadius(94*2.6f,9,2.6f),five=NativeTouchControls.radialItemRadius(94*2.6f,5,2.6f);
+        check(nine>=25*2.6f && five>nine && five<=32*2.6f+.01f && NativeTouchControls.radialItemRadius(94*2.6f,12,2.6f)>=25*2.6f-.01f,
+                "fewer sectors make larger targets, from 25dp up to 32dp");
+    }
     private static void checkObjectiveHud() {
         long all=(1L<<26)-1;
         long[] words={2,90,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,all,12,0,3,0,7,
@@ -165,13 +358,13 @@ public final class TouchInputTest {
         check(decoded.hudMap() && decoded.hudAmmo() && decoded.weaponCount==3 && decoded.grenadeCount==0,
                 "Version2 packed native Surface rects and actual counts decode independently of render scale");
         near(decoded.mapRect[0],.75f,"packed low-word X");near(decoded.ammoRect[3],.98f,"packed high-word bottom");
-        long[] prompt=java.util.Arrays.copyOf(words,18);prompt[0]=VERSION;prompt[6]|=bit(USE);prompt[9]|=16;
+        long[] prompt=java.util.Arrays.copyOf(words,25);prompt[0]=VERSION;prompt[6]|=bit(USE);prompt[9]|=16;
         prompt[16]=packed(.38f,.49f);prompt[17]=packed(.65f,.55f);
         Context promptContext=Context.decode(prompt);
         check(promptContext.hudUse() && promptContext.hudMap() && promptContext.hudAmmo() && promptContext.known(USE),
                 "v3 appends true native interaction-hint geometry without moving map/ammo fields");
-        long[] stale=java.util.Arrays.copyOf(prompt,18);stale[0]=3;
-        check(VERSION==4 && Context.decode(stale).epoch==0,"a protocol-3 producer without the seat actions is rejected");
+        long[] stale=java.util.Arrays.copyOf(prompt,18);stale[0]=4;
+        check(VERSION==6 && Context.decode(stale).epoch==0,"a protocol-4 producer without the slot, give-up and tab fields is rejected");
         near(promptContext.useRect[1],.49f,"native Use hint is normalized to the full Surface");
         prompt[16]=packed(Float.NaN,.49f);promptContext=Context.decode(prompt);
         check(!promptContext.hudUse() && promptContext.hudMap() && promptContext.hudAmmo() && promptContext.allows(USE),
@@ -295,7 +488,7 @@ public final class TouchInputTest {
         check(!run.sprintLatched() && sink.last().y==0,"vehicle throttle never inherits on-foot auto-run");
     }
     private static void checkVehicleSeat() {
-        check(ACTION_COUNT==31 && EXIT_VEHICLE==27 && SWITCH_SEATS==28 && DRIVER_FIRE_TURRET==29 && LOOK_BACK==30,
+        check(ACTION_COUNT==43 && EXIT_VEHICLE==27 && SWITCH_SEATS==28 && DRIVER_FIRE_TURRET==29 && LOOK_BACK==30,
                 "protocol 4 appends the four shipped seat actions after Chat");
         long seat=bit(FIRE)|bit(VEHICLE_BOOST)|bit(VEHICLE_BRAKE)|bit(VEHICLE_HORN)|bit(EXIT_VEHICLE)
                 |bit(SWITCH_SEATS)|bit(DRIVER_FIRE_TURRET)|bit(LOOK_BACK)|bit(MAP)|bit(INVENTORY);
@@ -330,7 +523,7 @@ public final class TouchInputTest {
         check(seatRadial.length==9 && seatRadial[0]==VEHICLE_HORN && seatRadial[1]==SWITCH_SEATS
                 && seatRadial[2]==LOOK_BACK && seatRadial[3]==DRIVER_FIRE_TURRET && seatRadial[8]==CHAT,
                 "the seat radial carries Horn and Switch seat, then Look back and Turret");
-        for(int action:footRadial) check(action<VEHICLE_BRAKE || action==LAST_WEAPON || action==CHAT,"the on-foot radial has no seat items");
+        for(int action:footRadial) check(action<VEHICLE_BRAKE || action==CHAT || action==SUICIDE,"the on-foot radial has no seat items");
         check(NativeTouchControls.radialHold(LOOK_BACK) && NativeTouchControls.radialHold(DRIVER_FIRE_TURRET)
                 && !NativeTouchControls.radialHold(VEHICLE_HORN) && !NativeTouchControls.radialHold(SWITCH_SEATS),
                 "only Look back and Turret are held radial items");
@@ -360,21 +553,23 @@ public final class TouchInputTest {
     }
     private static void checkChatEntry() {
         long oldActions=(1L<<26)-1;
-        long[] words={VERSION,91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,oldActions,50,0,-1,-1,0,0,0,0,0,0,0,0,0};
+        long[] words=new long[25];
+        long[] head={VERSION,91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,oldActions,50,0,-1,-1};
+        System.arraycopy(head,0,words,0,head.length);
         Context old=Context.decode(words);
-        check(old.usable() && !old.allows(CHAT) && NativeTouchControls.radialActionCount(old,false)==8,
-                "a native snapshot without Say retains the original eight-sector menu");
+        check(old.usable() && !old.allows(CHAT) && !contains(NativeTouchControls.radialItems(old,false,false,false),CHAT),
+                "a native snapshot without Say has no Chat sector");
         words[4]|=bit(CHAT);
         Context chat=Context.decode(words);
-        check(chat.usable() && chat.allows(CHAT) && NativeTouchControls.radialActionCount(chat,false)==9,
-                "the additive Say bit opens a ninth sector without changing the packet length or HUD metadata");
-        check(NativeTouchControls.radialActionCount(chat,true)==8,"legacy fallback cannot invent the original Say entry");
-        check(NativeTouchControls.radialActionCount(Context.unknown(),false)==8,"unknown native availability never exposes Chat");
+        check(chat.usable() && chat.allows(CHAT) && contains(NativeTouchControls.radialItems(chat,false,false,false),CHAT),
+                "the additive Say bit adds a Chat sector without changing the packet length or HUD metadata");
+        check(!contains(NativeTouchControls.radialItems(chat,true,false,false),CHAT),"legacy fallback cannot invent the original Say entry");
+        check(NativeTouchControls.radialItems(Context.unknown(),false,false,false).length==0,"unknown native availability opens no radial");
         Context physical=new Context(91,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK|PHYSICAL_OWNS_INPUT,words[4],50);
-        check(NativeTouchControls.radialActionCount(physical,false)==8,"physical ownership cannot expose a usable Chat gesture");
+        check(NativeTouchControls.radialItems(physical,false,false,false).length==0,"physical ownership cannot expose a usable Chat gesture");
         Context menu=new Context(92,MENU,DIRECT_UI|UI_NAVIGATION,bit(BACK)|bit(CHAT),51);
-        check(NativeTouchControls.radialActionCount(menu,false)==8,"native menu actions do not become a gameplay Chat sector");
-        for(int sectors:new int[]{8,9}) {
+        check(!contains(NativeTouchControls.radialItems(menu,false,false,false),CHAT),"native menu actions do not become a gameplay Chat sector");
+        for(int sectors=1;sectors<=12;++sectors) {
             for(int i=0;i<sectors;++i) {
                 double angle=i*Math.PI*2/sectors-Math.PI/2;
                 float x=220+(float)Math.cos(angle)*100,y=180+(float)Math.sin(angle)*100;
@@ -384,7 +579,8 @@ public final class TouchInputTest {
             check(TouchLayout.radialSector(220,180,220,180,100,sectors)==-1,"radial center cancels for "+sectors+" sectors");
             check(TouchLayout.radialSector(220,350,220,180,100,sectors)==-1,"leaving the radial outer ring cancels for "+sectors+" sectors");
         }
-        check(TouchLayout.radialSector(220,80,220,180,100,10)==-1,"unrecognized radial layouts fail closed");
+        check(TouchLayout.radialSector(220,80,220,180,100,0)==-1 && TouchLayout.radialSector(220,80,220,180,100,13)==-1,
+                "sector counts outside the adaptive 1..12 fail closed");
         check(TouchLayout.radialSector(220,80,220,180,Float.NaN,9)==-1,"invalid radius cannot dispatch an appended action");
 
         Sink sink=new Sink();TouchInput input=new TouchInput(sink);input.configure(3,60,.22f,.55f,false);input.setContext(chat);
@@ -413,7 +609,7 @@ public final class TouchInputTest {
         check(sink.resets==1 && sink.packets.size()==count,"lifecycle cancellation requires a fresh native context before Chat");
     }
     public static void main(String[] args) throws ReflectiveOperationException {
-        checkChatEntry();
+        checkChatEntry();checkStageFive();checkStageSix();
         checkHudGestures();checkAutoRun();checkReferenceCluster();checkObjectiveHud();
         TouchPreferences hints=new TouchPreferences();
         check(!hints.mapTapHintSeen && !hints.weaponGestureHintSeen,"one-shot HUD hints begin unseen");
@@ -421,14 +617,14 @@ public final class TouchInputTest {
         check(hints.mapTapHintSeen && !hints.weaponGestureHintSeen,"map hint acknowledgement persists without consuming the weapon hint");
         hints.markHintSeen(true);hints.resetTouch();hints.reload();
         check(hints.mapTapHintSeen && hints.weaponGestureHintSeen,"layout reset preserves both one-shot acknowledgements");
-        for(int kind=TouchPreferences.HINT_GAME_MORE;kind<=TouchPreferences.HINT_LAYOUT;++kind) {
+        for(int kind=TouchPreferences.HINT_GAME_MORE;kind<=TouchPreferences.HINT_STATUS_TAPS;++kind) {
             check(!hints.hintSeen(kind),"new tutorial begins unseen independently: "+kind);
             hints.markHintSeen(kind);hints.save();hints.reload();
             check(hints.hintSeen(kind),"tutorial acknowledgement survives settings save and reload: "+kind);
-            if(kind<TouchPreferences.HINT_LAYOUT) check(!hints.hintSeen(kind+1),"showing one tutorial does not consume the next");
+            if(kind<TouchPreferences.HINT_STATUS_TAPS) check(!hints.hintSeen(kind+1),"showing one tutorial does not consume the next");
         }
         hints.resetTouch();hints.reload();
-        for(int kind=TouchPreferences.HINT_MAP;kind<=TouchPreferences.HINT_LAYOUT;++kind)
+        for(int kind=TouchPreferences.HINT_MAP;kind<=TouchPreferences.HINT_STATUS_TAPS;++kind)
             check(hints.hintSeen(kind),"Reset Controls retains every presented tutorial: "+kind);
         Context mapMenu=new Context(1,MENU,DIRECT_UI|UI_NAVIGATION|MAP_GESTURES,bit(BACK),1);
         check(NativeTouchControls.menuPointerAllowed(mapMenu,-1,0,false),"map first pointer is admitted");
