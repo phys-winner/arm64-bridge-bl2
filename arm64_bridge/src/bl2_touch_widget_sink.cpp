@@ -650,6 +650,9 @@ private:
             if (!row(TouchSettingCaption(kTouchReloadButtonSetting,Bl2RussianLocaleSelected()),
                     kTouchSettingsValue + static_cast<std::int32_t>(kTouchReloadButtonSetting),
                     static_cast<int>(kTouchReloadButtonSetting)) ||
+                !row(TouchSettingCaption(kTouchRadialTapSetting,Bl2RussianLocaleSelected()),
+                    kTouchSettingsValue + static_cast<std::int32_t>(kTouchRadialTapSetting),
+                    static_cast<int>(kTouchRadialTapSetting)) ||
                 !row(Bl2RussianLocaleSelected() ? "ИЗМЕНИТЬ РАСКЛАДКУ" : "EDIT BUTTON LAYOUT",kTouchSettingsEdit) ||
                 !row(Bl2RussianLocaleSelected() ? "СБРОСИТЬ УПРАВЛЕНИЕ" : "RESET TOUCH CONTROLS",kTouchSettingsReset) ||
                 !row(Bl2RussianLocaleSelected() ? "КАЛИБРОВКА НАКЛОНА" : "CALIBRATE TILT AIMING",kTouchSettingsCalibrate) ||

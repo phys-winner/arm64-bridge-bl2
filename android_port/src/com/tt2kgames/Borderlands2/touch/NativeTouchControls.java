@@ -135,6 +135,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private RouteListener routeListener;
     private boolean nativeRoute, imeVisible;
     private boolean fallback, radialOpen, radialDragged;
+    /** RADIAL BY TAP: open after a short tap, waiting for a second tap. */
+    private boolean radialTapMode;
     private long legacyHeld;
     private float fallbackYaw, fallbackPitch, radialX,radialY,radialRadius,radialItemRadius,radialStartX,radialStartY;
     private int radialPointer=-1, radialSelection=-1, radialCount=8;
@@ -220,7 +222,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         NativeTouchControls view = active.get();
         if (view == null || view.activity != owner) return;
         view.resumed = value;
-        if (!value) { view.cancelInput(); view.unschedule(); }
+        // A backgrounded process may be killed without another callback.
+        if (!value) { view.cancelInput(); view.unschedule(); view.preferences.flush(); }
         else view.schedule();
     }
     public static void detach(Activity owner) {
@@ -445,6 +448,9 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             buttons.add(new Button(action,text,new RectF(placed[0],placed[1],placed[2],placed[3]),
                     TouchLayout.gameplayHitSlop(action,dp(1))));
         }
+    }
+    private static float[] hudBox(RectF target) {
+        return target.isEmpty() ? null : new float[]{target.left,target.top,target.right,target.bottom};
     }
     private void hudTarget(RectF target,float[] rect,boolean valid) {
         target.setEmpty();
@@ -676,7 +682,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         radialY=Math.max(safe.top+margin,Math.min(safe.bottom-margin,y));
         buildRadial(); haptic(HapticFeedbackConstants.VIRTUAL_KEY);
     }
-    private void closeRadial() { radialOpen=false;radialPointer=-1;radialSelection=-1;radialSelectedAt=0;radialButtons.clear(); }
+    private void closeRadial() { radialOpen=false;radialTapMode=false;radialPointer=-1;radialSelection=-1;radialSelectedAt=0;radialButtons.clear(); }
     /** Give up acts once the finger has stayed on its sector for a second. */
     private void confirmRadialHold(long now) {
         if (!radialOpen || radialPointer<0 || radialSelection<0 || radialSelectedAt==0
@@ -797,14 +803,17 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     }
     private void drawHint(Canvas canvas) {
         if (hintText == null || SystemClock.uptimeMillis() >= hintUntil) return;
-        float width=safe.width()-dp(32); if (width <= dp(24)) return;
         paint.setTextSize(dp(14)); paint.setTextAlign(Paint.Align.CENTER); paint.setStyle(Paint.Style.FILL);
+        float cy=safe.top+dp(74);
+        // The pill shifts or narrows to stay off the minimap, objectives and challenge notice.
+        float[] span=TouchLayout.hintSpan(safe.centerX(),paint.measureText(hintText)+dp(24),safe.left+dp(16),safe.right-dp(16),
+                cy-dp(18),cy+dp(18),dp(8),hudBox(mapTarget),hudBox(objectiveTarget),hudBox(challengeTarget));
+        if (span == null || span[1]-span[0] <= dp(48)) return; // Unseen: offered again later.
         float measured=paint.measureText(hintText);
-        if (measured > width-dp(24)) paint.setTextSize(dp(14)*(width-dp(24))/measured);
-        float half=Math.min(width/2,(paint.measureText(hintText)+dp(24))/2);
-        float cy=safe.top+dp(74),cx=safe.centerX();
+        if (measured > span[1]-span[0]-dp(24)) paint.setTextSize(dp(14)*(span[1]-span[0]-dp(24))/measured);
+        float cx=(span[0]+span[1])/2;
         paint.setColor(Color.BLACK); paint.setAlpha(210);
-        canvas.drawRoundRect(cx-half,cy-dp(18),cx+half,cy+dp(18),dp(10),dp(10),paint);
+        canvas.drawRoundRect(span[0],cy-dp(18),span[1],cy+dp(18),dp(10),dp(10),paint);
         paint.setColor(Color.WHITE); paint.setAlpha(255);
         canvas.drawText(hintText,cx,cy-(paint.ascent()+paint.descent())/2,paint);
         if (hintKind > 0 && !preferences.hintSeen(hintKind)) preferences.markHintSeen(hintKind);
@@ -900,12 +909,17 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if(id==radialPointer) {
                 int selected=radialDragged?TouchLayout.radialSector(x,y,radialX,radialY,radialRadius,radialCount):-1;
                 boolean tap=!radialDragged && SystemClock.uptimeMillis()-radialStarted<300;
-                closeRadial();
-                // Give up acts only from confirmRadialHold; an early release explains why.
-                if (selected >= 0 && radialConfirm(radial[selected]))
-                    showHint("Hold Give up for a second", "Удерживайте «Сдаться» секунду",0);
-                else if (selected >= 0 && radialAvailable(radial[selected])) activate(id,radial[selected],x,y);
-                else if (tap) moreHint();
+                if (tap && preferences.radialTap && !fallback) {
+                    // Stay open; the next tap picks an item, More or elsewhere closes.
+                    radialPointer=-1; radialTapMode=true; radialSelection=-1;
+                } else {
+                    closeRadial();
+                    // Give up acts only from confirmRadialHold; an early release explains why.
+                    if (selected >= 0 && radialConfirm(radial[selected]))
+                        showHint("Hold Give up for a second", "Удерживайте «Сдаться» секунду",0);
+                    else if (selected >= 0 && radialAvailable(radial[selected])) activate(id,radial[selected],x,y);
+                    else if (tap) moreHint();
+                }
             } else if (hudGesture.owns(id)) {
                 RectF rect=hudPointers.get(id); hudPointers.remove(id);
                 boolean inside=rect != null && (hudGesture.zone(id) == TouchInput.HudGesture.AMMO_ZONE ? safe.contains(x,y) : rect.contains(x,y));
@@ -964,10 +978,22 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                     input.down(id, TouchInput.BUTTON, b.action, x, y);
                     haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
                 }
+                if (radialTapMode && radialPointer<0 && radialConfirm(b.action)) {
+                    // Give up still needs its one-second hold: this finger now
+                    // owns the radial with that sector selected.
+                    radialPointer=id; radialDragged=true; radialSelectedAt=SystemClock.uptimeMillis();
+                    for (int i=0;i<radialCount;i++) if (radial[i]==b.action) radialSelection=i;
+                    haptic(HapticFeedbackConstants.CLOCK_TICK); return;
+                }
                 utilityPointers.put(id,b);
                 return;
             } else if(b!=null && b.action==MORE) {closeRadial();return;}
-            else if(radialPointer<0) closeRadial();
+            else if(radialPointer<0) {
+                // A tap-mode radial is dismissed by the next touch, which does nothing else.
+                boolean consume=radialTapMode;
+                closeRadial();
+                if (consume) return;
+            }
         }
         if (b != null) {
             if (b.action == MORE) {
@@ -1232,7 +1258,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 "\n\nПрогресс после последнего сохранения будет потерян.");
         restartDialog=new android.app.AlertDialog.Builder(activity)
                 .setMessage(message)
-                .setPositiveButton(label("Restart","Перезапустить"),(dialog,which)->GameRestart.restart(activity))
+                .setPositiveButton(label("Restart","Перезапустить"),(dialog,which)->{ preferences.flush(); GameRestart.restart(activity); })
                 .setNegativeButton(label("Later","Позже"),null)
                 .show();
     }
@@ -1390,6 +1416,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private void dispose() {
         if (disposed) return;
         disposed=true; cancelInput(); unschedule();
+        saveLayout(); preferences.flush();
         publishRoute(false);
         if (surface instanceof SurfaceView) ((SurfaceView)surface).getHolder().removeCallback(this);
         if (getParent() instanceof ViewGroup) ((ViewGroup)getParent()).removeView(this);

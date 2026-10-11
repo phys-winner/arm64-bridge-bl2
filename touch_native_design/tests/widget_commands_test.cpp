@@ -729,8 +729,8 @@ int main(int argc, char** argv) {
         assert(TouchSettingValueText(3,.223999798) == "0.22" && TouchSettingValueText(4,.55000001192) == "0.55");
         assert(TouchSettingValueText(11,1) == "1.00" && TouchSettingValueText(12,.400000059) == "0.40");
         assert(touchSettingsState.values == saved); // Display rounding cannot quantize saved preferences.
-        // v7 appends the Reload button toggle after frame pacing; ids 0-34 keep their slots.
-        assert(kTouchSettingsVersion == 7 && kTouchSettingCount == 36 && kTouchReloadButtonSetting == 35);
+        // v7 appended the Reload button toggle after frame pacing, v8 the tap radial; ids 0-35 keep their slots.
+        assert(kTouchSettingsVersion == 8 && kTouchSettingCount == 37 && kTouchReloadButtonSetting == 35);
         assert(touchSettingSpecs[kTouchReloadButtonSetting].toggle &&
             std::string(TouchSettingCaption(kTouchReloadButtonSetting,false)) == "RELOAD BUTTON" &&
             std::string(TouchSettingCaption(kTouchReloadButtonSetting,true)) == "КНОПКА ПЕРЕЗАРЯДКИ" &&
@@ -740,10 +740,20 @@ int main(int argc, char** argv) {
         const auto reloadOn = ExchangeBl2TouchSettings(host);
         assert(reloadOn.size() == kTouchSettingCount+3 && reloadOn[3+kTouchReloadButtonSetting] == 1 &&
             reloadOn[3+kTouchFramePacingSetting] == saved[kTouchFramePacingSetting]);
-        auto oldSize = host; oldSize.pop_back(); oldSize[0] = 6; oldSize[1] = reloadOn[1];
-        assert(ExchangeBl2TouchSettings(oldSize)[3+kTouchReloadButtonSetting] == 1); // A v6 host cannot clear it.
+        auto oldSize = host; oldSize.pop_back(); oldSize[0] = 7; oldSize[1] = reloadOn[1];
+        assert(ExchangeBl2TouchSettings(oldSize)[3+kTouchReloadButtonSetting] == 1); // A v7 host cannot clear it.
         host[1] = reloadOn[1]; host[2+kTouchReloadButtonSetting] = 2;
         assert(ExchangeBl2TouchSettings(host)[3+kTouchReloadButtonSetting] == 1); // Non-boolean host value rejected.
+        assert(kTouchRadialTapSetting == 36 && touchSettingSpecs[kTouchRadialTapSetting].toggle &&
+            std::string(TouchSettingCaption(kTouchRadialTapSetting,false)) == "RADIAL BY TAP" &&
+            std::string(TouchSettingCaption(kTouchRadialTapSetting,true)) == "РАДИАЛ ПО ТАПУ" &&
+            TouchSettingHint(kTouchRadialTapSetting,true) && TouchSettingHint(kTouchRadialTapSetting,false));
+        assert(touchSettingsState.values[kTouchRadialTapSetting] == 0); // OFF unless chosen.
+        assert(!SetBl2TouchSetting(kTouchRadialTapSetting,2) && !SetBl2TouchSetting(kTouchRadialTapSetting,.5));
+        assert(SetBl2TouchSetting(kTouchRadialTapSetting,1));
+        const auto radialOn = ExchangeBl2TouchSettings(host);
+        assert(radialOn.size() == kTouchSettingCount+3 && radialOn[3+kTouchRadialTapSetting] == 1 &&
+            radialOn[3+kTouchReloadButtonSetting] == 1);
     }
     {
         // Overflowing original descriptions scroll by whole lines under a vertical drag.
@@ -783,7 +793,7 @@ int main(int argc, char** argv) {
         assert(Bl2TextScrollLine(3,9,-9,20) == 3 && Bl2TextScrollLine(3,9,-11,20) == 4); // Rounded whole lines.
         assert(Bl2TextScrollLine(3,9,std::numeric_limits<double>::quiet_NaN(),20) == 3);
         assert(Bl2TextScrollLine(3,9,-50,0) == 3 && Bl2TextScrollLine(0,9,-50,20) == 0 && Bl2TextScrollLine(10,9,-50,20) == 10);
-        std::cout << "PASS: settings v7 Reload toggle; mission/challenge/quest description targets, authored boxes and line mapping\n";
+        std::cout << "PASS: settings v8 Reload and tap radial toggles; mission/challenge/quest description targets, authored boxes and line mapping\n";
     }
     {
         Vm vm(argv[1]);

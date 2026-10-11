@@ -97,6 +97,77 @@ public final class TouchInputTest {
         for(int value:values) if(value==wanted) return true;
         return false;
     }
+    /** Stage 7: a second stick-zone finger turns the camera; hints keep off the HUD. */
+    private static void checkStageSeven() {
+        Sink sink=new Sink();TouchInput input=new TouchInput(sink);
+        input.configure(2,60,.22f,.5f,false);input.setContext(play(70));
+        input.down(1,TouchInput.MOVEMENT,-1,100,500);input.move(1,100,420);
+        check(sink.last().y>0,"the first stick-zone finger is the stick");
+        input.down(2,TouchInput.MOVEMENT,-1,300,600);input.move(2,320,600);
+        near(sink.yaw(),2.2f,"a second stick-zone finger turns the camera by its own distance");
+        check(sink.last().y>0,"while the stick keeps moving");
+        input.up(1,100,420);input.move(2,340,600);
+        check(sink.last().x==0 && sink.last().y==0,"the camera finger never inherits the stick");
+        near(sink.yaw(),4.4f,"and keeps turning after the stick lifts");
+        Sink busy=new Sink();TouchInput both=new TouchInput(busy);
+        both.configure(2,60,.22f,.5f,false);both.setContext(play(71));
+        both.down(1,TouchInput.MOVEMENT,-1,100,500);both.down(3,TouchInput.LOOK,-1,1500,400);
+        both.down(2,TouchInput.MOVEMENT,-1,300,600);both.move(2,340,600);
+        near(busy.yaw(),0,"a third finger cannot take the camera from its owner");
+        both.move(3,1520,400);
+        near(busy.yaw(),2.2f,"the camera owner keeps turning");
+        Sink menuSink=new Sink();TouchInput menu=new TouchInput(menuSink);
+        menu.configure(2,60,.22f,.5f,false);menu.setContext(new Context(72,MENU,UI_NAVIGATION,bit(BACK),5));
+        menu.down(4,TouchInput.MOVEMENT,-1,100,500);menu.move(4,140,500);
+        near(menuSink.yaw(),0,"menus still ignore stick-zone fingers");
+        float[] free=TouchLayout.hintSpan(1200,600,40,2380,100,190,20);
+        check(free!=null && free[0]==900 && free[1]==1500,"without HUD rects the hint stays centred");
+        float[] map={1790,40,2040,300};
+        float[] shifted=TouchLayout.hintSpan(1200,1400,40,2380,100,190,20,map);
+        check(shifted!=null && shifted[1]==1770 && shifted[1]-shifted[0]==1400,"a wide hint moves left of the minimap");
+        float[] squeezed=TouchLayout.hintSpan(1200,2400,40,2380,100,190,20,map);
+        check(squeezed!=null && squeezed[0]==40 && squeezed[1]==1770,"a hint wider than the room narrows to it");
+        float[] objectives={1600,330,2050,400};
+        float[] below=TouchLayout.hintSpan(1200,600,40,2380,100,190,20,objectives);
+        check(below!=null && below[0]==900 && below[1]==1500,"a HUD rect outside the hint band changes nothing");
+        float[] leftSide={10,120,300,170};
+        float[] right=TouchLayout.hintSpan(400,600,40,2380,100,190,20,leftSide);
+        check(right!=null && right[0]==320 && right[1]==920,"a rect left of the centre caps the left edge");
+        check(TouchLayout.hintSpan(1200,600,40,2380,100,190,20,new float[]{0,0,2400,1080})==null,"no room, no hint");
+        check(TouchLayout.hintSpan(1200,600,40,2380,100,190,20,(float[])null)!=null,"an absent HUD rect is ignored");
+    }
+    /** Settings are written off the UI thread after SAVE_DELAY_MS, coalesced, and flushed on demand. */
+    private static void checkDeferredSettingsWrite() throws Exception {
+        java.io.File dir=java.nio.file.Files.createTempDirectory("bl2-touch-settings").toFile();
+        try {
+            java.io.File first=new java.io.File(dir,"first.properties");
+            TouchPreferences prefs=new TouchPreferences(first);
+            prefs.opacity=.5f;prefs.save();
+            check(prefs.writes==0 && !first.exists(),"a change is not written on the calling thread");
+            prefs.flush();
+            check(prefs.writes==1 && first.isFile(),"flush commits the pending change and waits for it");
+            check(new TouchPreferences(first).opacity==.5f,"the committed file reads back");
+            prefs.flush();
+            check(prefs.writes==1,"flush without a pending change writes nothing");
+            java.io.File second=new java.io.File(dir,"second.properties");
+            TouchPreferences burst=new TouchPreferences(second);
+            for(int i=0;i<5;i++) { burst.look=.1f+i*.1f;burst.save(); }
+            burst.flush();
+            check(burst.writes==1 && Math.abs(new TouchPreferences(second).look-.5f)<1e-6f,
+                    "a slider burst becomes one write of the last value");
+            java.io.File third=new java.io.File(dir,"third.properties");
+            TouchPreferences later=new TouchPreferences(third);
+            later.ads=.7f;later.save();
+            long deadline=System.currentTimeMillis()+TouchPreferences.SAVE_DELAY_MS+3000;
+            while(later.writes==0 && System.currentTimeMillis()<deadline) Thread.sleep(20);
+            check(later.writes==1 && third.isFile(),"the writer commits on its own after the delay");
+            check(new TouchPreferences().writes==0,"in-memory host preferences never write");
+        } finally {
+            java.io.File[] files=dir.listFiles();
+            if(files!=null) for(java.io.File file:files) file.delete();
+            dir.delete();
+        }
+    }
     /** Protocol 6: native menu X/Y and LB/RB keys; the More panel holds only what no gesture expresses. */
     private static void checkStageSix() {
         check(VERSION==6 && ACTION_COUNT==43 && UI_ACTION==39 && UI_OTHER==40 && UI_PREVIOUS_TAB==41 && UI_NEXT_TAB==42,
@@ -608,8 +679,8 @@ public final class TouchInputTest {
         input.cancel();count=sink.packets.size();input.pulse(CHAT);
         check(sink.resets==1 && sink.packets.size()==count,"lifecycle cancellation requires a fresh native context before Chat");
     }
-    public static void main(String[] args) throws ReflectiveOperationException {
-        checkChatEntry();checkStageFive();checkStageSix();
+    public static void main(String[] args) throws Exception {
+        checkChatEntry();checkStageFive();checkStageSix();checkStageSeven();checkDeferredSettingsWrite();
         checkHudGestures();checkAutoRun();checkReferenceCluster();checkObjectiveHud();
         TouchPreferences hints=new TouchPreferences();
         check(!hints.mapTapHintSeen && !hints.weaponGestureHintSeen,"one-shot HUD hints begin unseen");
@@ -650,10 +721,10 @@ public final class TouchInputTest {
                 "interface scale is bounded independently of render scale");
         check(TouchPreferences.uiPercent(Float.NaN)==125 && TouchPreferences.uiPercent(Float.POSITIVE_INFINITY)==125,
                 "invalid interface scale restores the 125-percent default");
-        int[] settings={7,1,0,100,Float.floatToIntBits(.42f),Float.floatToIntBits(1),
+        int[] settings={8,1,0,100,Float.floatToIntBits(.42f),Float.floatToIntBits(1),
             Float.floatToIntBits(.22f),Float.floatToIntBits(.55f),0,0,0,0,1,1,
             Float.floatToIntBits(1),Float.floatToIntBits(.4f),0,1,1,0,125,0,0};
-        settings=java.util.Arrays.copyOf(settings,39);
+        settings=java.util.Arrays.copyOf(settings,40);
         java.util.Arrays.fill(settings,24,35,-1);
         settings[38]=1;
         check(TouchPreferences.validSettingsWire(settings),"native settings protocol admits bounded full vector");
@@ -671,8 +742,10 @@ public final class TouchInputTest {
         settings[0]=6;
         check(!TouchPreferences.validSettingsWire(settings),"v6 cannot silently accept the Reload button field");
         settings[0]=7;
-        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,38)),"old field count cannot be accepted as v7");
-        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,40)),"extra fields cannot be accepted as v7");
+        check(!TouchPreferences.validSettingsWire(settings),"v7 cannot silently accept the radial tap field");
+        settings[0]=8;
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,39)),"old field count cannot be accepted as v8");
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,41)),"extra fields cannot be accepted as v8");
         for(int fps:new int[]{0,30,60,90}) {
             settings[22]=fps;
             check(TouchPreferences.validSettingsWire(settings),"exact selectable FPS mode admitted: "+fps);
@@ -707,6 +780,7 @@ public final class TouchInputTest {
         check(preferences.performance[0] && preferences.performance[1] && preferences.performance[2],
                 "absent performance and frame pacing choices default ON");
         check(preferences.reloadButton && preferences.settingsWire(1)[37]==1,"absent Reload button choice defaults ON");
+        check(!preferences.radialTap && preferences.settingsWire(1)[38]==0,"absent radial tap choice defaults OFF");
         settings[19]=0;
         check(TouchPreferences.validSettingsWire(settings),"toggle checks start from a valid vector");
         for(int invalid:new int[]{-1,2,Float.floatToIntBits(1)}) {
@@ -714,7 +788,8 @@ public final class TouchInputTest {
             settings[35]=0;settings[36]=invalid;check(!TouchPreferences.validSettingsWire(settings),"audio optimization must be boolean");
             settings[36]=0;settings[37]=invalid;check(!TouchPreferences.validSettingsWire(settings),"frame pacing must be boolean");
             settings[37]=0;settings[38]=invalid;check(!TouchPreferences.validSettingsWire(settings),"Reload button must be boolean");
-            settings[38]=1;
+            settings[38]=1;settings[39]=invalid;check(!TouchPreferences.validSettingsWire(settings),"radial tap must be boolean");
+            settings[39]=0;
         }
         settings[23]=2;check(!TouchPreferences.validSettingsWire(settings),"Potato must be boolean");settings[23]=0;
         settings[24]=2;check(!TouchPreferences.validSettingsWire(settings),"graphics toggle must be boolean or original default");settings[24]=-1;
@@ -761,7 +836,7 @@ public final class TouchInputTest {
         check(preferences.uiPercent==130 && preferences.renderPercent==90,"saved UI percentage normalizes independently of rendering");
         preferences.uiPercent=125;preferences.save();preferences.reload();
         check(preferences.uiPercent==125 && "125".equals(store.getProperty("uiPercent")),"125-percent default survives save and reload exactly");
-        check(preferences.settingsWire(1).length==38 && preferences.settingsWire(1)[0]==7
+        check(preferences.settingsWire(1).length==39 && preferences.settingsWire(1)[0]==8
                 && preferences.settingsWire(1)[19]==125,"new FPS fields leave the UI and Debug IDs unchanged");
         int[] edited = defaults.clone();
         edited[1]=2; edited[2]=8; edited[3]=110;
@@ -769,9 +844,10 @@ public final class TouchInputTest {
         edited[6]=Float.floatToIntBits(.8f); edited[7]=Float.floatToIntBits(.8f);
         edited[8]=1; edited[9]=1; edited[10]=0; edited[12]=0; edited[13]=0;
         edited[14]=Float.floatToIntBits(3); edited[15]=Float.floatToIntBits(3);
-        edited[16]=1; edited[17]=0; edited[18]=0; edited[20]=190; edited[38]=0;
+        edited[16]=1; edited[17]=0; edited[18]=0; edited[20]=190; edited[38]=0; edited[39]=1;
         check(preferences.applySettingsWire(edited),"native control edits admitted before reset");
         check(!preferences.reloadButton && preferences.settingsWire(2)[37]==0,"Reload button OFF is applied from the native page");
+        check(preferences.radialTap && preferences.settingsWire(2)[38]==1,"radial tap ON is applied from the native page");
         preferences.reload();
         check(!preferences.reloadButton,"Reload button OFF persists through save and reload");
         preferences.position(FIRE,.15f,.28f);
@@ -1015,6 +1091,6 @@ public final class TouchInputTest {
         TouchLayout.reserveGameplayHud(22,10,2446,1090,offsetHud);
         for(int i=0;i<hud.size();++i) for(int axis=0;axis<4;++axis)
             near(offsetHud.get(i)[axis],hud.get(i)[axis]+(axis%2==0?22:10),"HUD reservation follows Surface origin independently of safe insets");
-        System.out.println("TouchInputTest: HUD gestures, held action margins, pointer lifecycle, tutorials, settings v7, render50, graphics/performance/pacing/Reload button persistence and reset passed");
+        System.out.println("TouchInputTest: HUD gestures, held action margins, pointer lifecycle, tutorials, settings v8, deferred writer, stick-zone camera, hint span, render50, graphics/performance/pacing/Reload button persistence and reset passed");
     }
 }

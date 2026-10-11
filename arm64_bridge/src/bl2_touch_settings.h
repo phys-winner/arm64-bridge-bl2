@@ -14,12 +14,14 @@ namespace bl2::touch {
 #ifndef BL2_ENABLE_DEBUG_MENU_DEFAULT
 #define BL2_ENABLE_DEBUG_MENU_DEFAULT 0
 #endif
-constexpr std::uint32_t kTouchSettingsVersion = 7;
-constexpr std::size_t kTouchSettingCount = 36;
+constexpr std::uint32_t kTouchSettingsVersion = 8;
+constexpr std::size_t kTouchSettingCount = 37;
 // Present pacing (bl2_frame_pacer): ON by default and switchable while playing.
 constexpr std::size_t kTouchFramePacingSetting = 34;
 // Java shows Reload while a reload is possible; ON by default.
 constexpr std::size_t kTouchReloadButtonSetting = 35;
+// A short tap on More keeps the radial open for a second tap; OFF by default.
+constexpr std::size_t kTouchRadialTapSetting = 36;
 constexpr std::int32_t kTouchSettingsOpen = 0x6A100000;
 constexpr std::int32_t kTouchSettingsGraphicsOpen = 0x6A100004;
 constexpr std::int32_t kTouchSettingsValue = 0x6A100100;
@@ -45,7 +47,7 @@ inline constexpr TouchSettingSpec touchSettingSpecs[] = {
     {"STATIC DECALS",0,1,1,true}, {"UNBATCHED DECALS",0,1,1,true}, {"LIGHT SHAFTS",0,1,1,true},
     {"DISTORTION",0,1,1,true}, {"RADIAL BLUR",0,1,1,true}, {"ANISOTROPIC FILTERING",0,4,1,false},
     {"FASTER VISIBILITY TESTS",0,1,1,true}, {"FASTER AUDIO LIMITER",0,1,1,true},
-    {"FRAME PACING",0,1,1,true}, {"RELOAD BUTTON",0,1,1,true}
+    {"FRAME PACING",0,1,1,true}, {"RELOAD BUTTON",0,1,1,true}, {"RADIAL BY TAP",0,1,1,true}
 };
 static_assert(std::size(touchSettingSpecs) == kTouchSettingCount);
 inline const char* TouchSettingCaption(std::size_t id, bool russian) {
@@ -59,7 +61,7 @@ inline const char* TouchSettingCaption(std::size_t id, bool russian) {
         "ДИНАМИЧЕСКИЕ ТЕНИ", "ТЕНИ ОСВЕЩЕНИЯ", "СТАТИЧЕСКИЕ ДЕКАЛИ", "ОТДЕЛЬНЫЕ ДЕКАЛИ",
         "СВЕТОВЫЕ ЛУЧИ", "ИСКАЖЕНИЯ", "РАДИАЛЬНОЕ РАЗМЫТИЕ", "АНИЗОТРОПНАЯ ФИЛЬТРАЦИЯ",
         "УСКОРЕНИЕ ОТСЕЧЕНИЯ ОБЪЕКТОВ", "УСКОРЕНИЕ АУДИОЛИМИТЕРА", "РОВНЫЙ ТЕМП КАДРОВ",
-        "КНОПКА ПЕРЕЗАРЯДКИ"
+        "КНОПКА ПЕРЕЗАРЯДКИ", "РАДИАЛ ПО ТАПУ"
     };
     static_assert(std::size(captions) == kTouchSettingCount);
     return russian ? captions[id] : touchSettingSpecs[id].caption;
@@ -80,6 +82,9 @@ inline const char* TouchSettingHint(std::size_t id, bool russian) {
     if (id == kTouchReloadButtonSetting) return russian ?
         "Кнопка «Зарядить» появляется, когда магазин неполный и перезарядка ещё не идёт. Тап по полосе патронов перезаряжает и без неё." :
         "Shows Reload while the magazine is not full and no reload is running. Tapping the ammo bar reloads either way.";
+    if (id == kTouchRadialTapSetting) return russian ?
+        "Короткий тап по «Ещё» оставляет радиал открытым до следующего тапа. Удержание с протяжкой работает как раньше." :
+        "A short tap on More keeps the radial open until the next tap. Hold and drag work as before.";
     if (id >= 21 && id < 32) return russian ?
         "Сохраняется отдельно. Картофельная графика временно перекрывает выбранное значение." :
         "Saved separately. Potato graphics temporarily overrides the selected value.";
@@ -130,8 +135,8 @@ struct TouchSettingsState {
     std::vector<std::int32_t> nativeEvents, events;
 };
 inline TouchSettingsState touchSettingsState;
-// Host input [version 7, revision acknowledgement, 36 values]; output
-// [version 7, revision, command bits, 36 values]. Bits 1-8 are one-shot
+// Host input [version 8, revision acknowledgement, 37 values]; output
+// [version 8, revision, command bits, 37 values]. Bits 1-8 are one-shot
 // commands; 16 is set while the video options page is shown, so Java can offer
 // a restart for a new render resolution once that page closes. Unacknowledged
 // native edits win over an older Java snapshot, including the final menu-close poll.

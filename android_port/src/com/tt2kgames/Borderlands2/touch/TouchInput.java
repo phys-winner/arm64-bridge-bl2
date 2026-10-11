@@ -73,7 +73,9 @@ public final class TouchInput {
     public void down(int id, int role, int action, float x, float y) {
         if (!context.usable() || pointers.containsKey(id) || pointers.size() >= 10
                 || !Float.isFinite(x) || !Float.isFinite(y)) return;
-        if (role == MOVEMENT && (!context.gameplay() || moveId >= 0)) role = IGNORE;
+        if (role == MOVEMENT && !context.gameplay()) role = IGNORE;
+        // The stick zone holds one stick; another finger there turns the camera.
+        else if (role == MOVEMENT && moveId >= 0) role = LOOK;
         if (role == LOOK && (!context.gameplay() || !context.has(RELATIVE_LOOK))) role = IGNORE;
         if (role == BUTTON && (action < 0 || action >= ACTION_COUNT || !context.allows(action))) role = IGNORE;
         if (role == BUTTON && action == AIM && aimLatches()) {

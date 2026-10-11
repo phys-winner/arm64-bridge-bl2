@@ -107,6 +107,24 @@ public final class TouchLayout {
     public static int radialSector(float x, float y, float cx, float cy, float radius) {
         return radialSector(x,y,cx,cy,radius,8);
     }
+    /**
+     * Horizontal span {left,right} of a hint pill of the wanted width, centred at
+     * centerX inside [minX,maxX] and clear of every HUD rect {left,top,right,bottom}
+     * crossing its band [top,bottom] (minimap, objectives): a rect right of the
+     * centre caps the right edge, one left of it the left edge. Null without room.
+     */
+    public static float[] hintSpan(float centerX,float wanted,float minX,float maxX,float top,float bottom,
+                                   float gap,float[]... avoid) {
+        float low=minX,high=maxX;
+        for (float[] r:avoid) {
+            if (r==null || r.length!=4 || !(r[2]>r[0]) || !(r[3]>r[1]) || r[3]<=top || r[1]>=bottom) continue;
+            if ((r[0]+r[2])/2>=centerX) high=Math.min(high,r[0]-gap); else low=Math.max(low,r[2]+gap);
+        }
+        if (!(high-low>0) || !(wanted>0)) return null;
+        float width=Math.min(wanted,high-low);
+        float left=Math.max(low,Math.min(high-width,centerX-width/2));
+        return new float[]{left,left+width};
+    }
     /** The adaptive radial has one to twelve equal sectors, the first at twelve o'clock. */
     public static int radialSector(float x, float y, float cx, float cy, float radius,int sectors) {
         double dx=x-cx, dy=y-cy, distance=Math.hypot(dx,dy);

@@ -11,12 +11,30 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /** Layout is saved in normalized safe-rect coordinates under the game data root. */
 public final class TouchPreferences {
     private static final String TAG = "BL2TouchPreferences";
     private static final int MAX_SETTINGS_BYTES = 64 * 1024;
-    static final int SETTINGS_VERSION = 7, SETTINGS_FIELDS = 36;
+    /**
+     * A change is written this long after the last one, off the UI thread: the
+     * settings exchange polls every 100 ms while a slider moves, and one FUSE
+     * write with fsync and read-back costs tens of milliseconds on device.
+     */
+    static final long SAVE_DELAY_MS = 500;
+    private static final ScheduledExecutorService WRITER = Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "BL2TouchSettings");
+        thread.setDaemon(true);
+        return thread;
+    });
+    static final int SETTINGS_VERSION = 8, SETTINGS_FIELDS = 37;
     /** Settings 32 onward, all ON by default. */
     private static final String[] PERFORMANCE_KEYS = {"fasterVisibility", "fasterAudioLimiter", "framePacing"};
     private static final String[] GRAPHICS_KEYS = {"bloom", "motionBlur", "lensFlares", "dynamicShadows",
@@ -29,7 +47,14 @@ public final class TouchPreferences {
             "gameMoreHintSeen", "menuMoreHintSeen", "debugMoreHintSeen", "autoRunHintSeen",
             "mapNavigationHintSeen", "layoutHintSeen", "weaponSlotsHintSeen", "skillTapHintSeen", "statusTapsHintSeen"};
     private final Activity activity;
+    /** Host checks only: written without the external game data check. */
+    private final File hostFile;
     private final Properties store = new Properties();
+    private final Object writeLock = new Object();
+    private boolean dirty;
+    private ScheduledFuture<?> scheduledWrite;
+    /** Completed file commits, for host checks. */
+    volatile int writes;
     public float opacity, scale, look, ads;
     public volatile int renderPercent, uiPercent, fpsLimit;
     public boolean showFPS;
@@ -41,6 +66,8 @@ public final class TouchPreferences {
     public boolean gyroEnabled, gyroAdsOnly, gyroInvertY, haptics, aimToggle;
     /** Show Reload while the native route reports that a reload is possible. */
     public boolean reloadButton;
+    /** A short tap on More keeps the radial open for a second tap (RADIAL BY TAP). */
+    public boolean radialTap;
     public boolean debugMenuVisible;
     public boolean mapTapHintSeen, weaponGestureHintSeen;
     public boolean gameMoreHintSeen, menuMoreHintSeen, debugMoreHintSeen, autoRunHintSeen;
@@ -49,10 +76,28 @@ public final class TouchPreferences {
     private boolean debugMenuStored;
     public float gyroSensitivity, gyroDeadzone;
     /** In-memory preferences for host protocol checks. */
-    TouchPreferences() { activity = null; reload(); }
+    TouchPreferences() { activity = null; hostFile = null; reload(); }
+    /** File-backed preferences for host checks of the deferred writer. */
+    TouchPreferences(File file) {
+        activity = null; hostFile = file;
+        load(file);
+        reload();
+    }
     public TouchPreferences(Activity owner) {
-        activity = owner;
+        activity = owner; hostFile = null;
         File target = new File(GameStorage.root(activity), "touch-controls.properties");
+        if (target.isFile()) load(target);
+        else {
+            SharedPreferences legacy = activity.getSharedPreferences("bl2_native_touch_v1", 0);
+            for (Map.Entry<String, ?> entry : legacy.getAll().entrySet()) {
+                store.setProperty(entry.getKey(), String.valueOf(entry.getValue()));
+            }
+            // Legacy preferences remain intact until restart/readback acceptance.
+            persist();
+        }
+        reload();
+    }
+    private void load(File target) {
         if (target.isFile()) {
             try (FileInputStream input = new FileInputStream(target)) {
                 if (target.length() > MAX_SETTINGS_BYTES) throw new IOException("Touch settings too large");
@@ -65,15 +110,7 @@ public final class TouchPreferences {
                 store.clear();
                 Log.e(TAG, "Cannot read touch settings; retaining file", error);
             }
-        } else {
-            SharedPreferences legacy = activity.getSharedPreferences("bl2_native_touch_v1", 0);
-            for (Map.Entry<String, ?> entry : legacy.getAll().entrySet()) {
-                store.setProperty(entry.getKey(), String.valueOf(entry.getValue()));
-            }
-            // Legacy preferences remain intact until restart/readback acceptance.
-            persist();
         }
-        reload();
     }
     private float number(String key, float fallback) {
         try { return Float.parseFloat(store.getProperty(key, Float.toString(fallback))); }
@@ -109,6 +146,7 @@ public final class TouchPreferences {
         haptics = Boolean.parseBoolean(store.getProperty("haptics", "true"));
         aimToggle = Boolean.parseBoolean(store.getProperty("aimToggle", "true"));
         reloadButton = Boolean.parseBoolean(store.getProperty("reloadButton", "true"));
+        radialTap = Boolean.parseBoolean(store.getProperty("radialTap", "false"));
         debugMenuStored = store.containsKey("debugMenuVisible");
         debugMenuVisible = Boolean.parseBoolean(store.getProperty("debugMenuVisible", "false"));
         mapTapHintSeen = Boolean.parseBoolean(store.getProperty("mapTapHintSeen", "false"));
@@ -157,6 +195,7 @@ public final class TouchPreferences {
         store.setProperty("haptics", Boolean.toString(haptics));
         store.setProperty("aimToggle", Boolean.toString(aimToggle));
         store.setProperty("reloadButton", Boolean.toString(reloadButton));
+        store.setProperty("radialTap", Boolean.toString(radialTap));
         if (debugMenuStored) store.setProperty("debugMenuVisible", Boolean.toString(debugMenuVisible));
         store.setProperty("gyroSensitivity", Float.toString(gyroSensitivity));
         store.setProperty("gyroDeadzone", Float.toString(gyroDeadzone));
@@ -226,7 +265,7 @@ public final class TouchPreferences {
             else store.setProperty(GRAPHICS_KEYS[i], Integer.toString(advancedGraphics[i]));
         }
     }
-    /** Shared with bl2_touch_settings: version 7, acknowledged revision, 36 fixed fields. */
+    /** Shared with bl2_touch_settings: version 8, acknowledged revision, 37 fixed fields. */
     public int[] settingsWire(int revision) {
         int[] controls = new int[]{SETTINGS_VERSION, revision, renderPercent, Float.floatToIntBits(opacity), Float.floatToIntBits(scale),
             Float.floatToIntBits(look), Float.floatToIntBits(ads), leftHanded?1:0, invertY?1:0,
@@ -238,6 +277,7 @@ public final class TouchPreferences {
         System.arraycopy(advancedGraphics, 0, values, 23, advancedGraphics.length);
         for (int i = 0; i < performance.length; ++i) values[34+i] = performance[i] ? 1 : 0;
         values[37] = reloadButton ? 1 : 0;
+        values[38] = radialTap ? 1 : 0;
         return values;
     }
     private static boolean wireFloat(int bits, float low, float high) {
@@ -278,6 +318,7 @@ public final class TouchPreferences {
         System.arraycopy(words, 24, advancedGraphics, 0, advancedGraphics.length);
         for (int i = 0; i < performance.length; ++i) performance[i] = words[35+i] != 0;
         reloadButton = words[38] != 0;
+        radialTap = words[39] != 0;
         debugMenuStored |= (words[2]&8)!=0;
         // Reset wins over edits returned in the same poll, preserving non-touch choices.
         if ((words[2]&2)!=0) resetTouch(); else save();
@@ -294,24 +335,63 @@ public final class TouchPreferences {
     public static int fpsLimit(float value) {
         return value == 30 || value == 60 || value == 90 ? (int)value : 0;
     }
+    /** Marks the store changed; the writer commits it SAVE_DELAY_MS after the last change. */
     private void persist() {
-        if (activity == null) return;
+        if (activity == null && hostFile == null) return;
+        synchronized (writeLock) {
+            dirty = true;
+            if (scheduledWrite != null) scheduledWrite.cancel(false);
+            scheduledWrite = WRITER.schedule(this::writePending, SAVE_DELAY_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+    /**
+     * Commits a pending change now and waits for it: the activity pauses, the
+     * overlay goes away or the process is about to be restarted.
+     */
+    public void flush() {
+        Future<?> done;
+        synchronized (writeLock) {
+            if (!dirty) return;
+            if (scheduledWrite != null) scheduledWrite.cancel(false);
+            scheduledWrite = null;
+            done = WRITER.submit(this::writePending);
+        }
+        try {
+            done.get(2, TimeUnit.SECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException | TimeoutException error) {
+            Log.e(TAG, "Touch settings flush incomplete", error);
+        }
+    }
+    /** Writer thread: the latest snapshot, never an older one, wins the file. */
+    private void writePending() {
+        Properties snapshot;
+        synchronized (writeLock) {
+            if (!dirty) return;
+            dirty = false;
+            snapshot = (Properties) store.clone();
+        }
         File temporary = null;
         try {
-            File external = activity.getExternalFilesDir(null);
-            File target = GameStorage.file(activity, "touch-controls.properties");
-            if (external == null || !target.getParentFile().getCanonicalFile().equals(external.getCanonicalFile())) {
-                throw new IOException("External game data unavailable; retaining legacy preferences");
+            File target = hostFile;
+            if (activity != null) {
+                File external = activity.getExternalFilesDir(null);
+                target = GameStorage.file(activity, "touch-controls.properties");
+                if (external == null || !target.getParentFile().getCanonicalFile().equals(external.getCanonicalFile())) {
+                    throw new IOException("External game data unavailable; retaining legacy preferences");
+                }
             }
             temporary = new File(target.getParentFile(), target.getName() + ".tmp");
             try (FileOutputStream output = new FileOutputStream(temporary)) {
-                store.store(output, "Borderlands 2 touch settings");
+                snapshot.store(output, "Borderlands 2 touch settings");
                 output.getFD().sync();
             }
             Properties check = new Properties();
             try (FileInputStream input = new FileInputStream(temporary)) { check.load(input); }
-            if (!store.equals(check)) throw new IOException("Touch settings verification failed");
+            if (!snapshot.equals(check)) throw new IOException("Touch settings verification failed");
             if (!temporary.renameTo(target)) throw new IOException("Cannot commit touch settings");
+            synchronized (writeLock) { ++writes; }
         } catch (IOException | SecurityException error) {
             Log.e(TAG, "Cannot save external touch settings", error);
         } finally {
