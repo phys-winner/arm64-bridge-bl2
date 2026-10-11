@@ -56,8 +56,12 @@ public final class GameRestart extends Activity {
             handler.postDelayed(this::launchWhenReleased, POLL_MS);
             return;
         }
-        Log.i(TAG, "Game process " + gamePid + " released after "
-                + (SystemClock.uptimeMillis() - started) + " ms; starting the launcher");
+        // This process never loads the bridge, so final builds cannot drop the
+        // message: it appears only on request (setprop log.tag.BL2Restart D).
+        if (Log.isLoggable(TAG, Log.DEBUG)) {
+            Log.d(TAG, "Game process " + gamePid + " released after "
+                    + (SystemClock.uptimeMillis() - started) + " ms; starting the launcher");
+        }
         startActivity(new Intent(this, Downloader.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
         finish();

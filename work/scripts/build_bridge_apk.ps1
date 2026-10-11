@@ -4,10 +4,15 @@ param(
     [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$NativeBuildDir = 'bridge-seed2',
     [switch]$Diagnostics,
     [switch]$PhysxCookieWatch,
-    [switch]$Release
+    [switch]$Release,
+    # A release whose bridge never writes to logcat and whose process drops the
+    # BL2*/Arm32Bridge* Java tags on Android 11+ (HORN_SILENT_LOGCAT).
+    [switch]$Final
 )
 $ErrorActionPreference = 'Stop'
 if ($PhysxCookieWatch -and !$Diagnostics) { throw 'PhysX cookie watch requires a diagnostic build' }
+if ($Final -and $Diagnostics) { throw 'A final build excludes diagnostics' }
+$releaseBuild = $Release.IsPresent -or $Final.IsPresent
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $build = Join-Path $root 'work\build'
 $stagePack = Get-Item -LiteralPath (Join-Path $root 'app/assets/bl2_shader_stages.bin')
@@ -32,7 +37,8 @@ try {
     $cmake = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\cmake.exe'
     $diagnosticFlag = if ($Diagnostics) { 'ON' } else { 'OFF' }
     $physxDiagnosticFlag = if ($PhysxCookieWatch) { 'ON' } else { 'OFF' }
-    $debugMenuFlag = if ($Release) { 'OFF' } else { 'ON' }
+    $debugMenuFlag = if ($releaseBuild) { 'OFF' } else { 'ON' }
+    $silentFlag = if ($Final) { 'ON' } else { 'OFF' }
     if (!(Test-Path -LiteralPath (Join-Path $nativeBuild 'CMakeCache.txt'))) {
         $ndk = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018'
         & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild -G Ninja `
@@ -41,7 +47,7 @@ try {
             '-DCMAKE_MAKE_PROGRAM=C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\ninja.exe'
         if ($LASTEXITCODE) { throw 'Fresh offline native configuration failed' }
     }
-    & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag" "-DHORN_ENABLE_PHYSX_COOKIE_WATCH=$physxDiagnosticFlag" '-DHORN_GL_SELF_CHECK=OFF' "-DBL2_ENABLE_DEBUG_MENU_DEFAULT=$debugMenuFlag"
+    & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag" "-DHORN_ENABLE_PHYSX_COOKIE_WATCH=$physxDiagnosticFlag" '-DHORN_GL_SELF_CHECK=OFF' "-DBL2_ENABLE_DEBUG_MENU_DEFAULT=$debugMenuFlag" "-DHORN_SILENT_LOGCAT=$silentFlag"
     if ($LASTEXITCODE) { throw 'Native configuration failed' }
     & $cmake --build $nativeBuild --config Release --parallel 8
     if ($LASTEXITCODE) { throw 'Native build failed' }
@@ -125,6 +131,14 @@ try {
         }
         $exports = & "$llvmBin\llvm-nm.exe" -D --defined-only $nativePath
         if ($LASTEXITCODE -or ($exports -match 'Bl2Arm64GlParitySelfCheck|Bl2FreshPersistentBufferNamesSelfCheck')) { throw 'Gameplay bridge retains a GPU self-check entry' }
+        if ($cache -notmatch "(?m)^HORN_SILENT_LOGCAT:BOOL=${silentFlag}\r?$") { throw 'Silent logcat flag gate failed' }
+        if ($Final) {
+            # --wrap leaves no import of a liblog write function behind.
+            $imports = & "$llvmBin\llvm-nm.exe" -D --undefined-only $nativePath
+            if ($LASTEXITCODE -or ($imports -match '\s__android_log_(write|print|vprint|buf_write|buf_print)(@\S*)?\s*$')) {
+                throw 'Final bridge still imports a liblog write function'
+            }
+        }
     }
     if ($PreviousSeed -gt 0 -and $PreviousSeed -ne $Seed) {
         $previous = Join-Path $build "bl2-arm64-bridge-seed$PreviousSeed.apk"
@@ -143,9 +157,10 @@ try {
 }
 $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;bytes=(Get-Item -LiteralPath $signed).Length;
     bridge_logging=[bool]$Diagnostics.IsPresent;perf_probe_compiled=[bool]$Diagnostics.IsPresent;
-    release_build=[bool]$Release.IsPresent;debug_menu_default_enabled=(!$Release);
+    release_build=$releaseBuild;debug_menu_default_enabled=(!$releaseBuild);
+    final_build=[bool]$Final.IsPresent;silent_logcat=[bool]$Final.IsPresent;
     russian_text_in_base=$true;app_locales=@('en','ru');cache_layout='rebalanced';
-    bounded_backend_cache_display_logs=$true;gl_self_check_compiled=$false;
+    bounded_backend_cache_display_logs=(!$Final.IsPresent);gl_self_check_compiled=$false;
     physx_cookie_watch_compiled=[bool]$PhysxCookieWatch.IsPresent;
     cmake_source_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'arm64_bridge\CMakeLists.txt')).Hash;
     fastmem_fpsr_patch_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'arm64_bridge\patches\dynarmic-arm64-fastmem-fpsr.patch')).Hash;
@@ -154,7 +169,7 @@ $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;
     guest_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'app\assets\guest_libs\libUnrealEngine3.so')).Hash;
     stage_table_sha256=$stagePackHash;stage_table_bytes=$stagePack.Length;
     native_code='arm64-v8a';gles='3.2';zip_page_alignment=16384;
-    movies_skip_default=$true;movies_playback_property='debug.horn.play_movies';
+    movies_skip_default=$false;movies_skip_property='debug.horn.play_movies=0';
     render_scale_default='50%';render_scale_diagnostic_property='debug.bl2.render_scale';
     render_scale_user_min_percent=50;render_scale_user_max_percent=150;render_scale_user_step_percent=10;
     render_scale_user_preference='touch-controls.properties:renderPercent';

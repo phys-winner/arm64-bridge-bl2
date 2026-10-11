@@ -16,7 +16,8 @@ namespace bl2::touch {
 #endif
 constexpr std::uint32_t kTouchSettingsVersion = 8;
 constexpr std::size_t kTouchSettingCount = 37;
-// Present pacing (bl2_frame_pacer): ON by default and switchable while playing.
+// Present pacing (bl2_frame_pacer). Its Video row is commented out by user
+// request and the pacer stays off; the wire field is kept unchanged.
 constexpr std::size_t kTouchFramePacingSetting = 34;
 // Java shows Reload while a reload is possible; ON by default.
 constexpr std::size_t kTouchReloadButtonSetting = 35;
@@ -183,8 +184,11 @@ inline std::uint32_t Bl2FrameRateLimit() {
     return state.initialized ? state.values[19] : 0u;
 }
 inline bool Bl2FramePacingEnabled() {
-    auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
-    return !state.initialized || state.values[kTouchFramePacingSetting] != 0;
+    // FRAME PACING is commented out by user request: always unpaced, whatever
+    // value an earlier build saved. Restore the two lines below with the row.
+    // auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
+    // return !state.initialized || state.values[kTouchFramePacingSetting] != 0;
+    return false;
 }
 inline bool SetBl2TouchSetting(std::size_t id, double value) {
     if (id >= kTouchSettingCount || !std::isfinite(value)) return false;

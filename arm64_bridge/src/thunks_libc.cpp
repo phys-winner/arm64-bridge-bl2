@@ -4860,37 +4860,39 @@ void ThunkManager::RegisterLibcThunks() {
             const bool legacy_command_line = read_only &&
                 IsLegacyCommandLinePath(path);
             if (legacy_command_line) {
+                // Movies play by default again (user request 2026-10-11; the
+                // 2026-09-25 default skip is now the QA opt-in
+                // debug.horn.play_movies=0). Without any QA flag the engine
+                // reads the ordinary command line below, as the original game.
                 char play_movies[PROP_VALUE_MAX] = {};
-                const bool movies_enabled =
+                const bool skip_movies =
                     __system_property_get("debug.horn.play_movies", play_movies) > 0 &&
-                    play_movies[0] == '1';
-                if (!movies_enabled) {
-                    static char kDefaultMovieFlags[] =
-                        "-nomovies -nostartupmovies\n";
-                    static char kLowQualityFlags[] =
-                        "-nomovies -nostartupmovies -SystemSettings=SystemSettingsMobile\n";
-                    // ParseParam recognizes a space after its final argument.
-                    static char kNoSoundFlags[] =
-                        "-nomovies -nostartupmovies -nosound \n";
-                    static char kLowQualityNoSoundFlags[] =
-                        "-nomovies -nostartupmovies -SystemSettings=SystemSettingsMobile -nosound \n";
-                    char no_sound[PROP_VALUE_MAX] = {};
-                    const bool no_sound_enabled =
-                        __system_property_get("debug.bl2.no_sound", no_sound) > 0 &&
-                        std::strcmp(no_sound, "1") == 0;
-                    char low_quality[PROP_VALUE_MAX] = {};
-                    const bool low_quality_enabled =
-                        __system_property_get("debug.bl2.low_quality", low_quality) > 0 &&
-                        low_quality[0] == '1' && low_quality[1] == '\0';
-                    char* flags = no_sound_enabled
-                        ? (low_quality_enabled ? kLowQualityNoSoundFlags : kNoSoundFlags)
-                        : (low_quality_enabled ? kLowQualityFlags : kDefaultMovieFlags);
-                    const size_t flags_size = no_sound_enabled
-                        ? (low_quality_enabled ? sizeof(kLowQualityNoSoundFlags) - 1
-                                               : sizeof(kNoSoundFlags) - 1)
-                        : (low_quality_enabled ? sizeof(kLowQualityFlags) - 1
-                                               : sizeof(kDefaultMovieFlags) - 1);
-                    f = fmemopen(flags, flags_size, "r");
+                    play_movies[0] == '0';
+                char no_sound[PROP_VALUE_MAX] = {};
+                const bool no_sound_enabled =
+                    __system_property_get("debug.bl2.no_sound", no_sound) > 0 &&
+                    std::strcmp(no_sound, "1") == 0;
+                char low_quality[PROP_VALUE_MAX] = {};
+                const bool low_quality_enabled =
+                    __system_property_get("debug.bl2.low_quality", low_quality) > 0 &&
+                    low_quality[0] == '1' && low_quality[1] == '\0';
+                // Index: skip movies 4, low quality 2, no sound 1. ParseParam
+                // recognizes a space after its final argument.
+                static char kQaCommandLines[8][80] = {
+                    "",
+                    "-nosound \n",
+                    "-SystemSettings=SystemSettingsMobile\n",
+                    "-SystemSettings=SystemSettingsMobile -nosound \n",
+                    "-nomovies -nostartupmovies\n",
+                    "-nomovies -nostartupmovies -nosound \n",
+                    "-nomovies -nostartupmovies -SystemSettings=SystemSettingsMobile\n",
+                    "-nomovies -nostartupmovies -SystemSettings=SystemSettingsMobile -nosound \n",
+                };
+                const unsigned qa_variant = (skip_movies ? 4u : 0u) |
+                    (low_quality_enabled ? 2u : 0u) | (no_sound_enabled ? 1u : 0u);
+                if (qa_variant) {
+                    char* flags = kQaCommandLines[qa_variant];
+                    f = fmemopen(flags, strlen(flags), "r");
                     if (f && no_sound_enabled) {
                         static std::atomic<bool> logged{false};
                         if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -4899,8 +4901,9 @@ void ThunkManager::RegisterLibcThunks() {
                                 low_quality_enabled);
                         }
                     }
-                    if (f) LOGI("fopen: default arm64 movie skip enabled; "
-                                "low_quality=%d", low_quality_enabled);
+                    if (f) LOGI("fopen: arm64 QA command line skip_movies=%d "
+                                "low_quality=%d no_sound=%d", skip_movies,
+                                low_quality_enabled, no_sound_enabled);
                 }
                 if (!f && !g_saved_files_dir.empty()) {
                     const std::string app_command_line = g_saved_files_dir +

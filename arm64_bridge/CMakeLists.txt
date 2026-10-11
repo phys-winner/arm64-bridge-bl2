@@ -12,6 +12,10 @@ option(HORN_ENABLE_LOGGING "Compile bridge and forwarded guest logcat output" OF
 option(HORN_ENABLE_PHYSX_COOKIE_WATCH "Compile optional default-off BL2 PhysX first-write diagnostic" OFF)
 option(HORN_GL_SELF_CHECK "Compile bounded real GLES guest-thunk regression" OFF)
 option(BL2_ENABLE_DEBUG_MENU_DEFAULT "Show Pause Debug by default in development builds" OFF)
+option(HORN_SILENT_LOGCAT "Final build: no bridge logcat output, BL2* Java tags dropped on Android 11+" OFF)
+if(HORN_SILENT_LOGCAT AND (HORN_ENABLE_LOGGING OR HORN_ENABLE_PERF_PROBE OR HORN_ENABLE_PHYSX_COOKIE_WATCH))
+    message(FATAL_ERROR "HORN_SILENT_LOGCAT excludes the diagnostic options")
+endif()
 
 include(FetchContent)
 
@@ -268,6 +272,9 @@ set(BRIDGE_SOURCES
 if(HORN_ENABLE_PERF_PROBE)
     list(APPEND BRIDGE_SOURCES src/perf_probe.cpp)
 endif()
+if(HORN_SILENT_LOGCAT)
+    list(APPEND BRIDGE_SOURCES src/bl2_silent_log.cpp)
+endif()
 
 add_library(${BRIDGE_TARGET} SHARED ${BRIDGE_SOURCES})
 if(HORN_GL_SELF_CHECK)
@@ -335,3 +342,16 @@ target_link_options(${BRIDGE_TARGET} PRIVATE
     "-Wl,-z,max-page-size=16384"
     "-Wl,-z,common-page-size=16384"
 )
+
+if(HORN_SILENT_LOGCAT)
+    # Every bridge call of a liblog write function, the touch sources'
+    # included, lands in a no-op of src/bl2_silent_log.cpp.
+    target_compile_definitions(${BRIDGE_TARGET} PRIVATE HORN_SILENT_LOGCAT=1)
+    target_link_options(${BRIDGE_TARGET} PRIVATE
+        "-Wl,--wrap=__android_log_write"
+        "-Wl,--wrap=__android_log_print"
+        "-Wl,--wrap=__android_log_vprint"
+        "-Wl,--wrap=__android_log_buf_write"
+        "-Wl,--wrap=__android_log_buf_print"
+    )
+endif()

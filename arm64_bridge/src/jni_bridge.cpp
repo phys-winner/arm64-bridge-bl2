@@ -48,6 +48,9 @@
 #include "bl2_guest_integrity.h"
 #include "bl2_touch_runtime.h"
 #include "bl2_io_failure_probe.h"
+#if HORN_SILENT_LOGCAT
+#include "bl2_silent_log.h"
+#endif
 #include "bl2_touch_physical.h"
 #include "bl2_locale.h"
 #include "bl2_shader_stage_cache.h"
@@ -3203,6 +3206,9 @@ static void RollBackTable(JNIEnv* env, jclass cls, const char* class_name) {
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+#if HORN_SILENT_LOGCAT
+    Bl2SilenceProcessLogs();  // Before any Java code of this process logs again.
+#endif
     g_jvm = vm;
     JNIEnv* env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {

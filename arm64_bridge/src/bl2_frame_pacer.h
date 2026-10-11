@@ -11,8 +11,10 @@
 // number of refreshes (EGL_ANDROID_presentation_time), chooses that interval
 // from measured render-thread and GPU times, and holds the render thread until
 // the next frame is due, which also gives the guest game thread (one frame
-// behind it) the same cadence. The FRAME PACING setting switches it while
-// playing; debug.bl2.frame_pacing=0 before launch disables it.
+// behind it) the same cadence. The FRAME PACING setting that switched it while
+// playing is commented out by user request, so the bridge passes allowed=false
+// (bl2_touch_settings.h Bl2FramePacingEnabled); debug.bl2.frame_pacing=0 before
+// launch also disables it.
 
 struct Bl2FramePace {
     float paced_fps;  // Presented rate, 0 while frames are unpaced.

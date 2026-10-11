@@ -668,11 +668,13 @@ private:
             if (!row(TouchSettingCaption(id,Bl2RussianLocaleSelected()),kTouchSettingsValue + id,id)) return false;
             if (id == 0 && (!row(TouchSettingCaption(18,Bl2RussianLocaleSelected()),kTouchSettingsValue + 18,18) ||
                 !row(TouchSettingCaption(19,Bl2RussianLocaleSelected()),kTouchSettingsValue + 19,19) ||
-#if !defined(BL2_NATIVE_ARM32) // The frame pacer belongs to the ARM64 bridge.
-                !row(TouchSettingCaption(kTouchFramePacingSetting,Bl2RussianLocaleSelected()),
-                    kTouchSettingsValue + static_cast<std::int32_t>(kTouchFramePacingSetting),
-                    static_cast<int>(kTouchFramePacingSetting)) ||
-#endif
+                // FRAME PACING row commented out by user request: the pacer stays off
+                // (Bl2FramePacingEnabled in bl2_touch_settings.h).
+// #if !defined(BL2_NATIVE_ARM32) // The frame pacer belongs to the ARM64 bridge.
+//              !row(TouchSettingCaption(kTouchFramePacingSetting,Bl2RussianLocaleSelected()),
+//                  kTouchSettingsValue + static_cast<std::int32_t>(kTouchFramePacingSetting),
+//                  static_cast<int>(kTouchFramePacingSetting)) ||
+// #endif
                 !row(TouchSettingCaption(20,Bl2RussianLocaleSelected()),kTouchSettingsValue + 20,20) ||
                 !row(Bl2RussianLocaleSelected() ? "ДОПОЛНИТЕЛЬНАЯ ГРАФИКА" : "ADDITIONAL GRAPHICS",kTouchSettingsGraphicsOpen))) return false;
         }

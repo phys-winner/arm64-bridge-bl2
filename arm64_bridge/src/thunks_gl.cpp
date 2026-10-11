@@ -146,7 +146,10 @@ void RefreshGlVertexArrayBindings() {
     InvalidateGlAttribCache();
 }
 
+static void AdoptContextLegacyPrograms();
+
 void RefreshGlBindings() {
+    AdoptContextLegacyPrograms();
     InvalidateGlStateCaches();
     s_bound_array_buffer = 0;
     s_bound_element_buffer = 0;
@@ -1143,6 +1146,69 @@ static std::atomic<uint32_t> s_legacy_link_logs{0};
 static thread_local GLuint s_bound_legacy_vertex = 0;
 static thread_local GLuint s_bound_legacy_fragment = 0;
 
+// The emulated ARB program bindings are context state, as real GL program
+// bindings are. BL2 restarts its render worker after a Bink movie, and the new
+// thread draws the next movie with the programs the old one bound: the guest
+// RHI cache skips glBindProgramARB. Without the binding the bridge bound none of
+// the movie's textures, so the luma plane sampled a stale unit and the chroma
+// planes an empty one (green Gearbox/NVIDIA logos).
+struct LegacyContextPrograms {
+    std::atomic<GLuint> vertex{0};
+    std::atomic<GLuint> fragment{0};
+};
+static std::mutex s_legacy_context_programs_mutex;
+// Entries are never erased (a few contexts per process); creation resets one.
+static std::unordered_map<EGLContext, std::unique_ptr<LegacyContextPrograms>>
+    s_legacy_context_programs;
+
+static LegacyContextPrograms* LegacyContextProgramsFor(EGLContext context) {
+    if (context == EGL_NO_CONTEXT) return nullptr;
+    static thread_local EGLContext cached_context = EGL_NO_CONTEXT;
+    static thread_local LegacyContextPrograms* cached = nullptr;
+    if (context != cached_context) {
+        std::lock_guard lock(s_legacy_context_programs_mutex);
+        auto& programs = s_legacy_context_programs[context];
+        if (!programs) programs = std::make_unique<LegacyContextPrograms>();
+        cached = programs.get();
+        cached_context = context;
+    }
+    return cached;
+}
+
+static void RecordContextLegacyPrograms(EGLContext context, GLuint vertex, GLuint fragment) {
+    if (auto* programs = LegacyContextProgramsFor(context)) {
+        programs->vertex.store(vertex, std::memory_order_release);
+        programs->fragment.store(fragment, std::memory_order_release);
+    }
+}
+
+static void SetBoundLegacyPrograms(GLuint vertex, GLuint fragment) {
+    s_bound_legacy_vertex = vertex;
+    s_bound_legacy_fragment = fragment;
+    RecordContextLegacyPrograms(eglGetCurrentContext(), vertex, fragment);
+}
+
+// After eglMakeCurrent: this thread continues with the context's bindings.
+static void AdoptContextLegacyPrograms() {
+    const auto* programs = LegacyContextProgramsFor(eglGetCurrentContext());
+    s_bound_legacy_vertex = programs ? programs->vertex.load(std::memory_order_acquire) : 0;
+    s_bound_legacy_fragment = programs ? programs->fragment.load(std::memory_order_acquire) : 0;
+}
+
+// A deleted program is unbound from this thread and from every context.
+static void ForgetLegacyProgramName(GLuint name) {
+    if (s_bound_legacy_vertex == name) s_bound_legacy_vertex = 0;
+    if (s_bound_legacy_fragment == name) s_bound_legacy_fragment = 0;
+    std::lock_guard lock(s_legacy_context_programs_mutex);
+    for (auto& [context, programs] : s_legacy_context_programs) {
+        (void)context;
+        GLuint expected = name;
+        programs->vertex.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+        expected = name;
+        programs->fragment.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    }
+}
+
 void Bl2ShaderWarmupContextCreated(EGLDisplay display, EGLContext context,
                                   EGLContext share) {
     if (context == EGL_NO_CONTEXT) return;
@@ -1152,6 +1218,7 @@ void Bl2ShaderWarmupContextCreated(EGLDisplay display, EGLContext context,
         ? parent->second.group : s_next_shader_share_group++;
     s_shader_share_groups[context] = {display, group};
     InvalidateLegacyDrawCacheLocked();  // A recycled EGLContext address.
+    RecordContextLegacyPrograms(context, 0, 0);
 }
 
 static void AbandonDeadShaderWarmupGroupLocked() {
@@ -2437,8 +2504,8 @@ static void ApplyProgramUpgradesLocked(EGLContext context) {
 #endif
 
 static void BindLegacyProgram(GLenum target, GLuint name) {
-    if (target == kVertexProgramArb) s_bound_legacy_vertex = name;
-    else if (target == kFragmentProgramArb) s_bound_legacy_fragment = name;
+    if (target == kVertexProgramArb) SetBoundLegacyPrograms(name, s_bound_legacy_fragment);
+    else if (target == kFragmentProgramArb) SetBoundLegacyPrograms(s_bound_legacy_vertex, name);
     else {
         if (s_deferred_gl_error == GL_NO_ERROR) s_deferred_gl_error = GL_INVALID_ENUM;
         return;
@@ -3561,6 +3628,7 @@ bool NativeLegacyPipelineSelfCheck(EGLDisplay display, EGLSurface surface,
     s_explicit_gl_program = previous_explicit;
     s_bound_legacy_vertex = previous_vertex;
     s_bound_legacy_fragment = previous_fragment;
+    RecordContextLegacyPrograms(context, previous_vertex, previous_fragment);
     s_current_program = previous_mirror;
     s_program_cache_valid = previous_cache;
     s_current_gfx_text = previous_gfx;
@@ -5372,8 +5440,7 @@ void ThunkManager::RegisterGLThunks() {
             RetireNativeStageObjectsLocked(stage->second);
             s_legacy_stages.erase(stage);
             InvalidateLegacyDrawCacheLocked();
-            if (s_bound_legacy_vertex == name) s_bound_legacy_vertex = 0;
-            if (s_bound_legacy_fragment == name) s_bound_legacy_fragment = 0;
+            ForgetLegacyProgramName(name);
         }
     });
 

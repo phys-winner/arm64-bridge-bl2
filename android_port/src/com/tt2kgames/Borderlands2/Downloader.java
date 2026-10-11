@@ -15,10 +15,13 @@ public final class Downloader extends Activity {
     }
 
     private void continueCreate() {
+        // This runs before the bridge loads, so final builds cannot drop these
+        // messages: they appear only on request (setprop log.tag.BL2 D).
+        final boolean verbose = Log.isLoggable("BL2", Log.DEBUG);
         if (hasInstalledObbSplits()) {
-            Log.i("BL2", "Installed OBB cache splits found; starting native verification");
+            if (verbose) Log.d("BL2", "Installed OBB cache splits found; starting native verification");
         } else if (hasExternalObbPair()) {
-            Log.i("BL2", "Local OBB pair found; starting native verification");
+            if (verbose) Log.d("BL2", "Local OBB pair found; starting native verification");
         } else {
             new AlertDialog.Builder(this)
                     .setTitle(0x7f0700bd)
@@ -29,7 +32,7 @@ public final class Downloader extends Activity {
                     .show();
             return;
         }
-        Log.i("BL2", "Launching Game");
+        if (verbose) Log.d("BL2", "Launching Game");
         Intent game = new Intent().setClassName(this, "com.tt2kgames.Borderlands2.UE3JavaApp");
         game.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         startActivity(game);
