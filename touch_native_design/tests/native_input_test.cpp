@@ -725,6 +725,22 @@ static void testStageFiveTapTargetsAndSlots() {
 // Protocol 6: the menu X/Y and LB/RB keys are synthetic UI actions without a
 // shipped InputActionDefinition; a menu delivers each as one edge pair. A
 // blocking online message publishes Loading, which refuses every input.
+static int movieSkipsForTest = 0;
+static std::uint32_t movieStateForTest() { return kMoviePlaying | kMovieStartup; }
+static bool movieSkipForTest() { ++movieSkipsForTest; return true; }
+
+static void testMovieAccessOutsideTheMailbox() {
+    // TouchContract.MOVIE_*; nothing is installed until the bridge checks the player.
+    CHECK(kMoviePlaying == 1 && kMovieStartup == 2);
+    CHECK(movieAccess().state == nullptr && movieAccess().skip == nullptr);
+    setMovieAccess({movieStateForTest, movieSkipForTest});
+    const auto access = movieAccess();
+    CHECK(access.state && access.state() == (kMoviePlaying | kMovieStartup));
+    CHECK(access.skip && access.skip() && movieSkipsForTest == 1);
+    setMovieAccess({});
+    CHECK(movieAccess().state == nullptr && movieAccess().skip == nullptr);
+}
+
 static void testStageSixMenuKeysAndBlockingMessage() {
     CHECK(kProtocolVersion == 6 && kSnapshotWords == 25 && kActionCount == 43);
     CHECK(static_cast<unsigned>(Action::UiAction) == 39 && static_cast<unsigned>(Action::UiOther) == 40);
@@ -804,6 +820,7 @@ int main() {
     testUseHudRegionIsIndependent();
     testStageFiveTapTargetsAndSlots();
     testStageSixMenuKeysAndBlockingMessage();
-    std::cout << "PASS: 29 native touch contract scenarios\n";
+    testMovieAccessOutsideTheMailbox();
+    std::cout << "PASS: 30 native touch contract scenarios\n";
     return 0;
 }

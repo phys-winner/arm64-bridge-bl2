@@ -22,6 +22,8 @@ public final class TouchContract {
     public static final int DOWN = 0, MOVE = 1, UP = 2, CANCEL = 3;
     /** Context.weaponSlots layout is documented beside kWeaponSlotsKnown in bl2_touch_input.h. */
     public static final int WEAPON_SLOTS_KNOWN = 1 << 15;
+    /** TouchBridge.movieState() bits, kMovie* in bl2_touch_input.h (outside the mailbox). */
+    public static final int MOVIE_PLAYING = 1, MOVIE_STARTUP = 2;
     public static long bit(int action) { return 1L << action; }
 
     public static final class Context {

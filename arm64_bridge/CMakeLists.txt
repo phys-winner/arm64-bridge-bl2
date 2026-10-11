@@ -267,6 +267,7 @@ set(BRIDGE_SOURCES
     src/bl2_hitch_report.cpp
     src/bl2_frame_pacer.cpp
     src/bl2_guest_integrity.cpp
+    src/bl2_movie_skip.cpp
 )
 
 if(HORN_ENABLE_PERF_PROBE)

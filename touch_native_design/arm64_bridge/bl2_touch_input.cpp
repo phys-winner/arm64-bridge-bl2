@@ -1,6 +1,7 @@
 #include "bl2_touch_input.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -398,6 +399,20 @@ Mailbox& sharedMailbox() {
 std::uint64_t monotonicMilliseconds() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+namespace {
+std::atomic<std::uint32_t (*)()> movieState{nullptr};
+std::atomic<bool (*)()> movieSkip{nullptr};
+}
+
+void setMovieAccess(MovieAccess access) {
+    movieSkip.store(access.skip, std::memory_order_release);
+    movieState.store(access.state, std::memory_order_release);
+}
+
+MovieAccess movieAccess() {
+    return {movieState.load(std::memory_order_acquire), movieSkip.load(std::memory_order_acquire)};
 }
 
 } // namespace bl2::touch

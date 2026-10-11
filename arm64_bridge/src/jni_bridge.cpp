@@ -48,6 +48,7 @@
 #include "bl2_guest_integrity.h"
 #include "bl2_touch_runtime.h"
 #include "bl2_io_failure_probe.h"
+#include "bl2_movie_skip.h"
 #if HORN_SILENT_LOGCAT
 #include "bl2_silent_log.h"
 #endif
@@ -2067,6 +2068,9 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
     }
     if (!InstallBl2AudioDecodeFastpaths(*g_host,(kBl2PerformanceDefaults>>6)&3)) {
         LOGE("Optional BL2 audio decode fast path unavailable; retaining guest path");
+    }
+    if (!InstallBl2MovieSkip(*g_host)) {
+        LOGE("Movie skip unavailable: unexpected FFullScreenMovieBink code");
     }
     // Last: snapshots RELRO after every bridge patch (bl2_guest_integrity.h).
     StartBl2GuestIntegrityWatch(*g_host);

@@ -680,6 +680,8 @@ public final class TouchInputTest {
         check(sink.resets==1 && sink.packets.size()==count,"lifecycle cancellation requires a fresh native context before Chat");
     }
     public static void main(String[] args) throws Exception {
+        check(TouchContract.MOVIE_PLAYING==1 && TouchContract.MOVIE_STARTUP==2,
+                "movie state bits match kMovie* in bl2_touch_input.h");
         checkChatEntry();checkStageFive();checkStageSix();checkStageSeven();checkDeferredSettingsWrite();
         checkHudGestures();checkAutoRun();checkReferenceCluster();checkObjectiveHud();
         TouchPreferences hints=new TouchPreferences();

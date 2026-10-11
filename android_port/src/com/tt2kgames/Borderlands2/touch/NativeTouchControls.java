@@ -55,6 +55,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     /** Give up acts only after its sector is held this long. */
     private static final long CONFIRM_HOLD_MS = 1000;
     private static final long STALE_MS = 1000;
+    /** Upper bound for skipping the startup sequence after a tap (normally well under a second). */
+    private static final long INTRO_SKIP_MS = 6000;
+    /** Upper bound for the "Loading" text after a skipped intro. */
+    private static final long STARTUP_LOADING_MS = 30000;
     private static final int HINT_MAP = TouchPreferences.HINT_MAP, HINT_WEAPON = TouchPreferences.HINT_WEAPON,
             HINT_GAME_MORE = TouchPreferences.HINT_GAME_MORE, HINT_MENU_MORE = TouchPreferences.HINT_MENU_MORE,
             HINT_DEBUG_MORE = TouchPreferences.HINT_DEBUG_MORE, HINT_AUTORUN = TouchPreferences.HINT_AUTORUN,
@@ -130,6 +134,20 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private long lastSettingsPoll;
     private boolean layoutEditPending, layoutChanged, inWorld;
     private android.app.AlertDialog restartDialog;
+    /** Full-screen movie (MOVIE_*), read every frame from the player itself. */
+    private int movieState;
+    /** Other movies: a tap shows or hides "Skip movie", a tap on it skips. */
+    private boolean movieSkipShown, movieStream;
+    /** A tap on a startup movie skips the whole sequence, until this time at most. */
+    private boolean introSkipping;
+    private long introSkipUntil;
+    /** After a skipped intro the engine still loads what the logos covered: "Loading"
+     *  until the game loop publishes its first frame (mailbox frame differs). */
+    private boolean startupLoading;
+    private long startupLoadingFrame, startupLoadingUntil;
+    private float movieDownX, movieDownY;
+    private long movieDownTime;
+    private final RectF movieSkipRect = new RectF();
     /** Render resolution this process started with: the engine sizes its targets once. */
     private static int sessionRenderPercent;
     private RouteListener routeListener;
@@ -282,10 +300,29 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (disposed || !resumed || linkageFailed) return;
         try {
             updateGeometry();
+            // Before the mailbox: the startup movies block the game thread that
+            // publishes it, so the overlay is not eligible while they play.
+            int nextMovie = bridge.movieState();
+            // The player stops one startup movie per request: while the sequence
+            // lasts, every following movie is stopped as soon as it opens.
+            if (introSkipping && ((nextMovie & MOVIE_STARTUP) == 0 || SystemClock.uptimeMillis() > introSkipUntil)) {
+                introSkipping = false; invalidate();
+                startupLoading = true; startupLoadingFrame = lastFrame;
+                startupLoadingUntil = SystemClock.uptimeMillis() + STARTUP_LOADING_MS;
+            }
+            if (introSkipping && (nextMovie & MOVIE_PLAYING) != 0) bridge.skipMovie();
+            if (nextMovie != movieState) {
+                boolean starts = (nextMovie & MOVIE_PLAYING) != 0 && (movieState & MOVIE_PLAYING) == 0;
+                if (starts) cancelInput();
+                if ((nextMovie & MOVIE_PLAYING) == 0 || starts) movieSkipShown = false;
+                movieState = nextMovie; invalidate();
+            }
             Context next = bridge.snapshot();
             long now = SystemClock.uptimeMillis();
             if (syncSettings(next, now)) next = bridge.snapshot();
             if (next.frame != lastFrame) { lastFrame = next.frame; lastFrameTime = now; }
+            if (startupLoading && (lastFrame != startupLoadingFrame || now > startupLoadingUntil
+                    || (movieState & MOVIE_PLAYING) != 0)) { startupLoading = false; invalidate(); }
             boolean nextFallback=next.legacyFallback();
             boolean nextEligible = focused && surfaceAlive && !imeVisible
                     && (next.usable() || (nextFallback && LaunchControls.available(activity)))
@@ -819,6 +856,14 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (hintKind > 0 && !preferences.hintSeen(hintKind)) preferences.markHintSeen(hintKind);
     }
     @Override protected void onDraw(Canvas canvas) {
+        if (introSkipping) { canvas.drawColor(Color.BLACK); return; } // no flash of the skipped logos
+        if ((movieState & MOVIE_PLAYING) != 0) { drawMovieSkip(canvas); return; }
+        if (startupLoading) {
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setAlpha(200);
+            paint.setTextSize(dp(16)); paint.setTextAlign(Paint.Align.CENTER);
+            canvas.drawText(label("Loading…", "Загрузка…"), getWidth() / 2f, getHeight() / 2f + dp(6), paint);
+            return;
+        }
         if (!eligible) return;
         canvas.save(); canvas.clipRect(safe);
         if (input.moving()) {
@@ -874,6 +919,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         canvas.restore();
     }
     @Override public boolean onTouchEvent(MotionEvent event) {
+        if ((movieState & MOVIE_PLAYING) != 0 || movieStream) return movieTouch(event);
         int action = event.getActionMasked(), index = event.getActionIndex();
         if (action == MotionEvent.ACTION_DOWN) {
             streamOwned = event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)
@@ -1334,6 +1380,58 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (gyro.delta[0] != 0 || gyro.delta[1] != 0) input.relativeLook(gyro.delta[0], gyro.delta[1]);
     }
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+    /** The "Skip movie" pill, bottom right of the game area. */
+    private RectF movieSkipBounds() {
+        RectF area = !safe.isEmpty() ? safe : !viewport.isEmpty() ? viewport
+                : new RectF(0, 0, getWidth(), getHeight());
+        paint.setTextSize(dp(15));
+        float width = paint.measureText(label("Skip movie", "Пропустить ролик")) + dp(36), height = dp(44);
+        movieSkipRect.set(area.right - dp(20) - width, area.bottom - dp(20) - height,
+                area.right - dp(20), area.bottom - dp(20));
+        return movieSkipRect;
+    }
+    private void drawMovieSkip(Canvas canvas) {
+        if (!movieSkipShown) return;
+        RectF pill = movieSkipBounds();
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Color.BLACK); paint.setAlpha(170);
+        canvas.drawRoundRect(pill, pill.height() / 2, pill.height() / 2, paint);
+        paint.setColor(Color.WHITE); paint.setAlpha(235);
+        paint.setTextSize(dp(15)); paint.setTextAlign(Paint.Align.CENTER);
+        canvas.drawText(label("Skip movie", "Пропустить ролик"), pill.centerX(), pill.centerY() + dp(5), paint);
+    }
+    /** Touches over a full-screen movie never reach the game: a startup movie
+     *  ends on any tap, any other one toggles the "Skip movie" pill. */
+    private boolean movieTouch(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            movieStream = true; movieDownX = event.getX(); movieDownY = event.getY();
+            movieDownTime = event.getEventTime();
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            boolean tap = movieStream && action == MotionEvent.ACTION_UP
+                    && Math.hypot(event.getX() - movieDownX, event.getY() - movieDownY) < dp(24)
+                    && event.getEventTime() - movieDownTime < 600;
+            movieStream = false;
+            if (tap && (movieState & MOVIE_PLAYING) != 0) movieTap(event.getX(), event.getY());
+        }
+        return true;
+    }
+    private void movieTap(float x, float y) {
+        if ((movieState & MOVIE_STARTUP) != 0) {
+            introSkipping = bridge.skipMovie();
+            introSkipUntil = SystemClock.uptimeMillis() + INTRO_SKIP_MS;
+            invalidate();
+            return;
+        }
+        RectF target = new RectF(movieSkipBounds());
+        target.inset(-dp(8), -dp(8));
+        if (movieSkipShown && target.contains(x, y)) {
+            movieSkipShown = false;
+            bridge.skipMovie();
+        } else {
+            movieSkipShown = !movieSkipShown;
+        }
+        invalidate();
+    }
     private void cancelInput() {
         saveLayout();
         stopSensor();

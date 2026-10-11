@@ -39,6 +39,18 @@ Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeSubmit(
         yawDegrees, pitchDegrees, static_cast<std::uint64_t>(heldActions), monotonicMilliseconds());
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeMovieState(JNIEnv*, jclass) {
+    const auto access = bl2::touch::movieAccess();
+    return access.state ? static_cast<jint>(access.state()) : 0;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeSkipMovie(JNIEnv*, jclass) {
+    const auto access = bl2::touch::movieAccess();
+    return access.skip && access.skip() ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeReset(JNIEnv*, jclass) {
     sharedMailbox().reset();
