@@ -406,8 +406,16 @@ uint32_t ThunkManager::GetOrCreateThunkAddress(const std::string& name) {
     return 0;
 }
 
+// bl2_gl_worker.cpp: GL/EGL calls of the bound rendering thread.
+bool Bl2GlWorkerDispatch(uint32_t id, const std::string& name, const ThunkHandler& handler,
+                         Dynarmic::A32::Jit& jit, DynarmicHost& host);
+
 void ThunkManager::DispatchThunk(uint32_t thunk_id, Dynarmic::A32::Jit& jit) {
     if (thunk_id < m_id_to_handler.size() && m_id_to_handler[thunk_id]) {
+#if !defined(BL2_NATIVE_ARM32)
+        if (Bl2GlWorkerDispatch(thunk_id, m_id_to_name[thunk_id], m_id_to_handler[thunk_id], jit, m_host))
+            return;
+#endif
 #if defined(BL2_NATIVE_ARM32)
         NativeGlInventory(thunk_id, m_id_to_name[thunk_id].c_str(), jit.Regs().data());
 #endif

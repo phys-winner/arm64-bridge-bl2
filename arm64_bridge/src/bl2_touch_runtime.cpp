@@ -31,7 +31,13 @@
 #include <string>
 #include <vector>
 
+// bl2_gc_defer.cpp
+void Bl2GcDeferTick(DynarmicHost& host, bool ui_frame);
+
 namespace {
+
+std::atomic<std::uint32_t> publishedMode{0};
+std::atomic<std::uint64_t> publishedModeMs{0};
 
 [[maybe_unused]] constexpr char kTag[] = "Arm32Bridge_Touch";
 constexpr char kSha[] = "A0B06EF59F4C89C0889654196951D2DEB966CFEAC7180699B5724F0E26938814";
@@ -570,6 +576,12 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
             context.availableActions = 0;
         }
     }
+    publishedMode.store(static_cast<std::uint32_t>(context.mode), std::memory_order_relaxed);
+    publishedModeMs.store(bl2::touch::monotonicMilliseconds(), std::memory_order_relaxed);
+    // UE3's periodic garbage collection waits for menu frames (bl2_gc_defer.cpp).
+    Bl2GcDeferTick(host, context.mode == bl2::touch::Mode::Menu || context.mode == bl2::touch::Mode::Dialog ||
+                             context.mode == bl2::touch::Mode::TextInput ||
+                             context.mode == bl2::touch::Mode::Frontend);
     auto& mailbox = bl2::touch::sharedMailbox();
     [[maybe_unused]] const auto epoch = mailbox.publishContext(context);
     if (combinedSink) bl2::touch::consumeIntoEngine(mailbox, tick,
@@ -615,12 +627,20 @@ void inputDestroyed(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
 
 std::uint64_t Bl2TouchLifetimeGeneration() { return currentLifetimeGeneration(); }
 
+bool Bl2TouchPlayerInWorld() {
+    const std::uint64_t published = publishedModeMs.load(std::memory_order_relaxed);
+    if (!published || bl2::touch::monotonicMilliseconds() - published > 750) return false;
+    const auto mode = static_cast<bl2::touch::Mode>(publishedMode.load(std::memory_order_relaxed));
+    return mode == bl2::touch::Mode::Gameplay || mode == bl2::touch::Mode::Vehicle ||
+           mode == bl2::touch::Mode::Cinematic;
+}
+
 bool VerifyBl2TouchInput(const std::uint8_t* bytes, std::size_t size) {
     inputVerified = false;
     if (!bytes || size != kFileBytes) return false;
-    ObbSha256 sha;
-    if (!sha.Update(bytes, size)) return false;
-    const auto hex = ObbSha256::Hex(sha.Finalize());
+    ObbSha256::Digest digest{};
+    if (!ObbSha256::OfMapping(bytes, size, digest)) return false;
+    const auto hex = ObbSha256::Hex(digest);
     inputVerified = std::strcmp(hex.data(), kSha) == 0;
     if (!inputVerified) HORN_LOGE(kTag, "native-touch input refused: sha256=%s", hex.data());
     return inputVerified;

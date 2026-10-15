@@ -14,6 +14,10 @@
 #include <cstdint>
 #include <iterator>
 
+#if !defined(BL2_NATIVE_ARM32)
+bool Bl2GlWorkerTakeBufferName(uint32_t* name);  // GL worker, bound thread only
+#endif
+
 namespace {
 constexpr uint32_t kImageSize = 0x03089000;
 constexpr uint32_t kGenRva = 0x01E3EEE8;
@@ -78,6 +82,9 @@ ThunkHandler AllocationHandler(uint32_t site, uint32_t gen, uint32_t pool) {
 #if defined(BL2_NATIVE_ARM32)
             if (bl2vk::IsInitialized()) bl2vk::GenBuffers(1, &name);
             else
+#else
+            // The GL worker's bound thread takes a name generated in advance.
+            if (!Bl2GlWorkerTakeBufferName(&name))
 #endif
             glGenBuffers(1, &name);
             if (!name) {

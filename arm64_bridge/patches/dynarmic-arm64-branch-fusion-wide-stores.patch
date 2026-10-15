@@ -1,0 +1,198 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index 9e08871..bb7089c 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -173,7 +173,7 @@ A32AddressSpace::A32AddressSpace(const A32::UserConfig& conf)
+ }
+ 
+ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+-    IR::Block ir_block = A32::Translate(A32::LocationDescriptor{descriptor}, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions});
++    IR::Block ir_block = A32::Translate(A32::LocationDescriptor{descriptor}, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions, conf.fuse_conditional_branches, conf.wide_vector_transfers});
+ 
+     Optimization::PolyfillPass(ir_block, {});
+     Optimization::NamingPass(ir_block);
+diff --git a/src/dynarmic/frontend/A32/translate/a32_translate.h b/src/dynarmic/frontend/A32/translate/a32_translate.h
+index 1e5fc3b..f046579 100644
+--- a/src/dynarmic/frontend/A32/translate/a32_translate.h
++++ b/src/dynarmic/frontend/A32/translate/a32_translate.h
+@@ -29,6 +29,14 @@ struct TranslationOptions {
+     /// If this is false, we treat the instruction as a NOP.
+     /// If this is true, we emit an ExceptionRaised instruction.
+     bool hook_hint_instructions = true;
++
++    /// ARM B<cond> after other instructions ends the block with an If terminal
++    /// (as Thumb B<cond> does) instead of starting a one-instruction block.
++    bool fuse_conditional_branches = false;
++
++    /// Little-endian VST1 (one element per structure) and VFP doubleword stores
++    /// write whole 64-bit registers; VLD1 packs word reads into its registers.
++    bool wide_vector_transfers = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp b/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
+index fd4c7a9..8d9046e 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
+@@ -11,11 +11,21 @@ namespace Dynarmic::A32 {
+ 
+ // B <label>
+ bool TranslatorVisitor::arm_B(Cond cond, Imm<24> imm24) {
++    const u32 imm32 = mcl::bit::sign_extend<26, u32>(imm24.ZeroExtend() << 2) + 8;
++
++    // The branch tests the flags its own block just produced rather than
++    // reloading them in a block of its own.
++    if (options.fuse_conditional_branches && cond != Cond::AL && cond != Cond::NV && !ir.block.empty() &&
++        (cond_state == ConditionalState::None || cond_state == ConditionalState::Trailing)) {
++        ir.SetTerm(IR::Term::If{cond, IR::Term::LinkBlock{ir.current_location.AdvancePC(imm32)},
++                                IR::Term::LinkBlock{ir.current_location.AdvancePC(4)}});
++        return false;
++    }
++
+     if (!ArmConditionPassed(cond)) {
+         return true;
+     }
+ 
+-    const u32 imm32 = mcl::bit::sign_extend<26, u32>(imm24.ZeroExtend() << 2) + 8;
+     const auto new_location = ir.current_location.AdvancePC(imm32);
+     ir.SetTerm(IR::Term::LinkBlock{new_location});
+     return false;
+diff --git a/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp b/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp
+index 62da513..c5aafc1 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp
+@@ -97,6 +97,35 @@ bool TranslatorVisitor::v8_VST_multiple(bool D, Reg n, size_t Vd, Imm<4> type, s
+     const bool wback = m != Reg::R15;
+     const bool register_index = m != Reg::R15 && m != Reg::R13;
+ 
++    if (options.wide_vector_transfers && nelem == 1 && !ir.current_location.EFlag()) {
++        // Little-endian elements of one register are its bytes in order: store
++        // 64-bit registers, both halves of a Q register from one vector value.
++        const IR::U32 base = ir.GetRegister(n);
++        const auto at = [&](size_t offset) {
++            return offset ? IR::U32{ir.Add(base, ir.Imm32(static_cast<u32>(offset)))} : base;
++        };
++        for (size_t r = 0; r < regs;) {
++            const ExtReg ext_reg = d + r;
++            if (r + 1 < regs && RegNumber(ext_reg) % 2 == 0) {
++                const IR::U128 value = ir.GetVector(ExtReg::Q0 + RegNumber(ext_reg) / 2);
++                ir.WriteMemory64(at(8 * r), ir.VectorGetElement(64, value, 0), IR::AccType::NORMAL);
++                ir.WriteMemory64(at(8 * r + 8), ir.VectorGetElement(64, value, 1), IR::AccType::NORMAL);
++                r += 2;
++            } else {
++                ir.WriteMemory64(at(8 * r), ir.GetExtendedRegister(ext_reg), IR::AccType::NORMAL);
++                r += 1;
++            }
++        }
++        if (wback) {
++            if (register_index) {
++                ir.SetRegister(n, ir.Add(ir.GetRegister(n), ir.GetRegister(m)));
++            } else {
++                ir.SetRegister(n, ir.Add(ir.GetRegister(n), ir.Imm32(static_cast<u32>(8 * regs))));
++            }
++        }
++        return true;
++    }
++
+     IR::U32 address = ir.GetRegister(n);
+     for (size_t r = 0; r < regs; r++) {
+         for (size_t e = 0; e < elements; e++) {
+@@ -146,6 +175,41 @@ bool TranslatorVisitor::v8_VLD_multiple(bool D, Reg n, size_t Vd, Imm<4> type, s
+     const bool wback = m != Reg::R15;
+     const bool register_index = m != Reg::R15 && m != Reg::R13;
+ 
++    if (options.wide_vector_transfers && nelem == 1 && !ir.current_location.EFlag()) {
++        // 32-bit reads (still forwarded from a guest's word stores just before),
++        // packed per register; an even pair becomes one Q value so a following
++        // Q operation takes it without a CPU-state round trip.
++        const IR::U32 base = ir.GetRegister(n);
++        const auto at = [&](size_t offset) {
++            return offset ? IR::U32{ir.Add(base, ir.Imm32(static_cast<u32>(offset)))} : base;
++        };
++        for (size_t r = 0; r < regs;) {
++            const ExtReg ext_reg = d + r;
++            const auto read = [&](size_t offset) -> IR::U64 {
++                if (ebytes == 8) return ir.ReadMemory64(at(offset), IR::AccType::NORMAL);
++                return ir.Pack2x32To1x64(ir.ReadMemory32(at(offset), IR::AccType::NORMAL),
++                                         ir.ReadMemory32(at(offset + 4), IR::AccType::NORMAL));
++            };
++            const IR::U64 low = read(8 * r);
++            if (r + 1 < regs && RegNumber(ext_reg) % 2 == 0) {
++                const IR::U64 high = read(8 * r + 8);
++                ir.SetVector(ExtReg::Q0 + RegNumber(ext_reg) / 2, ir.Pack2x64To1x128(low, high));
++                r += 2;
++            } else {
++                ir.SetExtendedRegister(ext_reg, low);
++                r += 1;
++            }
++        }
++        if (wback) {
++            if (register_index) {
++                ir.SetRegister(n, ir.Add(ir.GetRegister(n), ir.GetRegister(m)));
++            } else {
++                ir.SetRegister(n, ir.Add(ir.GetRegister(n), ir.Imm32(static_cast<u32>(8 * regs))));
++            }
++        }
++        return true;
++    }
++
+     for (size_t r = 0; r < regs; r++) {
+         for (size_t i = 0; i < nelem; i++) {
+             const ExtReg ext_reg = d + i * inc + r;
+diff --git a/src/dynarmic/frontend/A32/translate/impl/vfp.cpp b/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+index 8cf9277..266cf09 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+@@ -1239,7 +1239,10 @@ bool TranslatorVisitor::vfp_VPUSH(Cond cond, bool D, size_t Vd, bool sz, Imm<8>
+     ir.SetRegister(Reg::SP, address);
+ 
+     for (size_t i = 0; i < regs; ++i) {
+-        if (sz) {
++        if (sz && options.wide_vector_transfers && !ir.current_location.EFlag()) {
++            ir.WriteMemory64(address, ir.GetExtendedRegister(d + i), IR::AccType::ATOMIC);
++            address = ir.Add(address, ir.Imm32(8));
++        } else if (sz) {
+             const auto reg_d = ir.GetExtendedRegister(d + i);
+             auto lo = ir.LeastSignificantWord(reg_d);
+             auto hi = ir.MostSignificantWord(reg_d).result;
+@@ -1300,7 +1303,9 @@ bool TranslatorVisitor::vfp_VSTR(Cond cond, bool U, bool D, Reg n, size_t Vd, bo
+     const auto d = ToExtReg(sz, Vd, D);
+     const auto base = n == Reg::PC ? ir.Imm32(ir.AlignPC(4)) : ir.GetRegister(n);
+     const auto address = U ? ir.Add(base, ir.Imm32(imm32)) : ir.Sub(base, ir.Imm32(imm32));
+-    if (sz) {
++    if (sz && options.wide_vector_transfers && !ir.current_location.EFlag()) {
++        ir.WriteMemory64(address, ir.GetExtendedRegister(d), IR::AccType::ATOMIC);
++    } else if (sz) {
+         const auto reg_d = ir.GetExtendedRegister(d);
+         auto lo = ir.LeastSignificantWord(reg_d);
+         auto hi = ir.MostSignificantWord(reg_d).result;
+@@ -1352,6 +1357,11 @@ bool TranslatorVisitor::vfp_VSTM_a1(Cond cond, bool p, bool u, bool D, bool w, R
+     }
+     for (size_t i = 0; i < regs; i++) {
+         const auto value = ir.GetExtendedRegister(d + i);
++        if (options.wide_vector_transfers && !ir.current_location.EFlag()) {
++            ir.WriteMemory64(address, value, IR::AccType::ATOMIC);
++            address = ir.Add(address, ir.Imm32(8));
++            continue;
++        }
+         auto word1 = ir.LeastSignificantWord(value);
+         auto word2 = ir.MostSignificantWord(value).result;
+ 
+diff --git a/src/dynarmic/interface/A32/config.h b/src/dynarmic/interface/A32/config.h
+index b09b2ef..becdbb6 100644
+--- a/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/interface/A32/config.h
+@@ -215,6 +215,13 @@ struct UserConfig {
+     /// definite behaviour for some unpredictable instructions.
+     bool define_unpredictable_behaviour = false;
+ 
++    /// Translation: ARM B<cond> closes the preceding block as an If terminal.
++    bool fuse_conditional_branches = false;
++
++    /// Translation: VST1/VFP doubleword stores write whole 64-bit registers and
++    /// VLD1 packs its word reads into registers (little-endian guests only).
++    bool wide_vector_transfers = false;
++
+     /// HACK:
+     /// This tells the translator a wall clock will be used, thus allowing it
+     /// to avoid writting certain unnecessary code only needed for cycle timers.

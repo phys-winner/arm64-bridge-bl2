@@ -5,6 +5,7 @@
 #include <sys/types.h>
 
 class DynarmicHost;
+class Bl2BinkAudio;
 
 // Same range representation as the existing direct-APK libc reader. A retained
 // descriptor is shared read-only; open() duplicates it and owns its own cursor.
@@ -13,6 +14,7 @@ struct Bl2LocaleEntry {
     off_t data_offset;
     off_t file_size;
     int apk_fd;
+    const Bl2BinkAudio* bink = nullptr;
 };
 
 // Cold-start only. Installed APK paths come from ApplicationInfo.splitSourceDirs;
@@ -24,6 +26,7 @@ bool Bl2RussianLocaleSelected();
 void IndexBl2LocaleSplits(const char* const* paths, size_t count,
                          const char* game_files_root);
 bool IndexBl2CacheBase(const char* path);
+void SetBl2LocaleMainObb(int fd, uint64_t offset, uint64_t bytes);
 bool HasBl2RelocatedCache();
 bool VerifyBl2LocaleGuest(const uint8_t* data, size_t bytes);
 bool InstallBl2LocaleOverlay(DynarmicHost& host);

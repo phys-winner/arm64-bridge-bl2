@@ -58,6 +58,11 @@ try {
         !$nativeText.Contains('debug.horn.play_movies')) {
         throw 'Arm64 bridge movie-skip option is missing from the native payload'
     }
+    # Release optimization can fold the two flag comparisons into immediate values.
+    foreach ($startupFlag in @('bl2_startup_screens', 'InstallBl2StartupScreens',
+            '_ZN7UUIRoot22GetDataStoreFieldValueERK7FStringR21FUIProviderFieldValueP12ULocalPlayer')) {
+        if (!$nativeText.Contains($startupFlag)) { throw "Startup screen policy missing: $startupFlag" }
+    }
     # The policy label is log-only and is removed from a silent build.
     # These properties are used by the actual resolution policy.
     if (!$nativeText.Contains('debug.bl2.render_scale') -or
@@ -76,6 +81,22 @@ try {
         throw 'Requested PhysX diagnostic is missing from the native payload'
     }
     $nativeText = $null
+    $nativeUnstrippedBytes = (Get-Item -LiteralPath $nativePath).Length
+    if ($releaseBuild) {
+        $llvmBin = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin'
+        $exportsBeforeStrip = & "$llvmBin\llvm-nm.exe" -D --defined-only $nativePath
+        if ($LASTEXITCODE) { throw 'Native exports inspection failed' }
+        & "$llvmBin\llvm-strip.exe" --strip-unneeded $nativePath
+        if ($LASTEXITCODE) { throw 'Native strip failed' }
+        $exportsAfterStrip = & "$llvmBin\llvm-nm.exe" -D --defined-only $nativePath
+        if ($LASTEXITCODE -or (Compare-Object $exportsBeforeStrip $exportsAfterStrip)) {
+            throw 'Native strip changed required dynamic exports'
+        }
+        $sections = & "$llvmBin\llvm-readelf.exe" --section-headers $nativePath
+        if ($LASTEXITCODE -or ($sections -match '\s\.(debug_\S*|symtab|strtab)\s')) {
+            throw 'Release bridge retains debug sections or a static symbol table'
+        }
+    }
     # Apktool -f can retain deleted resource files in its APK staging directory.
     $appRoot = [IO.Path]::GetFullPath((Join-Path $root 'app'))
     $apkStaging = [IO.Path]::GetFullPath((Join-Path $appRoot 'build'))
@@ -104,12 +125,12 @@ try {
     if (!($badging -match "targetSdkVersion:'37'")) { throw 'Target SDK 37 gate failed' }
     $zip = [IO.Compression.ZipFile]::OpenRead($signed)
     try {
-        foreach ($name in @('assets/guest_libs/libUnrealEngine3.so','lib/arm64-v8a/libUnrealEngine3.so',
-                           'assets/bl2_cache/WillowGame/Movies/Attract.bik',
-                           'assets/bl2_cache/WillowGame/CookedAndroid_DXT/Textures.tfc',
-                           'assets/bl2_cache/WillowGame/CookedAndroid_DXT/CharTextures.tfc')) {
+        foreach ($name in @('assets/guest_libs/libUnrealEngine3.so','lib/arm64-v8a/libUnrealEngine3.so')) {
             $entry = $zip.GetEntry($name)
             if (!$entry -or $entry.Length -ne $entry.CompressedLength) { throw "STORED payload gate failed: $name" }
+        }
+        if (@($zip.Entries | Where-Object {$_.FullName.StartsWith('assets/bl2_cache/')}).Count) {
+            throw 'Full-cache base APK still contains relocated OBB assets'
         }
         $stageEntry = $zip.GetEntry('assets/bl2_shader_stages.bin')
         if (!$stageEntry -or $stageEntry.Length -ne $stagePack.Length) { throw 'Full shader-stage asset missing from ARM64 APK' }
@@ -120,7 +141,6 @@ try {
             if ($packedStageHash -ne $stagePackHash) { throw 'Packed full shader-stage asset differs' }
         } finally { $stageStream.Dispose(); $stageHasher.Dispose() }
     } finally { $zip.Dispose() }
-    if ((Get-Item -LiteralPath $signed).Length -ge 2000000000L) { throw 'Base APK exceeds decimal 2 GB' }
     & 'C:\Program Files\Python313\python.exe' -X utf8 -B (Join-Path $PSScriptRoot 'verify_embedded_locale.py') --apk $signed
     if ($LASTEXITCODE) { throw 'Embedded Russian text payload gate failed' }
     if (!$Diagnostics) {
@@ -159,7 +179,10 @@ $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;
     bridge_logging=[bool]$Diagnostics.IsPresent;perf_probe_compiled=[bool]$Diagnostics.IsPresent;
     release_build=$releaseBuild;debug_menu_default_enabled=(!$releaseBuild);
     final_build=[bool]$Final.IsPresent;silent_logcat=[bool]$Final.IsPresent;
-    russian_text_in_base=$true;app_locales=@('en','ru');cache_layout='rebalanced';
+    bridge_stripped=$releaseBuild;bridge_unstripped_bytes=$nativeUnstrippedBytes;
+    bridge_bytes=(Get-Item -LiteralPath $nativePath).Length;
+    russian_text_in_base=$true;app_locales=@('en','ru');cache_layout='full';
+    russian_voice_revision='r3-audio-only';
     bounded_backend_cache_display_logs=(!$Final.IsPresent);gl_self_check_compiled=$false;
     physx_cookie_watch_compiled=[bool]$PhysxCookieWatch.IsPresent;
     cmake_source_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'arm64_bridge\CMakeLists.txt')).Hash;
@@ -170,8 +193,9 @@ $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;
     stage_table_sha256=$stagePackHash;stage_table_bytes=$stagePack.Length;
     native_code='arm64-v8a';gles='3.2';zip_page_alignment=16384;
     movies_skip_default=$false;movies_skip_property='debug.horn.play_movies=0';
+    startup_static_screens_skipped=$true;startup_video_logos_preserved=$true;
     render_scale_default='50%';render_scale_diagnostic_property='debug.bl2.render_scale';
-    render_scale_user_min_percent=50;render_scale_user_max_percent=150;render_scale_user_step_percent=10;
+    render_scale_user_min_percent=20;render_scale_user_max_percent=150;render_scale_user_step_percent=10;
     render_scale_user_preference='touch-controls.properties:renderPercent';
     ui_scale_default_percent=125;ui_scale_user_min_percent=100;ui_scale_user_max_percent=200;
     ui_scale_user_step_percent=10;ui_scale_user_preference='touch-controls.properties:uiPercent';
@@ -188,6 +212,7 @@ $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;
     bridge_build_support_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'arm64_bridge\cmake') -File | Get-FileHash | Select-Object Path,Hash);
     bridge_test_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'arm64_bridge\tests') -File | Get-FileHash | Select-Object Path,Hash);
     warmup_asset_hashes=@(Get-FileHash -LiteralPath (Join-Path $root 'app\assets\bl2_shader_warmup.bin'),(Join-Path $root 'app\assets\bl2_jit_warmup.bin'),$stagePack.FullName | Select-Object Path,Hash);
+    background_formation_asset_hashes=@(@('bl2_shader_first.bin','bl2_shader_order.bin','bl2_jit_learned_seed.bin') | ForEach-Object { Join-Path $root "app\assets\$_" } | Where-Object { Test-Path -LiteralPath $_ } | Get-FileHash | Select-Object Path,Hash);
     touch_core_source_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'touch_native_design\arm64_bridge') -File | Get-FileHash | Select-Object Path,Hash);
     android_source_hashes=@(Get-ChildItem -LiteralPath (Join-Path $root 'android_port\src') -Recurse -File | Get-FileHash | Select-Object Path,Hash);
     app_hook_hashes=@(Get-FileHash -LiteralPath (Join-Path $root 'app\smali\com\tt2kgames\Borderlands2\UE3JavaApp.smali'),(Join-Path $root 'app\smali\com\tt2kgames\Borderlands2\Downloader.smali'),(Join-Path $root 'app\AndroidManifest.xml'),(Join-Path $root 'app\apktool.yml') | Select-Object Path,Hash)}

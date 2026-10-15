@@ -17,6 +17,9 @@
 #include <mutex>
 #include <pthread.h>
 #include <cerrno>
+#include <dirent.h>
+#include <ftw.h>
+#include <string_view>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -49,12 +52,14 @@
 #include "bl2_touch_runtime.h"
 #include "bl2_io_failure_probe.h"
 #include "bl2_movie_skip.h"
+#include "bl2_startup_screens.h"
 #if HORN_SILENT_LOGCAT
 #include "bl2_silent_log.h"
 #endif
 #include "bl2_touch_physical.h"
 #include "bl2_locale.h"
 #include "bl2_shader_stage_cache.h"
+#include "bl2_shader_former.h"
 #include "bl2_touch_settings.h"
 #include "engine_hooks.h"
 #include "obb_pair_selection.h"
@@ -476,6 +481,35 @@ static std::vector<uint8_t> LoadBl2JitWarmupTable() {
         bytes.assign(view.data, view.data + view.size);
     CloseGuestMmap(view);
     return bytes;
+}
+
+// A fresh install has no learned JIT profile: start from the shipped one. The
+// guest is one ELF at one base on every device, so the blocks earlier sessions
+// reached are this device's warm-up list too; play then extends this copy.
+// LoadLearnedJitProfile still checks its guest identity and every descriptor.
+static void SeedBl2LearnedJitProfile(const std::string& directory) {
+    if (directory.empty()) return;
+    const std::string path = directory + "/bl2_jit_learned.bin";
+    struct stat info{};
+    if (::stat(path.c_str(), &info) == 0) return;  // The device's own profile wins.
+    GuestMmapView view;
+    if (!MmapGuestFromApk(g_saved_apk_path, {"assets/bl2_jit_learned_seed.bin"}, view)) return;
+    std::string temporary = path + ".seed.XXXXXX";
+    const int fd = view.size <= 16u * 1024u * 1024u ? ::mkstemp(temporary.data()) : -1;
+    bool good = fd >= 0;
+    for (size_t written = 0; good && written < view.size;) {
+        const ssize_t count = ::write(fd, view.data + written, view.size - written);
+        good = count > 0;
+        if (good) written += static_cast<size_t>(count);
+    }
+    if (fd >= 0) good = ::close(fd) == 0 && good;
+    if (fd >= 0 && (!good || std::rename(temporary.c_str(), path.c_str()) != 0)) {
+        std::remove(temporary.c_str());
+        good = false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "BL2JitLearn", "seed profile installed=%d bytes=%zu",
+                        good, view.size);
+    CloseGuestMmap(view);
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,6 +1412,34 @@ static jobject CurrentApplication(JNIEnv* env) {
     return nullptr;
 }
 
+// QA: debug.bl2.shader_cache_reset=1 before launch deletes every shader stage
+// and pair cache (all driver identities) and the legacy program cache, so a
+// first launch can be measured on a device without root access to the cache.
+static void ResetBl2ShaderCachesForQa(const std::string& directory) {
+    char value[PROP_VALUE_MAX] = {};
+    if (directory.empty() || __system_property_get("debug.bl2.shader_cache_reset", value) <= 0 ||
+        value[0] != '1') return;
+    size_t removed = 0;
+    if (DIR* listing = opendir(directory.c_str())) {
+        std::vector<std::string> targets;
+        while (const dirent* entry = readdir(listing)) {
+            const std::string_view name(entry->d_name);
+            if (name.starts_with("bl2-stage-cache-") || name == "bl2-program-cache.bin")
+                targets.emplace_back(directory + "/" + entry->d_name);
+        }
+        closedir(listing);
+        for (const auto& target : targets) {
+            // Depth-first: files, then their directory. A failed entry is skipped.
+            const int walked = nftw(target.c_str(), [](const char* path, const struct stat*, int, FTW*) {
+                ::remove(path);
+                return 0;
+            }, 16, FTW_DEPTH | FTW_PHYS);
+            if (walked == 0 && access(target.c_str(), F_OK) != 0) ++removed;
+        }
+    }
+    __android_log_print(ANDROID_LOG_INFO, "BL2ShaderCache", "QA cache reset removed=%zu", removed);
+}
+
 static void CaptureHostPaths(JNIEnv* env, jobject candidate_context) {
     if (!env || (!g_saved_apk_path.empty() && !g_saved_files_dir.empty() &&
                  g_split_source_dirs_captured && g_shader_cache_dir_capture_attempted &&
@@ -1537,8 +1599,10 @@ static void CaptureHostPaths(JNIEnv* env, jobject candidate_context) {
         if (env->ExceptionCheck()) ClearPathLookupException(env, method);
     };
     if (g_saved_files_dir.empty()) capture_directory("getFilesDir", g_saved_files_dir);
-    if (!g_shader_cache_dir_capture_attempted)
+    if (!g_shader_cache_dir_capture_attempted) {
         capture_directory("getCacheDir", g_bl2_shader_cache_dir);
+        ResetBl2ShaderCachesForQa(g_bl2_shader_cache_dir);
+    }
     // Cache storage is optional; a failed capture must not add JNI work to
     // every later guest entry. An empty directory retains source-only warmup.
     g_shader_cache_dir_capture_attempted = true;
@@ -1624,6 +1688,66 @@ bool PrepareBl2ShaderStageCache(Bl2ShaderStageCache& cache) {
         });
     ShaderPreparationProgress(0, 0);
     return prepared;
+}
+
+// Each call opens its own streaming reader (the former's producer thread).
+static bool OpenShaderFormerAsset(const char* name, Bl2ShaderFormerAsset* asset) {
+    if (!g_shader_assets || !asset) return false;
+    AAsset* opened = AAssetManager_open(g_shader_assets, name, AASSET_MODE_STREAMING);
+    if (!opened) return false;
+    const auto length = AAsset_getLength64(opened);
+    if (length <= 0) {
+        AAsset_close(opened);
+        return false;
+    }
+    asset->opaque = opened;
+    asset->bytes = static_cast<uint64_t>(length);
+    asset->read = [](void* opaque, uint8_t* bytes, size_t wanted) -> size_t {
+        const int read = AAsset_read(static_cast<AAsset*>(opaque), bytes,
+                                     std::min<size_t>(wanted, INT_MAX));
+        return read > 0 ? static_cast<size_t>(read) : 0;
+    };
+    asset->close = [](void* opaque) { AAsset_close(static_cast<AAsset*>(opaque)); };
+    return true;
+}
+
+// The touch overlay's main-menu progress line: per mille of the catalogue with
+// a binary, -1 once formation has stopped.
+static std::int32_t ShaderFormationPermille() {
+    uint32_t ready = 0, total = 0;
+    if (!Bl2ShaderFormerProgress(&ready, &total)) return -1;
+    return static_cast<std::int32_t>(uint64_t{ready} * 1000 / total);
+}
+
+// Renderer thread, first guest shader stage. The default opens the cache from
+// the catalogue header alone and leaves any formation to background workers:
+// the game never waits for it. debug.bl2.shader_former=full keeps the old pass.
+bool OpenBl2ShaderStageCache(Bl2ShaderStageCache& cache) {
+    const auto mode = Bl2ShaderFormerConfiguredMode();
+    if (mode == Bl2ShaderFormerMode::Blocking) return PrepareBl2ShaderStageCache(cache);
+    if (!g_shader_assets) return false;
+    std::unique_ptr<AAsset, decltype(&AAsset_close)> asset(
+        AAssetManager_open(g_shader_assets, "bl2_shader_stages.bin", AASSET_MODE_STREAMING), AAsset_close);
+    if (!asset) return false;
+    const auto length = AAsset_getLength64(asset.get());
+    if (length <= 0 || length > 256LL * 1024 * 1024) return false;
+    const Bl2ShaderStageCache::Reader reader{
+        asset.get(), static_cast<uint64_t>(length),
+        [](void* opaque, uint8_t* bytes, size_t wanted) -> size_t {
+            const int read = AAsset_read(static_cast<AAsset*>(opaque), bytes,
+                                        std::min<size_t>(wanted, INT_MAX));
+            return read > 0 ? static_cast<size_t>(read) : 0;
+        },
+        [](void* opaque) { return AAsset_seek64(static_cast<AAsset*>(opaque), 0, SEEK_SET) == 0; }
+    };
+    if (!cache.OpenStream(reader, g_bl2_shader_cache_dir)) return false;
+    if (!cache.Complete() && mode == Bl2ShaderFormerMode::Background) {
+        Bl2ShaderFormerSetGameplayProbe(Bl2TouchPlayerInWorld);
+        if (Bl2ShaderFormerStart(&cache, eglGetCurrentDisplay(), OpenShaderFormerAsset,
+                                 Bl2ShaderFormerConfiguredThreads()))
+            bl2::touch::setShaderFormationProgress(ShaderFormationPermille);
+    }
+    return true;
 }
 
 // DISPLAY limit plus debug.bl2.fps_limit=900: uncapped and unpaced, for
@@ -1975,6 +2099,8 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
         GuestMmapView guest_view;
         if (MmapGuestFromApk(g_saved_apk_path, ApkCandidates(cfg::kGuestLib),
                              guest_view)) {
+            // One SHA-256 of the 49.9 MB ELF serves every module's identity check.
+            const ObbSha256::MappingScope guest_digest(guest_view.data, guest_view.size);
             VerifyBl2TouchInput(guest_view.data, guest_view.size);
             VerifyBl2PauseDebugMenuInput(guest_view.data, guest_view.size);
             VerifyBl2IoFailureProbeInput(guest_view.data, guest_view.size);
@@ -2072,6 +2198,9 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
     if (!InstallBl2MovieSkip(*g_host)) {
         LOGE("Movie skip unavailable: unexpected FFullScreenMovieBink code");
     }
+    if (!InstallBl2StartupScreens(*g_host)) {
+        LOGE("Startup screen skip unavailable: unexpected registry getter code");
+    }
     // Last: snapshots RELRO after every bridge patch (bl2_guest_integrity.h).
     StartBl2GuestIntegrityWatch(*g_host);
     // The original ELF passed VerifyBl2NativeResolutionInput before loading;
@@ -2081,8 +2210,10 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
 #endif
     if (!g_host->InstallJitWarmupTable(LoadBl2JitWarmupTable()))
         LOGI("JIT warmup unavailable; retaining ordinary compilation");
-    else
+    else {
+        SeedBl2LearnedJitProfile(g_saved_files_dir);
         g_host->LoadLearnedJitProfile(g_saved_files_dir);
+    }
     // Resolve this before FakeJniEnv is bound to the host. A missing symbol is
     // permanent for the loaded payload, but it must not leave FakeJniEnv holding
     // guest addresses from a host that is then destroyed.
@@ -2707,10 +2838,13 @@ static jboolean B_OnPause(JNIEnv* env, jobject self) {
         ? JNI_TRUE : JNI_FALSE;
     // The process may be killed while paused: keep this run's learned blocks.
     if (g_host) g_host->RequestLearnedJitSave();
+    // No shader formation in the background of another app.
+    Bl2ShaderFormerPause(true);
     return result;
 }
 
 static jboolean B_OnResume(JNIEnv* env, jobject self) {
+    Bl2ShaderFormerPause(false);
     return RunGuest32(env, self,
         "_Z23NativeCallback_onResumeP7_JNIEnvP8_jobject")
         ? JNI_TRUE : JNI_FALSE;

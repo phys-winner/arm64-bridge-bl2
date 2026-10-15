@@ -60,7 +60,7 @@ Data read(DynarmicHost& host) {
 }
 void write(DynarmicHost& host,const Data& data,std::uint32_t address=0) {
     if(!address)address=state.base+kSystem+4;
-    for(std::size_t i=0;i<data.size();++i)host.MemoryWrite32(address+std::uint32_t(i*4),data[i]);
+    for(std::size_t i=0;i<data.size();++i)host.MemoryWrite32(address+std::uint32_t(i*4),i==52/4 ? 0u : data[i]);
 }
 bool valid(const Data& data) {
     float percent;std::memcpy(&percent,&data[1020/4],4);
@@ -248,8 +248,9 @@ bool installFreshDefaults(DynarmicHost& host) {
 #if defined(BL2_NATIVE_ARM32)
             if(!state.freshDefaults && state.initialPreferencesApplied)return;
 #else
-            if(!state.freshDefaults)return;
+            // Always enforce MotionBlur before the original render initialization.
 #endif
+            current.MemoryWrite32(state.base+kSystem+4+52,0);
             const auto loaded=read(current);if(!valid(loaded))return;
             if(state.freshDefaults) {
                 state.freshDefaults=false;state.original=bl2::graphics::MinimumDefaults(loaded);state.ready=true;
@@ -279,6 +280,13 @@ bool InstallBl2GraphicsSettings(DynarmicHost& host) {
     std::lock_guard<std::recursive_mutex> lock(state.mutex);
     state.host=&host;state.base=host.GetElfLoader().GetBaseAddress();
     if(host.FindSymbol("GSystemSettings")!=state.base+kSystem)return false;
+    // Old INI values and original engine commands must never re-enable the effect.
+    if(host.MemoryRead32(state.base+0x01266C04)!=0xE5983038 ||
+        host.MemoryRead32(state.base+0x01266F6C)!=0xE5903038)return false;
+    for(const auto offset:{0x01266C04u,0x01266F6Cu}) {
+        host.MemoryWrite32(state.base+offset,0xE3A03000); // mov r3, #0: cached MotionBlur flag
+        host.InvalidateGuestCode(state.base+offset,4);
+    }
 #if defined(BL2_NATIVE_ARM32)
     const auto& files=NativeSavedFilesRoot();
 #else

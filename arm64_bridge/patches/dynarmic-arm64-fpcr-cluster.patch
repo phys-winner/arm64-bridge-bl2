@@ -1,15 +1,15 @@
 --- a/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
 +++ b/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp
-@@ -2,6 +2,8 @@
-  * Copyright (c) 2022 MerryMage
+@@ -3,6 +3,8 @@
   * SPDX-License-Identifier: 0BSD
   */
-+
-+#include <iterator>
  
++#include <iterator>
++
  #include <mcl/bit_cast.hpp>
  #include <mcl/mp/metavalue/lift_value.hpp>
-@@ -46,14 +48,49 @@
+ #include <mcl/mp/typelist/cartesian_product.hpp>
+@@ -46,14 +48,111 @@ using A64FullVectorWidth = std::integral_constant<size_t, 128>;
  template<typename T>
  using VectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T>>;
  
@@ -34,6 +34,61 @@
 +    return inst.GetArg(control_arg).IsImmediate() && !inst.GetArg(control_arg).GetU1();
 +}
 +
++// IR nodes that neither depend on FPCR nor call out of the block (register
++// file moves, integer and bitwise operations): a standard-mode run of native
++// math may span them. A32 NEON math always has Get/SetVector between.
++static bool FPCRNeutral(const IR::Inst& inst) {
++    switch (inst.GetOpcode()) {
++    case IR::Opcode::A32GetRegister:
++    case IR::Opcode::A32SetRegister:
++    case IR::Opcode::A32GetExtendedRegister32:
++    case IR::Opcode::A32GetExtendedRegister64:
++    case IR::Opcode::A32SetExtendedRegister32:
++    case IR::Opcode::A32SetExtendedRegister64:
++    case IR::Opcode::A32GetVector:
++    case IR::Opcode::A32SetVector:
++    case IR::Opcode::VectorGetElement32:
++    case IR::Opcode::VectorGetElement64:
++    case IR::Opcode::VectorSetElement32:
++    case IR::Opcode::VectorSetElement64:
++    case IR::Opcode::VectorBroadcast32:
++    case IR::Opcode::VectorBroadcast64:
++    case IR::Opcode::VectorBroadcastElement32:
++    case IR::Opcode::VectorBroadcastElement64:
++    case IR::Opcode::VectorAnd:
++    case IR::Opcode::VectorOr:
++    case IR::Opcode::VectorEor:
++    case IR::Opcode::VectorNot:
++    case IR::Opcode::VectorAndNot:
++    case IR::Opcode::VectorZeroUpper:
++    case IR::Opcode::ZeroVector:
++    case IR::Opcode::Add32:
++    case IR::Opcode::Sub32:
++    case IR::Opcode::And32:
++    case IR::Opcode::Or32:
++    case IR::Opcode::Eor32:
++    case IR::Opcode::LeastSignificantWord:
++    case IR::Opcode::MostSignificantWord:
++    case IR::Opcode::Pack2x32To1x64:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// Whether another native math node is reachable from `it` (exclusive) across
++// FPCR-neutral nodes only; both directions use the same rule and bound, so the
++// operations at the two ends of a run agree on who switches the mode.
++template<typename Step>
++static bool StandardMathReachable(const IR::Block& block, IR::Block::const_iterator it, Step step) {
++    for (unsigned budget = 64; budget; --budget) {
++        if (!step(block, it)) return false;
++        if (NativeStandardFPVectorMath(*it)) return true;
++        if (!FPCRNeutral(*it)) return false;
++    }
++    return false;
++}
++
  template<typename EmitFn>
 -static void MaybeStandardFPSCRValue(oaknut::CodeGenerator& code, EmitContext& ctx, bool fpcr_controlled, EmitFn emit) {
 +static void MaybeStandardFPSCRValue(oaknut::CodeGenerator& code, EmitContext& ctx, bool fpcr_controlled, EmitFn emit, IR::Inst* inst = nullptr) {
@@ -43,12 +98,19 @@
 +        bool enter_standard = true;
 +        bool restore_guest = true;
 +        if (!ctx.conf.very_verbose_debugging_output && inst && NativeStandardFPVectorMath(*inst)) {
-+            // Only these immediately adjacent native math operations may keep
-+            // standard FPCR. Every other IR node remains a restore boundary.
-+            const IR::Block::iterator here{inst};
-+            const auto next = std::next(here);
-+            enter_standard = here == ctx.block.begin() || !NativeStandardFPVectorMath(*std::prev(here));
-+            restore_guest = next == ctx.block.end() || !NativeStandardFPVectorMath(*next);
++            // Native math operations keep standard FPCR across the
++            // FPCR-neutral nodes between them; every other IR node and the
++            // block end restore the guest mode.
++            const IR::Block::const_iterator here{inst};
++            enter_standard = !StandardMathReachable(ctx.block, here, [](const IR::Block& block, IR::Block::const_iterator& it) {
++                if (it == block.begin()) return false;
++                --it;
++                return true;
++            });
++            restore_guest = !StandardMathReachable(ctx.block, here, [](const IR::Block& block, IR::Block::const_iterator& it) {
++                if (it == block.end() || ++it == block.end()) return false;
++                return true;
++            });
 +        }
 +        if (enter_standard) {
 +            code.MOV(Wscratch0, ctx.FPCR(fpcr_controlled).Value());
@@ -64,7 +126,7 @@
      } else {
          emit();
      }
-@@ -96,7 +133,7 @@
+@@ -96,7 +195,7 @@ static void EmitThreeOp(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst*
      RegAlloc::Realize(Qresult, Qa, Qb);
      ctx.fpsr.Load();
  
@@ -73,7 +135,7 @@
  }
  
  template<size_t size, typename EmitFn>
-@@ -134,7 +171,7 @@
+@@ -134,7 +233,7 @@ static void EmitFMA(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* ins
          } else {
              static_assert(Common::always_false_v<mcl::mp::lift_value<size>>);
          }

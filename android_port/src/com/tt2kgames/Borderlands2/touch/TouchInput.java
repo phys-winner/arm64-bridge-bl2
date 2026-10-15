@@ -28,7 +28,7 @@ public final class TouchInput {
     private float density = 1, radiusDp = 60, degreesPerDp = .22f, adsMultiplier = .55f;
     private boolean invertY, autoSprint, aimToggle, aimLatched, sprintLatched, sprintHeld, stopBlockedUntilNeutral;
     private float lastStickX, lastStickY;
-    private long held;
+    private long held, mouseHeld;
     public TouchInput(Sink sink) { this.sink = sink; }
     public void autoSprint(boolean enabled) {
         if (autoSprint && !enabled) stopAutoRun();
@@ -66,6 +66,7 @@ public final class TouchInput {
                         it.remove();
                     }
                 }
+                mouseHeld &= next.actions;
                 recomputeHeld(); context = next; emit(0,0);
             } else context = next;
         }
@@ -145,6 +146,14 @@ public final class TouchInput {
         sink.submit(context.epoch, moveX, moveY, 0, 0, held() | bit(action));
         emit(0, 0);
     }
+    /** A captured mouse button holds an action like a finger on its button,
+     *  without owning the camera; a context change releases it. */
+    public void mouseButton(int action, boolean down) {
+        if (action < 0 || action >= ACTION_COUNT) return;
+        long next = down && context.usable() && context.allows(action) ? mouseHeld | bit(action) : mouseHeld & ~bit(action);
+        if (next == mouseHeld) return;
+        mouseHeld = next; recomputeHeld(); emit(0, 0);
+    }
     /** Sensor degrees share the native relative-look seam and keep touch ownership. */
     public void relativeLook(float yawDegrees, float pitchDegrees) {
         if (!context.usable() || !context.gameplay() || !context.has(RELATIVE_LOOK)
@@ -153,7 +162,7 @@ public final class TouchInput {
         emit(yawDegrees*gain, pitchDegrees*gain);
     }
     private void clearLocal() {
-        pointers.clear(); moveId = lookId = -1; moveX = moveY = 0; held = 0;
+        pointers.clear(); moveId = lookId = -1; moveX = moveY = 0; held = mouseHeld = 0;
         aimLatched = sprintLatched = sprintHeld = stopBlockedUntilNeutral = false; lastStickX = lastStickY = 0;
     }
     private void stopAutoRun() {
@@ -161,7 +170,7 @@ public final class TouchInput {
         if (moveId < 0) moveX = moveY = 0;
     }
     private void recomputeHeld() {
-        held = aimLatched ? bit(AIM) : 0;
+        held = (aimLatched ? bit(AIM) : 0) | mouseHeld;
         // OR of all owners: releasing one of two fingers cannot release the other.
         for (Pointer p : pointers.values()) if (p.role == BUTTON && !(p.action == AIM && aimLatches())) held |= bit(p.action);
     }

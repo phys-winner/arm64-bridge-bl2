@@ -37,6 +37,7 @@ struct HintApi {
 };
 
 std::atomic<pid_t> g_game_tid{0};
+std::atomic<pid_t> g_producer_tid{0};
 
 // APerformanceHint is API 33; this library targets API 24, so resolve lazily.
 const HintApi* LoadHintApi() {
@@ -92,6 +93,10 @@ void Bl2PerfHintGameThread() {
     g_game_tid.compare_exchange_strong(expected, gettid(), std::memory_order_relaxed);
 }
 
+// The guest rendering thread when its GL calls run on another host thread
+// (bl2_gl_worker.cpp); that thread then presents.
+void Bl2PerfHintSetProducer(pid_t tid) { g_producer_tid.store(tid, std::memory_order_relaxed); }
+
 void Bl2PerfHintFrame(float frame_limit_fps) {
     // The caller serializes presents (host mutex); the first presenting
     // thread owns this state and other presenters return early.
@@ -100,8 +105,8 @@ void Bl2PerfHintFrame(float frame_limit_fps) {
     static bool disabled = false;
     static int64_t target = 0;
     static int64_t last_cpu = -1;
-    static pid_t game = 0;
-    static int64_t last_game_cpu = -1;
+    static pid_t game = 0, producer = 0;
+    static int64_t last_game_cpu = -1, last_producer_cpu = -1;
     if (disabled) return;
     const pid_t tid = gettid();
     if (owner && owner != tid) return;
@@ -110,11 +115,22 @@ void Bl2PerfHintFrame(float frame_limit_fps) {
     if (!wanted || cpu < 0) return;
     const HintApi* api = LoadHintApi();
     const pid_t known_game = g_game_tid.load(std::memory_order_relaxed);
+    const pid_t known_producer = g_producer_tid.load(std::memory_order_relaxed);
     const bool with_game = known_game && known_game != tid;
+    const bool with_producer = known_producer && known_producer != tid && known_producer != known_game;
+    int32_t threads[3] = {static_cast<int32_t>(tid)};
+    size_t thread_count = 1;
+    if (with_game) threads[thread_count++] = static_cast<int32_t>(known_game);
+    if (with_producer) threads[thread_count++] = static_cast<int32_t>(known_producer);
+    const auto adopt = [&] {
+        game = with_game ? known_game : 0;
+        producer = with_producer ? known_producer : 0;
+        last_game_cpu = game ? CpuNs(ThreadCpuClock(game)) : -1;
+        last_producer_cpu = producer ? CpuNs(ThreadCpuClock(producer)) : -1;
+    };
     if (!session) {
         void* manager = api ? api->get_manager() : nullptr;
-        const int32_t threads[] = {static_cast<int32_t>(tid), static_cast<int32_t>(known_game)};
-        session = manager ? api->create_session(manager, threads, with_game ? 2 : 1, wanted) : nullptr;
+        session = manager ? api->create_session(manager, threads, thread_count, wanted) : nullptr;
         if (!session) {
             disabled = true;
             return;
@@ -122,20 +138,17 @@ void Bl2PerfHintFrame(float frame_limit_fps) {
         owner = tid;
         target = wanted;
         last_cpu = cpu;
-        game = with_game ? known_game : 0;
-        last_game_cpu = game ? CpuNs(ThreadCpuClock(game)) : -1;
+        adopt();
         __android_log_print(ANDROID_LOG_INFO, "BL2_Parity",
-                            "ADPF session render=%d game=%d target=%.2fms limit=%.1fFPS",
-                            tid, game, wanted / 1e6, frame_limit_fps);
+                            "ADPF session render=%d game=%d producer=%d target=%.2fms limit=%.1fFPS",
+                            tid, game, producer, wanted / 1e6, frame_limit_fps);
         return;
     }
-    if (!game && with_game && api->set_threads) {
-        const int32_t threads[] = {static_cast<int32_t>(tid), static_cast<int32_t>(known_game)};
-        if (api->set_threads(session, threads, 2) == 0) {
-            game = known_game;
-            last_game_cpu = CpuNs(ThreadCpuClock(game));
+    if (((!game && with_game) || producer != (with_producer ? known_producer : 0)) && api->set_threads) {
+        if (api->set_threads(session, threads, thread_count) == 0) {
+            adopt();
             __android_log_print(ANDROID_LOG_INFO, "BL2_Parity",
-                                "ADPF session added game=%d", game);
+                                "ADPF session threads game=%d producer=%d", game, producer);
         }
     }
     if (wanted != target && api->update_target(session, wanted) == 0) target = wanted;
@@ -145,6 +158,11 @@ void Bl2PerfHintFrame(float frame_limit_fps) {
         const int64_t game_cpu = CpuNs(ThreadCpuClock(game));
         if (game_cpu >= 0 && last_game_cpu >= 0) actual = std::max(actual, game_cpu - last_game_cpu);
         last_game_cpu = game_cpu;
+    }
+    if (producer) {
+        const int64_t producer_cpu = CpuNs(ThreadCpuClock(producer));
+        if (producer_cpu >= 0 && last_producer_cpu >= 0) actual = std::max(actual, producer_cpu - last_producer_cpu);
+        last_producer_cpu = producer_cpu;
     }
     api->report_actual(session, std::clamp<int64_t>(actual, 1'000, 1'000'000'000));
 }

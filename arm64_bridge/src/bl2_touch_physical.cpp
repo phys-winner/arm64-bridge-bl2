@@ -58,11 +58,18 @@ void PhysicalOwnership::reset(std::uint64_t now) {
 }
 void PhysicalOwnership::disconnected(int id, std::uint64_t now) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& controller : controllers_) if (controller.used && controller.id == id) controller = {};
-    for (auto key = keys_.begin(); key != keys_.end();) {
-        if (key->first == id) key = keys_.erase(key); else ++key;
+    // UE3JavaApp reports every device change (pointer capture reconfigures a
+    // mouse) as disconnect + connect. Only a device that still held a key, an
+    // axis or a button owned input; releasing it keeps the neutral interval.
+    bool held = false;
+    for (auto& controller : controllers_) if (controller.used && controller.id == id) {
+        held |= controller.axes || controller.mouse;
+        controller = {};
     }
-    activityLocked(now);
+    for (auto key = keys_.begin(); key != keys_.end();) {
+        if (key->first == id) { key = keys_.erase(key); held = true; } else ++key;
+    }
+    if (held) activityLocked(now);
 }
 bool PhysicalOwnership::ownsInput(std::uint64_t now) const {
     std::lock_guard<std::mutex> lock(mutex_);

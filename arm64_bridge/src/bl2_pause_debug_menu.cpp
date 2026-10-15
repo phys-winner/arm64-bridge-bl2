@@ -231,9 +231,9 @@ void RefreshBl2PauseDebugMenu(DynarmicHost& host) {
 bool VerifyBl2PauseDebugMenuInput(const std::uint8_t* bytes, std::size_t size) {
     verified = false;
     if (!bytes || size != kFileBytes) return false;
-    ObbSha256 sha;
-    if (!sha.Update(bytes, size)) return false;
-    const auto hex = ObbSha256::Hex(sha.Finalize());
+    ObbSha256::Digest digest{};
+    if (!ObbSha256::OfMapping(bytes, size, digest)) return false;
+    const auto hex = ObbSha256::Hex(digest);
     verified = std::strcmp(hex.data(), kSha) == 0;
     return verified;
 }

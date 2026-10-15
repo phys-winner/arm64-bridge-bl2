@@ -246,12 +246,22 @@ bool Mailbox::uiPointer(std::uint64_t epoch, std::int32_t pointerId,
         invalidateLocked(InvalidNumeric);
         return false;
     }
-    if (pointerId < 0 || static_cast<unsigned>(phase) > static_cast<unsigned>(PointerPhase::Cancel)) {
+    if (pointerId < 0 || static_cast<unsigned>(phase) > static_cast<unsigned>(PointerPhase::Hover)) {
         invalidateLocked(InvalidPointer);
         return false;
     }
-    int slot = pointerSlot(submittedPointers_, pointerId);
     const bool outside = surfaceX < 0 || surfaceX > 1 || surfaceY < 0 || surfaceY > 1;
+    if (phase == PointerPhase::Hover) {
+        // No slot, no reset: a lost hover is replaced by the next cursor move.
+        if (outside) return false;
+        const PointerEvent event{pointerId, phase, surfaceX, surfaceY, epoch_, ++sequence_, nowMs};
+        if (!pointers_.empty() && pointers_.back().phase == PointerPhase::Hover) pointers_.back() = event;
+        else if (pointers_.full()) return false;
+        else pointers_.push(event);
+        heartbeatMs_ = nowMs;
+        return true;
+    }
+    int slot = pointerSlot(submittedPointers_, pointerId);
     if (phase == PointerPhase::Down) {
         if (outside) return false; // Never clamp a new gesture onto a UI edge.
         if (slot >= 0) { invalidateLocked(InvalidPointer); return false; }
@@ -386,7 +396,7 @@ Frame Mailbox::consumeFrame(std::uint64_t engineTick, std::uint64_t nowMs) {
     while (!pointers_.empty()) {
         const auto event = pointers_.pop();
         frame.pointerEvents[frame.pointerEventCount++] = event;
-        rememberPointerLocked(event);
+        if (event.phase != PointerPhase::Hover) rememberPointerLocked(event);
     }
     return frame;
 }
@@ -404,6 +414,7 @@ std::uint64_t monotonicMilliseconds() {
 namespace {
 std::atomic<std::uint32_t (*)()> movieState{nullptr};
 std::atomic<bool (*)()> movieSkip{nullptr};
+std::atomic<std::int32_t (*)()> formationPermille{nullptr};
 }
 
 void setMovieAccess(MovieAccess access) {
@@ -413,6 +424,15 @@ void setMovieAccess(MovieAccess access) {
 
 MovieAccess movieAccess() {
     return {movieState.load(std::memory_order_acquire), movieSkip.load(std::memory_order_acquire)};
+}
+
+void setShaderFormationProgress(std::int32_t (*permille)()) {
+    formationPermille.store(permille, std::memory_order_release);
+}
+
+std::int32_t shaderFormationProgress() {
+    const auto permille = formationPermille.load(std::memory_order_acquire);
+    return permille ? permille() : -1;
 }
 
 } // namespace bl2::touch

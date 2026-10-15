@@ -1,0 +1,267 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bb7089c..a2bee2a 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -371,6 +371,38 @@ void A32AddressSpace::EmitPrelude() {
+         code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+     }
+ 
++    // A FastDispatchHint site missed (X4 = the site): probe the table, refill
++    // the site on a hit, otherwise take the dispatcher's C++ path.
++    prelude_info.return_to_dispatcher_site = code.xptr<void*>();
++    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++        oaknut::Label site_miss;
++
++        code.LDAR(Wscratch0, Xhalt);
++        code.CBNZ(Wscratch0, return_from_run_code);
++
++        if (conf.enable_cycle_counting) {
++            code.CMP(Xticks, 0);
++            code.B(LE, return_from_run_code);
++        }
++
++        code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++        code.LSR(X2, X0, 1);
++        code.LSR(X1, X0, 32);
++        code.EOR(X1, X1, X2);
++        code.AND(X1, X1, fast_dispatch_table_mask);
++        code.LSL(X1, X1, 4);
++        code.LDR(X3, l_fast_dispatch_table);
++        code.ADD(X3, X3, X1);
++        code.LDP(X1, X2, X3);
++        code.CMP(X1, X0);
++        code.B(NE, site_miss);
++        code.CBZ(X2, site_miss);
++        code.STP(X0, X2, X4);
++        code.BR(X2);
++        code.l(site_miss);
++    }
++    code.B(prelude_info.return_to_dispatcher);
++
+     prelude_info.return_from_run_code = code.xptr<void*>();
+     {
+         code.l(return_from_run_code);
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+index 01981b2..45a51dd 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -509,6 +509,8 @@ void A64AddressSpace::EmitPrelude() {
+         code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+     }
+ 
++    prelude_info.return_to_dispatcher_site = prelude_info.return_to_dispatcher;
++
+     prelude_info.return_from_run_code = code.xptr<void*>();
+     {
+         code.l(return_from_run_code);
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index fe5a4e4..51d10c5 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -109,6 +109,7 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+     }
+ 
+     ProtectCodeMemory();
++    ClearDispatchSites();
+ }
+ 
+ void AddressSpace::ClearCache() {
+@@ -118,6 +119,8 @@ void AddressSpace::ClearCache() {
+     block_infos.clear();
+     block_references.clear();
+     code.set_offset(prelude_info.end_of_prelude);
++    ClearDispatchSites();
++    dispatch_sites_used = 0;
+ }
+ 
+ void AddressSpace::DumpDisassembly() const {
+@@ -126,6 +129,25 @@ void AddressSpace::DumpDisassembly() const {
+     }
+ }
+ 
++// Sites may point at invalidated code: every one misses until refilled.
++void AddressSpace::ClearDispatchSites() {
++    for (size_t i = 0; i < dispatch_sites_used; ++i) {
++        dispatch_site_chunks[i / dispatch_sites_per_chunk][i % dispatch_sites_per_chunk] = DispatchSite{};
++    }
++}
++
++void* AddressSpace::AllocateDispatchSite(void* context) {
++    auto& self = *static_cast<AddressSpace*>(context);
++    const size_t chunk = self.dispatch_sites_used / dispatch_sites_per_chunk;
++    if (chunk == self.dispatch_site_chunks.size()) {
++        if (chunk >= max_dispatch_site_chunks) {
++            return nullptr;
++        }
++        self.dispatch_site_chunks.push_back(std::make_unique<DispatchSite[]>(dispatch_sites_per_chunk));
++    }
++    return &self.dispatch_site_chunks[chunk][self.dispatch_sites_used++ % dispatch_sites_per_chunk];
++}
++
+ size_t AddressSpace::GetRemainingSize() {
+     return code_cache_size - static_cast<size_t>(code.offset());
+ }
+@@ -137,7 +159,10 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+ 
+     UnprotectCodeMemory();
+ 
+-    EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
++    EmitConfig emit_config = GetEmitConfig();
++    emit_config.allocate_dispatch_site = &AddressSpace::AllocateDispatchSite;
++    emit_config.dispatch_site_context = this;
++    EmittedBlockInfo block_info = EmitArm64(code, std::move(block), emit_config, fastmem_manager);
+ 
+     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
+     ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
+@@ -166,6 +191,9 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+         case LinkTarget::ReturnToDispatcher:
+             c.B(prelude_info.return_to_dispatcher);
+             break;
++        case LinkTarget::ReturnToDispatcherSite:
++            c.B(prelude_info.return_to_dispatcher_site);
++            break;
+         case LinkTarget::ReturnFromRunCode:
+             c.B(prelude_info.return_from_run_code);
+             break;
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 1325972..1e0bddb 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -15,6 +15,9 @@
+ #include <tsl/robin_map.h>
+ #include <tsl/robin_set.h>
+ 
++#include <memory>
++#include <vector>
++
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+ #include "dynarmic/backend/arm64/fastmem.h"
+ #include "dynarmic/interface/halt_reason.h"
+@@ -79,6 +82,17 @@ protected:
+ #endif
+     }
+ 
++    // Inline cache of one FastDispatchHint terminal: its last target. Sites
++    // live in chunks so their addresses stay fixed in emitted code.
++    struct alignas(16) DispatchSite {
++        u64 descriptor = ~u64{0};
++        CodePtr code_ptr = nullptr;
++    };
++    static constexpr size_t dispatch_sites_per_chunk = 4096;
++    static constexpr size_t max_dispatch_site_chunks = 64;
++    static void* AllocateDispatchSite(void* context);
++    void ClearDispatchSites();
++
+     size_t GetRemainingSize();
+     EmittedBlockInfo Emit(IR::Block ir_block);
+     void Link(EmittedBlockInfo& block);
+@@ -106,6 +120,9 @@ protected:
+     ExceptionHandler exception_handler;
+     FastmemManager fastmem_manager;
+ 
++    std::vector<std::unique_ptr<DispatchSite[]>> dispatch_site_chunks;
++    size_t dispatch_sites_used = 0;
++
+     struct PreludeInfo {
+         std::ptrdiff_t end_of_prelude;
+ 
+@@ -113,6 +130,7 @@ protected:
+         RunCodeFuncType run_code;
+         RunCodeFuncType step_code;
+         void* return_to_dispatcher;
++        void* return_to_dispatcher_site;  // FastDispatchHint site miss: X4 = site
+         void* return_from_run_code;
+ 
+         void* read_memory_8;
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index b09541c..ed7d47c 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -42,6 +42,7 @@ using CodePtr = std::byte*;
+ 
+ enum class LinkTarget {
+     ReturnToDispatcher,
++    ReturnToDispatcherSite,
+     ReturnFromRunCode,
+     ReadMemory8,
+     ReadMemory16,
+@@ -144,6 +145,11 @@ struct EmitConfig {
+     // Endianness
+     bool always_little_endian;
+ 
++    // FastDispatchHint inline caches: returns a 16-byte (descriptor, code)
++    // site owned by the address space, or nullptr to use the dispatcher.
++    void* (*allocate_dispatch_site)(void* context) = nullptr;
++    void* dispatch_site_context = nullptr;
++
+     // Frontend specific callbacks
+     FP::FPCR (*descriptor_to_fpcr)(const IR::LocationDescriptor& descriptor);
+     oaknut::Label (*emit_cond)(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Cond cond);
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index 2359b53..e79f58f 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <mcl/bit/bit_field.hpp>
++#include <mcl/bit_cast.hpp>
+ #include <oaknut/oaknut.hpp>
+ 
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+@@ -181,10 +182,38 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Po
+     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+ }
+ 
+-void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool) {
+-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
++    void* site = nullptr;
++    if (ctx.conf.HasOptimization(OptimizationFlag::FastDispatch) && !is_single_step && ctx.conf.allocate_dispatch_site) {
++        site = ctx.conf.allocate_dispatch_site(ctx.conf.dispatch_site_context);
++    }
++    if (!site) {
++        EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++        return;
++    }
+ 
+-    // TODO: Implement FastDispatchHint optimization
++    // Inline cache: the last target of this indirect branch (PLT stubs and
++    // virtual calls are mostly monomorphic). A hit is one branch predicted for
++    // this site; a miss refills the site from the dispatch table.
++    oaknut::Label l_site, miss;
++    code.LDR(X4, l_site);
++    code.LDR(Wscratch0, Xhalt);  // the dispatcher re-checks with LDAR
++    code.CBNZ(Wscratch0, miss);
++    if (ctx.conf.enable_cycle_counting) {
++        code.CMP(Xticks, 0);
++        code.B(LE, miss);
++    }
++    static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor));
++    code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++    code.LDP(Xscratch0, Xscratch1, X4);
++    code.CMP(X0, Xscratch0);
++    code.B(NE, miss);
++    code.BR(Xscratch1);
++    code.l(miss);
++    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcherSite);
++    code.align(8);
++    code.l(l_site);
++    code.dx(mcl::bit_cast<u64>(site));
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+diff --git a/src/dynarmic/backend/arm64/stack_layout.h b/src/dynarmic/backend/arm64/stack_layout.h
+index f095523..f5cfa3b 100644
+--- a/src/dynarmic/backend/arm64/stack_layout.h
++++ b/src/dynarmic/backend/arm64/stack_layout.h
+@@ -23,7 +23,8 @@ struct alignas(16) RSBEntry {
+     u64 code_ptr;
+ };
+ 
+-constexpr size_t RSBCount = 8;
++// UE3 code nests deeper than 8 calls between returns; misses go to the dispatcher.
++constexpr size_t RSBCount = 16;
+ constexpr u64 RSBIndexMask = (RSBCount - 1) * sizeof(RSBEntry);
+ 
+ struct alignas(16) StackLayout {

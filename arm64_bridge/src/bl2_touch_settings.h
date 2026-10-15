@@ -16,6 +16,8 @@ namespace bl2::touch {
 #endif
 constexpr std::uint32_t kTouchSettingsVersion = 8;
 constexpr std::size_t kTouchSettingCount = 37;
+// Keep the v8 wire slot for older preference files; Motion Blur stays disabled.
+constexpr std::size_t kTouchMotionBlurSetting = 22;
 // Present pacing (bl2_frame_pacer). Its Video row is commented out by user
 // request and the pacer stays off; the wire field is kept unchanged.
 constexpr std::size_t kTouchFramePacingSetting = 34;
@@ -33,7 +35,7 @@ constexpr std::int32_t kTouchSettingsCalibrate = 0x6A100204;
 constexpr std::int32_t kTouchSettingsNativeBack = 0x6A100206;
 struct TouchSettingSpec { const char* caption; double minimum, maximum, step; bool toggle; };
 inline constexpr TouchSettingSpec touchSettingSpecs[] = {
-    {"RENDER RESOLUTION (%)",50,150,10,false}, {"BUTTON OPACITY",.15,.9,.05,false},
+    {"RENDER RESOLUTION (%)",20,150,10,false}, {"BUTTON OPACITY",.15,.9,.05,false},
     {"CONTROL SIZE",.85,1.4,.05,false}, {"LOOK SENSITIVITY",.04,1,.02,false},
     {"AIM SENSITIVITY",.1,1,.05,false}, {"LEFT HANDED",0,1,1,true},
     {"INVERT LOOK Y",0,1,1,true}, {"AUTORUN LATCH",0,1,1,true},
@@ -158,6 +160,7 @@ inline std::vector<std::uint32_t> ExchangeBl2TouchSettings(const std::vector<std
         const bool initialized = state.initialized;
         if (!state.initialized) state.revision = 1;
         std::copy_n(host.begin() + 2,kTouchSettingCount,state.values.begin()); state.initialized = true;
+        state.values[kTouchMotionBlurSetting] = 0;
         if (state.values[16] == 0xFFFFFFFFu) state.values[16] = BL2_ENABLE_DEBUG_MENU_DEFAULT ? 1u : 0u;
         if (initialized && state.values != previous) state.uiRequest |= 4u;
         if (state.resetPending) { state.uiRequest |= 4u; state.resetPending = false; }
@@ -191,7 +194,7 @@ inline bool Bl2FramePacingEnabled() {
     return false;
 }
 inline bool SetBl2TouchSetting(std::size_t id, double value) {
-    if (id >= kTouchSettingCount || !std::isfinite(value)) return false;
+    if (id >= kTouchSettingCount || !std::isfinite(value) || (id == kTouchMotionBlurSetting && value != 0)) return false;
     const auto& spec = touchSettingSpecs[id];
     if (value < spec.minimum - .00001 || value > spec.maximum + .00001 || (spec.toggle && value != 0 && value != 1) ||
         (id == 0 && std::fmod(value,10) != 0) || (id == 17 && value != 125 && std::fmod(value,10) != 0) ||

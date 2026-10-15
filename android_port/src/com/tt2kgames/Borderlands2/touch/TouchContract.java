@@ -19,7 +19,8 @@ public final class TouchContract {
             SLOT1 = 31, SLOT2 = 32, SLOT3 = 33, SLOT4 = 34, SUICIDE = 35, SKILLS = 36, LOGS = 37, CHALLENGES = 38,
             UI_ACTION = 39, UI_OTHER = 40, UI_PREVIOUS_TAB = 41, UI_NEXT_TAB = 42,
             ACTION_COUNT = 43;
-    public static final int DOWN = 0, MOVE = 1, UP = 2, CANCEL = 3;
+    /** HOVER: a mouse cursor without a pressed button (native PointerPhase::Hover). */
+    public static final int DOWN = 0, MOVE = 1, UP = 2, CANCEL = 3, HOVER = 4;
     /** Context.weaponSlots layout is documented beside kWeaponSlotsKnown in bl2_touch_input.h. */
     public static final int WEAPON_SLOTS_KNOWN = 1 << 15;
     /** TouchBridge.movieState() bits, kMovie* in bl2_touch_input.h (outside the mailbox). */

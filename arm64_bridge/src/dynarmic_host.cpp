@@ -219,6 +219,15 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicHost::CreateJit(size_t processor_id
     config.enable_cycle_counting = HornPerfEnabled();
     config.always_little_endian = true;                    // guest never uses SETEND; drops CPSR.E handling
     config.define_unpredictable_behaviour = true;          // define rather than halt on odd encodings
+    // Ported from the static recompiler: ARM B<cond> closes its block as an If
+    // terminal; VST1/VFP doubleword stores write whole registers and VLD1 packs
+    // its words in registers. debug.bl2.jit_fusion=0 before launch disables both.
+    static const bool translate_fusion = [] {
+        char value[PROP_VALUE_MAX] = {};
+        return !(__system_property_get("debug.bl2.jit_fusion", value) > 0 && value[0] == '0');
+    }();
+    config.fuse_conditional_branches = translate_fusion;
+    config.wide_vector_transfers = translate_fusion;
     if (m_memory_size == GUEST_ADDRESS_SPACE) {
         config.fastmem_pointer = reinterpret_cast<uintptr_t>(m_memory);
     }
@@ -1027,6 +1036,11 @@ void DynarmicHost::LoadLearnedJitProfile(const std::string& directory) {
                   Bl2JitWarmup::kGuestSha,
                   [loader](uint32_t pc) { return loader->IsReadOnlyRange(pc, 4); });
     m_learned_jit = profile;
+#if defined(__ANDROID__)
+    // QA: debug.bl2.jit_learn_export=1 rewrites the profile once (0660) for adb.
+    if (__system_property_get("debug.bl2.jit_learn_export", enabled) > 0 && enabled[0] == '1')
+        profile->SaveNow();
+#endif
     __android_log_print(ANDROID_LOG_INFO, "BL2JitLearn", "profile main=%zu callback=%zu renderer=%zu",
          profile->Loaded(bl2::jit::kMain).size(), profile->Loaded(bl2::jit::kCallback).size(),
          profile->Loaded(bl2::jit::kRenderer).size());

@@ -16,6 +16,13 @@
 #include <limits>
 
 namespace {
+bool ReadEnabled();
+}  // namespace
+
+// Read once at library load, before any guest thunk runs.
+const bool g_bl2_startup_profile_enabled = ReadEnabled();
+
+namespace {
 
 constexpr const char* kTag = "BL2_StartupProfile";
 constexpr uint64_t kWindowNs = 5'000'000'000ull;
@@ -76,14 +83,13 @@ uint64_t ClockNs(clockid_t clock) {
            static_cast<uint64_t>(value.tv_nsec);
 }
 
-bool Enabled() {
-    static const bool enabled = [] {
-        char value[PROP_VALUE_MAX]{};
-        return __system_property_get("debug.bl2.startup_profile", value) > 0 &&
-               std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
+bool ReadEnabled() {
+    char value[PROP_VALUE_MAX]{};
+    return __system_property_get("debug.bl2.startup_profile", value) > 0 &&
+           std::strcmp(value, "1") == 0;
 }
+
+bool Enabled() { return g_bl2_startup_profile_enabled; }
 
 // 0 means not classified, 1 ignored, 2 timed, 3 ends the startup interval.
 uint8_t Classify(const char* name) {
@@ -230,9 +236,7 @@ void Flush(ThreadProfile& state, uint64_t wall, uint64_t cpu,
 
 } // namespace
 
-Bl2StartupThunkScope::Bl2StartupThunkScope(uint32_t id, const char* name,
-                                          Dynarmic::A32::Jit& jit) {
-    if (!Enabled()) return;
+void Bl2StartupThunkScope::Begin(uint32_t id, const char* name, Dynarmic::A32::Jit& jit) {
     ThreadProfile& state = g_thread;
     if (state.finished) return;
     if (g_stopped.load(std::memory_order_relaxed)) {
@@ -302,7 +306,7 @@ Bl2StartupThunkScope::Bl2StartupThunkScope(uint32_t id, const char* name,
     wall_start_ = ClockNs(CLOCK_MONOTONIC);
 }
 
-Bl2StartupThunkScope::~Bl2StartupThunkScope() {
+void Bl2StartupThunkScope::End() {
     if (activity_slot_) {
         PublishActivity(*static_cast<ActiveSlot*>(activity_slot_),
                         previous_activity_, previous_activity_call_);

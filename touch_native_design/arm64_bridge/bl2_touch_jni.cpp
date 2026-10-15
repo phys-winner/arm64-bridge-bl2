@@ -51,6 +51,11 @@ Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeSkipMovie(JNIEnv*, jclas
     return access.skip && access.skip() ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeShaderProgress(JNIEnv*, jclass) {
+    return static_cast<jint>(bl2::touch::shaderFormationProgress());
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeReset(JNIEnv*, jclass) {
     sharedMailbox().reset();
@@ -60,7 +65,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeUiPointer(
         JNIEnv*, jclass, jlong epoch, jint pointerId, jint phase,
         jfloat surfaceNormalizedX, jfloat surfaceNormalizedY) {
-    if (phase < 0 || phase > 3) {
+    if (phase < 0 || phase > 4) {
         // Preserve epoch isolation: a malformed stale packet must not reset a
         // newer scene. Mailbox validates this out-of-range enum under its lock.
         phase = 255;

@@ -677,7 +677,9 @@ int main(int argc, char** argv) {
         assert(ExchangeBl2TouchSettings(legacy)[1] == 0 && !touchSettingsState.initialized);
         legacy = host; legacy.push_back(125);
         assert(ExchangeBl2TouchSettings(legacy)[1] == 0 && !touchSettingsState.initialized && Bl2InterfaceScale() == 1.25f);
+        host[2+kTouchMotionBlurSetting]=1; // Older builds could save ON.
         const auto initial = ExchangeBl2TouchSettings(host);
+        assert(initial[3+kTouchMotionBlurSetting]==0 && !SetBl2TouchSetting(kTouchMotionBlurSetting,1));
         assert(initial.size() == kTouchSettingCount+3 && initial[0] == kTouchSettingsVersion && initial[1] == 1 && initial[2] == 0 &&
             initial[3+16] == (BL2_ENABLE_DEBUG_MENU_DEFAULT ? 1u : 0u) && initial[3+17] == 125 && Bl2InterfaceScale() == 1.25f &&
             initial[3+7] == 0 && initial[3+18] == 0 && initial[3+19] == 0);

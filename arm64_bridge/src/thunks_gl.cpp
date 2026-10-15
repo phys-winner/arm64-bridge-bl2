@@ -1,4 +1,7 @@
 #include "thunk_manager.h"
+// bl2_auto_flush.cpp: submit long frames in parts on the drawing thread.
+void Bl2AutoFlushNoteDraw();
+void Bl2AutoFlushReset();
 #include "bridge_log.h"
 #include "bl2_fog_audit.h"
 #include "dynarmic_host.h"
@@ -41,6 +44,7 @@
 #include <unordered_set>
 #include <utility>
 #include <memory>
+#include <thread>
 #include "bl2_shader_stage_cache.h"
 #include "bl2_hitch_report.h"
 #if !defined(BL2_NATIVE_ARM32)
@@ -1009,6 +1013,35 @@ static bool s_shader_stage_preparation_attempted = false;
 // shortcut: Keep the captured common stages resident; extend the set after profiling new effects.
 static std::vector<LegacyAssemblyStage> s_hot_legacy_stages;
 static std::unordered_set<uint64_t> s_hot_legacy_groups;
+// Learned stage prewarm: a stage first created while the player is in the
+// world stalls that frame (binary import, uniform and sampler setup, ~2 ms).
+// Such stages are remembered by digest beside the stage binaries; on later
+// launches menus and loading screens import them again ahead of the game.
+struct LearnedStageKey {
+    GLenum target = 0;  // GL_VERTEX_SHADER or GL_FRAGMENT_SHADER.
+    ObbSha256::Digest original{};
+    bool operator==(const LearnedStageKey&) const = default;
+};
+struct LearnedStageKeyHash {
+    size_t operator()(const LearnedStageKey& key) const {
+        size_t value = 0;
+        std::memcpy(&value, key.original.data(), sizeof(value));
+        return value ^ key.target;
+    }
+};
+struct LearnedStage { LearnedStageKey key; ObbSha256::Digest padded{}; };
+struct PrewarmedStage { ObbSha256::Digest padded{}; std::unique_ptr<LegacyAssemblyPipeline> state; };
+using LearnedStageSet = std::unordered_set<LearnedStageKey, LearnedStageKeyHash>;
+static std::vector<LearnedStage> s_learned_stages;
+static LearnedStageSet s_learned_keys;
+static bool s_learned_loaded = false;
+static size_t s_learned_saved = 0;
+static uint64_t s_learned_saved_ns = 0;
+static uint32_t s_prewarm_imported = 0, s_prewarm_taken = 0;
+static std::unordered_map<uint64_t,
+    std::unordered_map<LearnedStageKey, PrewarmedStage, LearnedStageKeyHash>> s_prewarmed_stages;
+static std::unordered_map<uint64_t, size_t> s_prewarm_cursor;
+static std::unordered_map<uint64_t, LearnedStageSet> s_group_stage_keys;
 // Pipeline containers are context-local, whereas stage programs are shared.
 static std::unordered_map<EGLContext, std::unordered_map<uint64_t, LegacyAssemblyPipeline>> s_native_legacy_pipelines;
 struct RetiredLegacyObjects { std::vector<GLuint> programs, shaders; };
@@ -1119,6 +1152,10 @@ static void AbandonDeadNativeShaderObjectsLocked() {
     for (auto& stage : s_hot_legacy_stages)
         std::erase_if(stage.sso_programs, [&](const auto& entry) { return !alive(entry.first); });
     std::erase_if(s_hot_legacy_groups, [&](uint64_t group) { return !alive(group); });
+    // Prewarmed programs died with their share group; only forget the names.
+    std::erase_if(s_prewarmed_stages, [&](const auto& entry) { return !alive(entry.first); });
+    std::erase_if(s_prewarm_cursor, [&](const auto& entry) { return !alive(entry.first); });
+    std::erase_if(s_group_stage_keys, [&](const auto& entry) { return !alive(entry.first); });
     std::erase_if(s_retired_legacy_objects, [&](const auto& entry) { return !alive(entry.first); });
     // GL destroys each context's pipeline namespace itself. Never delete a
     // vanished context's numeric name in another context (an ABA collision).
@@ -1822,6 +1859,49 @@ static void DiscardPrivateLegacyErrors() {
     for (unsigned i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {}
 }
 
+static uint64_t LegacyStageClockNs() {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ull +
+           static_cast<uint64_t>(now.tv_nsec);
+}
+
+// QA: debug.bl2.stage_trace=1 before launch writes one line per guest stage
+// creation to <external files>/bl2-stage-trace-<pid>.txt (monotonic ms, frame,
+// target, original-source SHA-256, driver compile, ms, name): the input of the
+// shipped first-use priority list.
+static void TraceLegacyStageCreation(GLenum target, const ObbSha256::Digest& digest,
+                                     const std::string& name, bool compiled, uint64_t ns) {
+#if defined(BL2_NATIVE_ARM32)
+    (void)target; (void)digest; (void)name; (void)compiled; (void)ns;
+#else
+    static const bool enabled = [] {
+        char value[PROP_VALUE_MAX] = {};
+        return __system_property_get("debug.bl2.stage_trace", value) > 0 && value[0] == '1';
+    }();
+    if (!enabled) return;
+    static std::mutex mutex;
+    static FILE* file = nullptr;
+    static bool opened = false;
+    std::lock_guard lock(mutex);
+    if (!opened) {
+        opened = true;
+        extern std::string g_saved_files_dir;
+        if (!g_saved_files_dir.empty()) {
+            const std::string path = g_saved_files_dir + "/bl2-stage-trace-" +
+                                     std::to_string(getpid()) + ".txt";
+            file = std::fopen(path.c_str(), "w");
+        }
+    }
+    if (!file) return;
+    std::fprintf(file, "%.3f %llu %c %s %d %.3f %s\n", LegacyStageClockNs() / 1e6,
+                 static_cast<unsigned long long>(Bl2HitchFrameIndex()),
+                 target == kVertexProgramArb ? 'V' : 'F', ObbSha256::Hex(digest).data(),
+                 compiled ? 1 : 0, ns / 1e6, name.c_str());
+    std::fflush(file);
+#endif
+}
+
 static void PopulateLegacyUniformArrays(LegacyAssemblyPipeline& state,
                                         GLuint vertex, GLuint fragment) {
     state.vertex_global = FindLegacyUniformArray(vertex, "VConstGlobal");
@@ -1836,10 +1916,10 @@ static void PopulateLegacyUniformArrays(LegacyAssemblyPipeline& state,
 }
 
 static std::unique_ptr<LegacyAssemblyPipeline> LoadNativeSsoStateLocked(
-        const LegacyAssemblyStage& stage, uint64_t group) {
+        const LegacyAssemblyStage& stage, uint64_t group, bool import_only = false) {
     auto state = std::make_unique<LegacyAssemblyPipeline>();
     state->program = s_shader_stage_cache.LoadProgram(
-        LegacyShaderType(stage.target), stage.original_source, stage.sso_source);
+        LegacyShaderType(stage.target), stage.original_source, stage.sso_source, import_only);
     if (state->program) {
         state->share_group = group;
         try {
@@ -1883,8 +1963,11 @@ static void EnsureHotLegacyStagesLocked(uint64_t group) {
         s_hot_legacy_stages.swap(stages);
     }
     size_t ready = 0;
+    // While stages are still being formed, a hot stage without a binary is not
+    // compiled here, on the first frame: it is created like any other stage.
+    const bool import_only = !s_shader_stage_cache.Complete();
     for (auto& stage : s_hot_legacy_stages) {
-        auto state = LoadNativeSsoStateLocked(stage, group);
+        auto state = LoadNativeSsoStateLocked(stage, group, import_only);
         if (!state) continue;
         const GLuint program = state->program;
         try {
@@ -1897,6 +1980,125 @@ static void EnsureHotLegacyStagesLocked(uint64_t group) {
     }
     LOGI("Hot SSO stages group=%llu ready=%zu total=%zu",
          static_cast<unsigned long long>(group), ready, s_hot_legacy_stages.size());
+}
+
+static constexpr size_t kMaxLearnedStages = 768;
+static constexpr std::array<uint8_t, 8> kLearnedStagesMagic{'B','L','2','S','L','R','N','1'};
+
+static uint64_t LearnedClockNs() {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<uint64_t>(now.tv_sec) * 1000000000ull + static_cast<uint64_t>(now.tv_nsec);
+}
+
+static std::string LearnedStagesPath() {
+    extern std::string g_bl2_shader_cache_dir;
+    return g_bl2_shader_cache_dir.empty() ? std::string{} : g_bl2_shader_cache_dir + "/stage-learned.bin";
+}
+
+// File: magic, version 1, count, then per stage its GL target and the SHA-256
+// of its original and padded SSO sources; SHA-256 of all that last.
+static void LoadLearnedStagesLocked() {
+    if (s_learned_loaded) return;
+    s_learned_loaded = true;
+    const auto path = LearnedStagesPath();
+    if (path.empty()) return;
+    std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(path.c_str(), "rb"), std::fclose);
+    if (!file) return;
+    std::array<uint8_t, 16> header{};
+    uint32_t version = 0, count = 0;
+    if (std::fread(header.data(), 1, header.size(), file.get()) != header.size() ||
+        !std::equal(kLearnedStagesMagic.begin(), kLearnedStagesMagic.end(), header.begin())) return;
+    std::memcpy(&version, header.data() + 8, 4);
+    std::memcpy(&count, header.data() + 12, 4);
+    if (version != 1 || count > kMaxLearnedStages) return;
+    std::vector<uint8_t> body(size_t{count} * 68 + 32);
+    if (std::fread(body.data(), 1, body.size(), file.get()) != body.size()) return;
+    ObbSha256 hash;
+    hash.Update(header.data(), header.size());
+    hash.Update(body.data(), body.size() - 32);
+    const auto digest = hash.Finalize();
+    if (!std::equal(digest.begin(), digest.end(), body.end() - 32)) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t* entry = body.data() + size_t{i} * 68;
+        LearnedStage stage;
+        std::memcpy(&stage.key.target, entry, 4);
+        std::memcpy(stage.key.original.data(), entry + 4, 32);
+        std::memcpy(stage.padded.data(), entry + 36, 32);
+        if ((stage.key.target != GL_VERTEX_SHADER && stage.key.target != GL_FRAGMENT_SHADER) ||
+            !s_learned_keys.insert(stage.key).second) continue;
+        s_learned_stages.push_back(stage);
+    }
+    s_learned_saved = s_learned_stages.size();
+}
+
+// The renderer only copies the table; a detached thread writes and renames it.
+static void SaveLearnedStagesLocked() {
+    if (s_learned_stages.size() == s_learned_saved) return;
+    const auto path = LearnedStagesPath();
+    if (path.empty()) return;
+    std::vector<uint8_t> bytes(16 + s_learned_stages.size() * 68 + 32);
+    std::copy(kLearnedStagesMagic.begin(), kLearnedStagesMagic.end(), bytes.begin());
+    const uint32_t version = 1, count = static_cast<uint32_t>(s_learned_stages.size());
+    std::memcpy(bytes.data() + 8, &version, 4);
+    std::memcpy(bytes.data() + 12, &count, 4);
+    for (size_t i = 0; i < s_learned_stages.size(); ++i) {
+        uint8_t* entry = bytes.data() + 16 + i * 68;
+        std::memcpy(entry, &s_learned_stages[i].key.target, 4);
+        std::memcpy(entry + 4, s_learned_stages[i].key.original.data(), 32);
+        std::memcpy(entry + 36, s_learned_stages[i].padded.data(), 32);
+    }
+    ObbSha256 hash;
+    hash.Update(bytes.data(), bytes.size() - 32);
+    const auto digest = hash.Finalize();
+    std::copy(digest.begin(), digest.end(), bytes.end() - 32);
+    s_learned_saved = s_learned_stages.size();
+    s_learned_saved_ns = LearnedClockNs();
+    try {
+        std::thread([path, bytes = std::move(bytes)] {
+            static std::mutex writer;
+            std::lock_guard lock(writer);
+            const std::string temporary = path + ".tmp";
+            FILE* file = std::fopen(temporary.c_str(), "wb");
+            if (!file) return;
+            const bool written = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+            if (std::fclose(file) == 0 && written) std::rename(temporary.c_str(), path.c_str());
+            else std::remove(temporary.c_str());
+        }).detach();
+    } catch (...) {
+        s_learned_saved = 0;  // Retry with the next save.
+    }
+}
+
+static void LearnStageLocked(const LegacyAssemblyStage& stage) {
+#if !defined(BL2_NATIVE_ARM32)
+    extern bool Bl2TouchPlayerInWorld();
+    if (!Bl2TouchPlayerInWorld() || stage.sso_source.empty()) return;
+    LoadLearnedStagesLocked();
+    if (s_learned_stages.size() >= kMaxLearnedStages) return;
+    const LearnedStage learned{{LegacyShaderType(stage.target), stage.source_digest},
+                               Bl2ShaderWarmup::Hash(stage.sso_source)};
+    if (s_learned_keys.insert(learned.key).second) s_learned_stages.push_back(learned);
+#else
+    (void)stage;
+#endif
+}
+
+static std::unique_ptr<LegacyAssemblyPipeline> TakePrewarmedStageLocked(
+        const LegacyAssemblyStage& stage, uint64_t group) {
+    const auto pool = s_prewarmed_stages.find(group);
+    if (pool == s_prewarmed_stages.end() || pool->second.empty()) return nullptr;
+    const auto found = pool->second.find({LegacyShaderType(stage.target), stage.source_digest});
+    if (found == pool->second.end()) return nullptr;
+    std::unique_ptr<LegacyAssemblyPipeline> state;
+    if (found->second.padded == Bl2ShaderWarmup::Hash(stage.sso_source)) {
+        state = std::move(found->second.state);
+        ++s_prewarm_taken;
+    } else if (found->second.state) {
+        glDeleteProgram(found->second.state->program);
+    }
+    pool->second.erase(found);
+    return state;
 }
 
 static std::unique_ptr<LegacyAssemblyPipeline> TakeHotLegacyStageLocked(
@@ -1923,8 +2125,14 @@ static LegacyAssemblyPipeline* NativeSsoStageProgramLocked(LegacyAssemblyStage& 
     PreserveSceneAuditGlError(glGetError());
     if (!s_shader_stage_preparation_attempted) {
         s_shader_stage_preparation_attempted = true;
+#if defined(BL2_NATIVE_ARM32)
         extern bool PrepareBl2ShaderStageCache(Bl2ShaderStageCache&);
         const bool prepared = PrepareBl2ShaderStageCache(s_shader_stage_cache);
+#else
+        // Header-only open; any formation continues on background workers.
+        extern bool OpenBl2ShaderStageCache(Bl2ShaderStageCache&);
+        const bool prepared = OpenBl2ShaderStageCache(s_shader_stage_cache);
+#endif
         const auto& stats = s_shader_stage_cache.Stats();
         __android_log_print(ANDROID_LOG_INFO, "BL2ShaderCache",
             "all-stage preparation ready=%d stages=%u compiled=%u binary_hits=%u marker=%d failed=%u binary_bytes=%llu",
@@ -1943,7 +2151,12 @@ static LegacyAssemblyPipeline* NativeSsoStageProgramLocked(LegacyAssemblyStage& 
         legacy_glsl::CompleteSsoInterface(stage.original_source, stage.target == kVertexProgramArb,
                                          &stage.sso_source);
     if (stage.sso_source.empty()) return nullptr;
-    if (!state) state = LoadNativeSsoStateLocked(stage, group);
+    if (!state) state = TakePrewarmedStageLocked(stage, group);
+    if (!state) {
+        state = LoadNativeSsoStateLocked(stage, group);
+        if (state) LearnStageLocked(stage);
+    }
+    s_group_stage_keys[group].insert({LegacyShaderType(stage.target), stage.source_digest});
     const auto [found, inserted] = stage.sso_programs.emplace(group, std::move(state));
     return found->second.get();
 }
@@ -5446,6 +5659,7 @@ void ThunkManager::RegisterGLThunks() {
 
     RegisterThunk("glNamedProgramStringEXT", [](Dynarmic::A32::Jit& jit,
                                                   DynarmicHost& host) {
+        const uint64_t created_at = LegacyStageClockNs();
         const GLuint name = jit.Regs()[0];
         const GLenum target = static_cast<GLenum>(jit.Regs()[1]);
         const GLenum format = static_cast<GLenum>(jit.Regs()[2]);
@@ -5468,7 +5682,8 @@ void ThunkManager::RegisterGLThunks() {
 
         const char* nv_source = reinterpret_cast<const char*>(
             host.GetGuestMemoryBase() + source_address);
-        if (name == 1610612847u) {
+        // Scene-audit evidence only: no external-storage write on a normal launch.
+        if (name == 1610612847u && SceneAuditEnabled()) {
             const char* path = "/sdcard/Android/data/com.tt2kgames.Borderlands2/"
                                "files/scene-ground-original.nvfp";
             FILE* file = std::fopen(path, "wb");
@@ -5598,15 +5813,20 @@ void ThunkManager::RegisterGLThunks() {
         prepared_stage.original_source = source;
         prepared_stage.source_digest = Bl2ShaderWarmup::Hash(source);
         GLint compiled = GL_FALSE;
+        bool driver_compiled = false;
         {
             std::lock_guard lock(s_legacy_program_mutex);
             const auto group = CurrentShaderShareGroupLocked();
             DrainRetiredLegacyObjectsLocked();
+            const uint32_t compiles_before = s_shader_stage_cache.Stats().compiled;
             if (NativeSsoStageProgramLocked(prepared_stage, group)) compiled = GL_TRUE;
             else {
                 shader = NativeMonolithicShaderLocked(prepared_stage, group);
                 compiled = shader ? GL_TRUE : GL_FALSE;
+                driver_compiled = true;
             }
+            driver_compiled = driver_compiled ||
+                s_shader_stage_cache.Stats().compiled != compiles_before;
         }
         if (compiled != GL_TRUE) {
             const std::string log = shader ? ShaderInfoLog(shader) : std::string{};
@@ -5669,6 +5889,15 @@ void ThunkManager::RegisterGLThunks() {
             stage.sampler_registers = sampler_registers;
             stage.sampler_targets = sampler_targets;
         }
+        const uint64_t creation_ns = LegacyStageClockNs() - created_at;
+        Bl2HitchAddStageNs(creation_ns, driver_compiled);
+#if !defined(BL2_NATIVE_ARM32)
+        extern void Bl2ShaderFormerNoteDemandCompile(GLenum, const uint8_t*);
+        if (driver_compiled)
+            Bl2ShaderFormerNoteDemandCompile(LegacyShaderType(target), prepared_stage.source_digest.data());
+#endif
+        TraceLegacyStageCreation(target, prepared_stage.source_digest, shader_name,
+                                 driver_compiled, creation_ns);
         const uint32_t log_index =
             s_legacy_compile_logs.fetch_add(1, std::memory_order_relaxed);
         if (log_index < 96) {
@@ -6403,6 +6632,7 @@ void ThunkManager::RegisterGLThunks() {
         glDrawArrays(static_cast<GLenum>(jit.Regs()[0]), static_cast<GLint>(jit.Regs()[1]), static_cast<GLsizei>(jit.Regs()[2]));
         // Bl2FogAuditCompleted();  // Pixel readback diagnosis paused.
         if (SceneAuditEnabled()) SceneAuditDrawCompleted("glDrawArrays");
+        Bl2AutoFlushNoteDraw();
         CaptureGlError("glDrawArrays");
     });
 
@@ -6436,6 +6666,7 @@ void ThunkManager::RegisterGLThunks() {
                        static_cast<GLenum>(jit.Regs()[2]), indices);
         // Bl2FogAuditCompleted();  // Pixel readback diagnosis paused.
         if (SceneAuditEnabled()) SceneAuditDrawCompleted("glDrawElements");
+        Bl2AutoFlushNoteDraw();
         CaptureGlError("glDrawElements");
     });
 
@@ -6453,11 +6684,13 @@ void ThunkManager::RegisterGLThunks() {
     RegisterThunk("glFinish", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         HornPerfScope perf(HornPerfCategory::GpuSync);
         glFinish();
+        Bl2AutoFlushReset();
     });
 
     RegisterThunk("glFlush", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         HornPerfScope perf(HornPerfCategory::GpuSync);
         glFlush();
+        Bl2AutoFlushReset();
     });
 
     RegisterThunk("glFramebufferRenderbuffer", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -7256,4 +7489,55 @@ void ThunkManager::RegisterGLThunks() {
         ScaleViewportToSurface(x, y, w, h);
         glViewport(x, y, w, h);
     });
+}
+
+// After each present (renderer thread, game context current): import learned
+// stages while the player is in a menu or a loading screen (4 ms per frame), or
+// within a paced frame's idle time. Unsaved learned stages are written out.
+void Bl2LegacyStagePrewarmFrame(uint64_t next_start_ns) {
+#if !defined(BL2_NATIVE_ARM32)
+    extern bool Bl2TouchPlayerInWorld();
+    const uint64_t start = LearnedClockNs();
+    const bool in_world = Bl2TouchPlayerInWorld();
+    uint64_t budget = in_world ? 0 : 4000000;
+    if (in_world && next_start_ns > start + 2500000) budget = next_start_ns - start - 1500000;
+    std::lock_guard lock(s_legacy_program_mutex);
+    if (s_learned_stages.size() != s_learned_saved && start - s_learned_saved_ns > 2000000000ull)
+        SaveLearnedStagesLocked();
+    if (!budget || !s_shader_stage_preparation_attempted || !s_shader_stage_cache.PairStoreReady()) return;
+    const uint64_t group = CurrentShaderShareGroupLocked();
+    if (!group) return;
+    LoadLearnedStagesLocked();
+    size_t& cursor = s_prewarm_cursor[group];
+    if (cursor >= s_learned_stages.size()) return;
+    auto& pool = s_prewarmed_stages[group];
+    const auto& created = s_group_stage_keys[group];
+    PreserveSceneAuditGlError(glGetError());
+    try {
+        while (cursor < s_learned_stages.size() && LearnedClockNs() - start < budget) {
+            const LearnedStage& learned = s_learned_stages[cursor++];
+            if (created.contains(learned.key) || pool.contains(learned.key)) continue;
+            const GLuint program = s_shader_stage_cache.ImportStage(
+                learned.key.target, learned.key.original, learned.padded);
+            if (!program) continue;
+            auto state = std::make_unique<LegacyAssemblyPipeline>();
+            state->program = program;
+            state->share_group = group;
+            PopulateLegacyUniformArrays(*state, program, program);
+            ConfigureLegacySamplers(program, true);
+            state->samplers_initialized = true;
+            pool.emplace(learned.key, PrewarmedStage{learned.padded, std::move(state)});
+            ++s_prewarm_imported;
+        }
+    } catch (...) {
+    }
+    DiscardPrivateLegacyErrors();
+    if (cursor >= s_learned_stages.size())
+        __android_log_print(ANDROID_LOG_INFO, "BL2StagePrewarm",
+            "group=%llu learned=%zu imported=%u taken=%u",
+            static_cast<unsigned long long>(group), s_learned_stages.size(),
+            s_prewarm_imported, s_prewarm_taken);
+#else
+    (void)next_start_ns;
+#endif
 }

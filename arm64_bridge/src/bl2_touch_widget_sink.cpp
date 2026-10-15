@@ -9,6 +9,8 @@
 #include "bridge_log.h"
 #include "dynarmic_host.h"
 #include "elf_loader.h"
+#include "thunk_manager.h"
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <optional>
@@ -367,8 +369,10 @@ public:
     void prepare(const Prepared& source, bool pointerCaptured, bool scrolling = false) {
         if (values_) {
             values_->beginInputBoundary();
+            // A gamepad or keyboard keeps this page: dropping it while physical
+            // input owned the screen rebuilt the list every other frame and sent
+            // the selection back to the first row. Its keys reach physicalKey.
             if (!current() || source.owner != source_.owner || source.movie != source_.movie) drop(false);
-            else if (physicalOwnership().ownsInput(monotonicMilliseconds())) { drop(true); return; }
             else {
                 auto data = values_->member(list_,"data"); GfxIdentity identity;
                 const bool same = data && values_->identity(data,identity) && identity == dataIdentity_;
@@ -414,8 +418,13 @@ public:
                 auto prototype = s.member(list_,"__proto__");
                 quietSlider_ = s.member(prototype,"onSliderValueChange"); quietSpinner_ = s.member(prototype,"onSpinnerValueChange");
                 s.release(prototype); emptyListeners_ = s.point(0,0);
+                // An original list refresh (a changed value, the bounds preview)
+                // re-attaches here: keep its selection, never jump to row 0.
+                double nativeSelected = 0;
+                if (!number(list_,"selectedIndex",nativeSelected) || nativeSelected < 0 || std::floor(nativeSelected) != nativeSelected ||
+                    nativeSelected >= static_cast<double>(original_.eventIds.size())) nativeSelected = 0;
                 if (!list_ || !options_ || !headerText_ || !originalHeader_ || !originalData_ || !listeners_ || !sliderHandler_ || !spinnerHandler_ ||
-                    !quietSlider_ || !quietSpinner_ || !emptyListeners_ || !show(false)) {
+                    !quietSlider_ || !quietSpinner_ || !emptyListeners_ || !show(false,static_cast<int>(nativeSelected),true)) {
                     HORN_LOGE("BL2Bridge","native-touch settings attach=%s provider=%s",s.reason() ? s.reason() : "missing-options-AS-member",model.providerClass.c_str());
                     drop(true); return;
                 }
@@ -449,6 +458,30 @@ public:
         // scale-slider drag bound to its original geometry until UP/cancel.
         if (!pointerCaptured) pollScale();
         else if (scrolling) scaleList(false);
+    }
+    // A gamepad or keyboard key before this Options movie's OnInputKey. Pages
+    // and rows added here answer it exactly like touch; original rows keep the
+    // original key. The relocated original Back row takes the original Back.
+    bool physicalKey(std::uint32_t owner, Action key, std::uint32_t event, bool& nativeBack) {
+        nativeBack = false;
+        if (!values_ || original_.movieClass != "OptionsGFxMovie" || owner != source_.owner || event > 3 || !current()) return false;
+        values_->beginInputBoundary();
+        double selected = -1;
+        const bool row = number(list_,"selectedIndex",selected) && selected >= 0 && std::floor(selected) == selected &&
+            selected < static_cast<double>(events_.size());
+        const auto rowEvent = row ? events_[static_cast<std::size_t>(selected)] : 0;
+        if (key == Action::Confirm && !page_ && rowEvent == kTouchSettingsNativeBack) { nativeBack = true; return false; }
+        const bool custom = row && rowEvent >= kTouchSettingsOpen;
+        const bool customRows = page_ || std::any_of(events_.begin(),events_.end(),[](std::int32_t e) { return e >= kTouchSettingsOpen; });
+        const bool vertical = key == Action::UiUp || key == Action::UiDown;
+        if (!(vertical ? customRows : key == Action::Back ? page_ != 0 : page_ != 0 || custom)) return false;
+        const bool pressed = event == 0 || event == 3;
+        if (vertical || key == Action::UiLeft || key == Action::UiRight) {
+            // Directions act on each press and auto-repeat, as the original list does.
+            if (pressed || event == 2) { action({key,true,0,0}); action({key,false,0,0}); inputCompleted(); }
+        } else if (pressed) action({key,true,0,0});
+        else if (event == 1) { action({key,false,0,0}); inputCompleted(); }
+        return true;
     }
     bool action(const ActionEdge& edge) {
         if (!values_ || original_.movieClass != "OptionsGFxMovie" || !current()) return false;
@@ -559,8 +592,10 @@ private:
                     std::floor(selected) == selected && selected < events_.size()) {
                     const auto id = events_[static_cast<std::size_t>(selected)] - kTouchSettingsValue;
                     const auto own = id >= 0 ? TouchSettingHint(static_cast<std::size_t>(id),Bl2RussianLocaleSelected()) : nullptr;
-                    // The touch page keeps its usage line under rows without their own hint.
-                    const auto hint = own ? own : page_ ? TouchPageUsage(Bl2RussianLocaleSelected()) : nullptr;
+                    // The touch page keeps its usage line under rows without their own hint;
+                    // an added row without one clears the previous row's text.
+                    const auto hint = own ? own : page_ ? TouchPageUsage(Bl2RussianLocaleSelected()) :
+                        events_[static_cast<std::size_t>(selected)] >= kTouchSettingsOpen ? "" : nullptr;
                     if (hint) {
                         auto text = s.stringValue(hint);
                         auto result = s.invoke(options_,"SetDescription",{text},true);
@@ -616,7 +651,7 @@ private:
         const bool okay = result && s.good(); s.release(result); s.release(disabled); s.release(label);
         if (okay) events_.push_back(event); return okay;
     }
-    bool show(unsigned page, int selectedIndex = 0) {
+    bool show(unsigned page, int selectedIndex = 0, bool nativeIndex = false) {
         auto& s = *values_; if (!s.good() || !callbacks(false)) return false;
         auto data = page ? s.array() : s.invoke(originalData_,"slice");
         GfxHandle nativeBack;
@@ -638,6 +673,7 @@ private:
         s.release(data);
         if (page == 2) {
             for (std::size_t i = 21; i < kTouchFramePacingSetting; ++i) {
+                if (i == kTouchMotionBlurSetting) continue;
 #if defined(BL2_NATIVE_ARM32)
                 if(i>=32)continue; // These replacements belong to the ARM64 bridge.
 #endif
@@ -700,6 +736,9 @@ private:
             if (originalDescription_ && !s.setMember(description_,"htmlText",originalDescription_)) return false;
         }
         if (events_.empty()) return false;
+        // The relocated original Back row moved behind the added rows.
+        if (nativeIndex && customOriginal && selectedIndex == static_cast<int>(original_.eventIds.size()) - 1)
+            selectedIndex = static_cast<int>(events_.size()) - 1;
         auto first = s.number(std::clamp(selectedIndex,0,static_cast<int>(events_.size()) - 1));
         auto selected = s.invoke(list_,"__set__selectedIndex",{first},true); s.release(selected); s.release(first);
         auto currentData = s.member(list_,"data"); const bool okay = currentData && s.identity(currentData,dataIdentity_); s.release(currentData);
@@ -746,6 +785,69 @@ private:
     GfxHandle list_, options_, headerText_, originalHeader_, description_, originalDescription_, originalData_, listeners_, sliderHandler_, spinnerHandler_, quietSlider_, quietSpinner_, emptyListeners_;
     GfxIdentity dataIdentity_; std::vector<std::int32_t> events_;
 };
+
+// Physical keys reach the settings page at UGFxMoviePlayer::InputKey, which
+// FGFxEngine::InputKey calls (vtable+0x174) before Scaleform sees the key; a
+// true return means handled. The engine has already turned D-pad buttons,
+// the hat, the left stick and the keyboard into these key names, with repeats.
+SettingsUi* physicalKeySettings = nullptr; // Game thread only.
+std::uint32_t physicalKeyBase = 0;
+constexpr std::uint32_t kMovieInputKey = 0x01CB7410;
+struct PhysicalKeyName { const char* symbol; std::uint32_t rva; Action action; };
+constexpr PhysicalKeyName kPhysicalKeys[] = {
+    {"KEY_Up",0x03009FF0,Action::UiUp},{"KEY_XboxTypeS_DPad_Up",0x0300A370,Action::UiUp},
+    {"KEY_Gamepad_LeftStick_Up",0x0300A398,Action::UiUp},{"KEY_Down",0x0300A000,Action::UiDown},
+    {"KEY_XboxTypeS_DPad_Down",0x0300A378,Action::UiDown},{"KEY_Gamepad_LeftStick_Down",0x0300A3A0,Action::UiDown},
+    {"KEY_Left",0x03009FE8,Action::UiLeft},{"KEY_XboxTypeS_DPad_Left",0x0300A388,Action::UiLeft},
+    {"KEY_Gamepad_LeftStick_Left",0x0300A3B0,Action::UiLeft},{"KEY_Right",0x03009FF8,Action::UiRight},
+    {"KEY_XboxTypeS_DPad_Right",0x0300A380,Action::UiRight},{"KEY_Gamepad_LeftStick_Right",0x0300A3A8,Action::UiRight},
+    {"KEY_Enter",0x03009FA0,Action::Confirm},{"KEY_XboxTypeS_A",0x0300A330,Action::Confirm},
+    {"KEY_Escape",0x03009FB8,Action::Back},{"KEY_XboxTypeS_B",0x0300A338,Action::Back}
+};
+constexpr std::uint32_t kXboxTypeSB = 0x0300A338;
+bool InstallPhysicalSettingsKeys(DynarmicHost& host) {
+    const auto& elf = host.GetElfLoader();
+    const auto base = elf.GetBaseAddress();
+    if (physicalKeyBase) return physicalKeyBase == base;
+    if (elf.GetImageSize() != 0x03089000 || std::uint64_t(base) + elf.GetImageSize() > UINT32_MAX ||
+        host.FindSymbol("_ZN15UGFxMoviePlayer8InputKeyEi5FNameh") != base + kMovieInputKey ||
+        !elf.IsReadOnlyRange(base + kMovieInputKey,8) || !elf.IsCodeRange(base + kMovieInputKey,8) ||
+        host.MemoryRead32(base + kMovieInputKey) != 0xE92D4070 || host.MemoryRead32(base + kMovieInputKey + 4) != 0xE24DD028)
+        return false;
+    for (const auto& key : kPhysicalKeys) if (host.FindSymbol(key.symbol) != base + key.rva) return false;
+    // push {r4,r5,r6,lr}; sub sp,sp,#40; then continue the original body.
+    const std::array<std::uint32_t,4> words{0xE92D4070,0xE24DD028,0xE51FF004,base + kMovieInputKey + 8};
+#if defined(BL2_NATIVE_ARM32)
+    const auto continuation = host.CreateCodeVeneer(words); if (!continuation) return false;
+#else
+    const auto continuation = host.GuestAlloc(sizeof(words),4); if (!continuation) return false;
+    for (std::size_t i = 0; i < words.size(); ++i) host.MemoryWrite32(continuation + static_cast<std::uint32_t>(i * 4),words[i]);
+    host.AddExecutableRange(continuation,sizeof(words)); host.InvalidateGuestCode(continuation,sizeof(words));
+#endif
+    const auto thunk = host.GetThunkManager().RegisterThunk("bl2_settings_physical_key",
+        [continuation,base](Dynarmic::A32::Jit& jit,DynarmicHost& current) {
+            // r0 movie owner, r1 ControllerId, r2:r3 key FName, [sp] EInputEvent.
+            auto& r = jit.Regs();
+            r[15] = continuation;
+            // Touch reaches the movie only while it owns input; an ARM caller
+            // (FGFxEngine::InputKey) can be answered by returning to LR.
+            if (!physicalKeySettings || (r[14] & 1u) || !physicalOwnership().ownsInput(monotonicMilliseconds())) return;
+            for (const auto& key : kPhysicalKeys) {
+                if (current.MemoryRead32(base + key.rva) != r[2] || current.MemoryRead32(base + key.rva + 4) != r[3]) continue;
+                bool nativeBack = false;
+                if (physicalKeySettings->physicalKey(r[0],key.action,current.MemoryRead32(r[13]) & 0xFFu,nativeBack)) {
+                    r[0] = 1; r[15] = r[14];
+                } else if (nativeBack) {
+                    r[2] = current.MemoryRead32(base + kXboxTypeSB); r[3] = current.MemoryRead32(base + kXboxTypeSB + 4);
+                }
+                return;
+            }
+        });
+    if (!thunk) return false;
+    host.MemoryWrite32(base + kMovieInputKey,0xE51FF004); host.MemoryWrite32(base + kMovieInputKey + 4,thunk);
+    host.InvalidateGuestCode(base + kMovieInputKey,8);
+    physicalKeyBase = base; return true;
+}
 }
 struct Ue3WidgetSink::State {
     DynarmicHost& host;
@@ -780,8 +882,14 @@ struct Ue3WidgetSink::State {
     }
 };
 Ue3WidgetSink::Ue3WidgetSink(DynarmicHost& host, LifetimeGeneration generation)
-    : state_(std::make_unique<State>(host,generation)) {}
-Ue3WidgetSink::~Ue3WidgetSink() = default;
+    : state_(std::make_unique<State>(host,generation)) {
+    if (!state_->signatures) return;
+    if (InstallPhysicalSettingsKeys(host)) physicalKeySettings = &state_->settings;
+    else HORN_LOGE("BL2Bridge","native-touch settings physical keys unavailable: signature mismatch");
+}
+Ue3WidgetSink::~Ue3WidgetSink() {
+    if (physicalKeySettings == &state_->settings) physicalKeySettings = nullptr;
+}
 bool Ue3WidgetSink::verified() const { return state_->signatures; }
 std::uint32_t Ue3WidgetSink::prepare(std::uint32_t viewport, std::uint32_t controller,
     std::uint32_t movie, std::uint32_t owner, std::uint64_t scene) {
@@ -882,6 +990,12 @@ void Ue3WidgetSink::action(const ActionEdge& edge) {
     }
 }
 void Ue3WidgetSink::pointer(const PointerEvent& event) {
+    if(event.phase==PointerPhase::Hover) {
+        // A mouse cursor reaches only the original MouseMove, never the
+        // Debug canvas or a list the router has captured for a drag.
+        if(!state_->prepared.debug && !state_->router.captured()) state_->navigation.hover(event);
+        return;
+    }
     if(state_->prepared.debug) state_->debug.pointer(event);
     else if(state_->prepared.widgets) {
         if(state_->navigation.footerPointer(event,!state_->router.captured())) {

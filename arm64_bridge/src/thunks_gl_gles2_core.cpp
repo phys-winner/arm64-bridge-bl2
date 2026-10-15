@@ -1,5 +1,8 @@
 #include "guest_software_write_watch.h"
 #include "thunk_manager.h"
+// bl2_auto_flush.cpp: submit long frames in parts on the drawing thread.
+void Bl2AutoFlushNoteDraw();
+void Bl2AutoFlushReset();
 #include "dynarmic_host.h"
 #include "thunk_types.h"
 #include "gl_storage_call_diagnostic.h"
@@ -718,6 +721,11 @@ std::unordered_map<void*, GuestMappedBuffer> s_guest_mapped_buffers;
 // tracked and synchronized; any change of the mapping set clears it. With no
 // new dirty epoch such a pass has nothing to copy (s_mapping_mutex).
 bool s_mapping_set_steady = false;
+// Lock-free mirror for the per-draw sync: true only while the mapping set is
+// steady and fully synchronized at s_mapping_scanned_epoch (no guest store has
+// faulted on a watched page since). Every change clears it under the lock.
+static std::atomic<bool> s_mapping_fast_steady{false};
+static std::atomic<uint32_t> s_mapping_scanned_epoch{0};
 
 GuestMappedDirtyTracker& MappedDirtyTracker() {
     // A process-lifetime instance leaves no dangling signal-handler storage.
@@ -838,6 +846,25 @@ uint32_t AllocateGuestGlSyncHandleLocked() {
 
 }  // namespace
 
+// GL worker (bl2_gl_worker.cpp): the guest thread reserves the handle
+// of a glFenceSync that the worker creates later, so the call does not wait
+// for the worker's queue; the worker attaches the host fence (null on failure).
+uint32_t Bl2GuestGlSyncReserve() {
+    std::lock_guard<std::mutex> lock(g_guest_gl_sync_mutex);
+    GuestGlSyncSlot* slot = FindEmptyGuestGlSyncSlotLocked();
+    const uint32_t handle = slot ? AllocateGuestGlSyncHandleLocked() : 0;
+    if (!slot || !handle) return 0;
+    slot->guest_handle = handle;
+    slot->host_sync = nullptr;
+    ++g_guest_gl_sync_count;
+    return handle;
+}
+
+void Bl2GuestGlSyncAttach(uint32_t handle, GLsync sync) {
+    std::lock_guard<std::mutex> lock(g_guest_gl_sync_mutex);
+    if (GuestGlSyncSlot* slot = FindGuestGlSyncLocked(handle)) slot->host_sync = sync;
+}
+
 #if defined(BL2_NATIVE_ARM32)
 bool NativeDirectGlMappingsRequested() {
     static const bool requested = [] {
@@ -948,6 +975,15 @@ GuestMappedWriteGuard::~GuestMappedWriteGuard() {
 
 void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
     constexpr GLbitfield kMapPersistentBit = 0x0040;
+    // Per-draw common case: nothing mapped changed since the last full pass.
+    // Skips the EGL TLS lookup and the process-wide mapping mutex.
+    static const bool fast_sync = [] {
+        char value[PROP_VALUE_MAX] = {};
+        return !(__system_property_get("debug.bl2.sync_fast", value) > 0 && value[0] == '0');
+    }();
+    if (fast_sync && s_mapping_fast_steady.load(std::memory_order_acquire) &&
+        MappedDirtyTracker().DirtyEpoch() ==
+            s_mapping_scanned_epoch.load(std::memory_order_relaxed)) return;
     constexpr GLbitfield kMapCoherentBit = 0x0080;
     const EGLContext context = eglGetCurrentContext();
     if (context == EGL_NO_CONTEXT) return;
@@ -977,7 +1013,11 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
     size_t copied_bytes = 0;
     const uint32_t dirty_epoch = tracker ? tracker->DirtyEpoch() : 0;
     const bool scan_dirty_pages = tracker && tracker->NeedsDirtyScan(dirty_epoch);
-    if (tracker && !scan_dirty_pages && s_mapping_set_steady) return;
+    if (tracker && !scan_dirty_pages && s_mapping_set_steady) {
+        s_mapping_scanned_epoch.store(dirty_epoch, std::memory_order_relaxed);
+        s_mapping_fast_steady.store(true, std::memory_order_release);
+        return;
+    }
     bool steady = tracker != nullptr;
     if (software || scan_dirty_pages) {
         // Snapshot all dirty pages before comparisons. The legacy path rearms
@@ -1107,6 +1147,9 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
         mapped_bytes += mapping.length;
     }
     s_mapping_set_steady = steady;
+    // Publish the epoch this pass consumed; a later fault bumps the live epoch.
+    s_mapping_scanned_epoch.store(dirty_epoch, std::memory_order_relaxed);
+    s_mapping_fast_steady.store(steady && tracker && !software, std::memory_order_release);
     if (copied_bytes) Bl2HitchAddBufferUpload(copied_bytes);
 #if defined(BL2_NATIVE_ARM32)
     if (profile && (mapping_count || direct_count)) {
@@ -1196,6 +1239,7 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
 void ResetGuestMappedDirtyTracker() {
     std::lock_guard mapping_lock(s_mapping_mutex);
     s_mapping_set_steady = false;
+    s_mapping_fast_steady.store(false, std::memory_order_release);
     MappedDirtyTracker().Shutdown();
     for (auto& [native_pointer, mapping] : s_guest_mapped_buffers) {
         (void)native_pointer;
@@ -2084,6 +2128,7 @@ bool ForgetGuestGlMappings(DynarmicHost& host, GLsizei count, const GLuint* buff
             host.GuestFree(mapping.guest_address);
         s_guest_mapped_buffers.erase(found);
         s_mapping_set_steady = false;
+        s_mapping_fast_steady.store(false, std::memory_order_release);
     }
     glBindBuffer(target, 0);
     if (probe_array) {
@@ -3516,6 +3561,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         glDrawArraysInstanced(mode, first, count, instance_count);
         // Bl2FogAuditCompleted();  // Pixel readback diagnosis paused.
         if (SceneAuditEnabled()) SceneAuditDrawCompleted("glDrawArraysInstanced");
+        Bl2AutoFlushNoteDraw();
         if (samples_query != 0) {
             glEndQuery(GL_ANY_SAMPLES_PASSED);
             GLuint any_samples = 0;
@@ -3576,6 +3622,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         glDrawElementsInstanced(mode, count, type, indices, instance_count);
         // Bl2FogAuditCompleted();  // Pixel readback diagnosis paused.
         if (SceneAuditEnabled()) SceneAuditDrawCompleted("glDrawElementsInstanced");
+        Bl2AutoFlushNoteDraw();
     });
     auto make_draw_elements_base_vertex = [](bool prefer_ext) {
       return [prefer_ext](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
@@ -3636,6 +3683,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         }
         // Bl2FogAuditCompleted();  // Pixel readback diagnosis paused.
         if (SceneAuditEnabled()) SceneAuditDrawCompleted("glDrawElementsBaseVertex");
+        Bl2AutoFlushNoteDraw();
         if (DrawAuditEnabled() && call < 3) {
             LOGI("BaseVertex audit #%u after_error=0x%X", call + 1, glGetError());
         }
@@ -3698,6 +3746,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         }
         // Bl2FogAuditCompleted();  // Pixel readback diagnosis paused.
         if (SceneAuditEnabled()) SceneAuditDrawCompleted("glDrawElementsInstancedBaseVertex");
+        Bl2AutoFlushNoteDraw();
       };
     };
     manager.RegisterThunkIfAbsent("glDrawElementsInstancedBaseVertexOES",
@@ -4111,6 +4160,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         const GLenum target = static_cast<GLenum>(jit.Regs()[0]);
         std::lock_guard mapping_lock(s_mapping_mutex);
         s_mapping_set_steady = false;
+        s_mapping_fast_steady.store(false, std::memory_order_release);
         const GLintptr offset = static_cast<int32_t>(jit.Regs()[1]);
         const GLsizeiptr length = static_cast<int32_t>(jit.Regs()[2]);
         const GLbitfield access = static_cast<GLbitfield>(jit.Regs()[3]);
@@ -4355,6 +4405,7 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
         const GLenum target = static_cast<GLenum>(jit.Regs()[0]);
         std::lock_guard mapping_lock(s_mapping_mutex);
         s_mapping_set_steady = false;
+        s_mapping_fast_steady.store(false, std::memory_order_release);
         void* native = nullptr; glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &native);
         auto it = s_guest_mapped_buffers.find(native);
         if (it == s_guest_mapped_buffers.end()) {
@@ -4553,13 +4604,20 @@ void RegisterGles2CoreThunks(ThunkManager& manager) {
             LOGE("glClientWaitSync rejected without current EGL context handle=0x%08X", handle);
             return;
         }
-        std::lock_guard<std::mutex> lock(g_guest_gl_sync_mutex);
-        GuestGlSyncSlot* slot = FindGuestGlSyncLocked(handle);
-        if (!slot) {
-            LOGE("glClientWaitSync rejected stale handle=0x%08X", handle);
-            return;
+        GLsync host_sync = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_guest_gl_sync_mutex);
+            GuestGlSyncSlot* slot = FindGuestGlSyncLocked(handle);
+            if (!slot) {
+                LOGE("glClientWaitSync rejected stale handle=0x%08X", handle);
+                return;
+            }
+            host_sync = slot->host_sync;
         }
-        const GLenum result = glClientWaitSync(slot->host_sync, flags, timeout);
+        // Waited outside the registry lock: the fence may belong to another
+        // thread's context, which must stay free to create and delete its own
+        // syncs (and flush) meanwhile. GL defers a concurrent deletion.
+        const GLenum result = glClientWaitSync(host_sync, flags, timeout);
         jit.Regs()[0] = result;
     });
     manager.RegisterThunkIfAbsent("glDeleteSync", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {

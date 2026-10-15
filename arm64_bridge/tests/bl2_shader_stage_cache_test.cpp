@@ -254,6 +254,50 @@ int main(int argc, char** argv) {
     Check(newDriver.PrepareStream(changed.Reader(), root) && newDriver.Stats().compiled == 2 &&
           !newDriver.Stats().preparedFromMarker, "driver identity change never reuses old binary/marker");
     Check(shaders.empty() && programs.empty() && errorReads == 0, "no leaked objects or swallowed guest errors");
+    {
+        // Background formation: header-only open, renderer misses, worker forms.
+        const std::string formRoot = root + "/former"; std::filesystem::create_directory(formRoot);
+        Stream header{source.bytes}; Bl2ShaderStageCache opened;
+        const unsigned compilesBefore = compiles;
+        Check(opened.OpenStream(header.Reader(), formRoot) && header.total == 56 && !opened.Complete() &&
+              compiles == compilesBefore, "open reads only the header and compiles nothing");
+        Check(opened.MatchesCurrentDriver(), "former context reports the opened identity");
+        std::string vertexPadded, fragmentPadded;
+        legacy_glsl::CompleteSsoInterface(vertex, true, &vertexPadded);
+        legacy_glsl::CompleteSsoInterface(fragment, false, &fragmentPadded);
+        const auto vertexDigest = Hash(std::span(reinterpret_cast<const uint8_t*>(vertex.data()), vertex.size()));
+        const auto fragmentDigest = Hash(std::span(reinterpret_cast<const uint8_t*>(fragment.data()), fragment.size()));
+        Check(!opened.LoadProgram(GL_VERTEX_SHADER, vertex, vertexPadded, true) && compiles == compilesBefore,
+              "import-only load of an unformed stage compiles nothing");
+        Check(!opened.StageFilePresent(GL_VERTEX_SHADER, vertexDigest), "no binary before formation");
+        uint64_t formedBytes = 0;
+        Check(opened.FormStage(GL_VERTEX_SHADER, vertexDigest, vertexPadded, formedBytes) && formedBytes > 148 &&
+              opened.StageFilePresent(GL_VERTEX_SHADER, vertexDigest) && compiles == compilesBefore + 1,
+              "worker forms and persists one stage");
+        const GLuint imported = opened.LoadProgram(GL_VERTEX_SHADER, vertex, vertexPadded, true);
+        Check(imported && compiles == compilesBefore + 1 && opened.Stats().compiled == 0,
+              "renderer imports the formed stage; worker compiles stay out of renderer stats");
+        glDeleteProgram(imported);
+        const GLuint missed = opened.LoadProgram(GL_FRAGMENT_SHADER, fragment, fragmentPadded);
+        uint64_t fragmentBytes = 0;
+        Check(missed && opened.Stats().compiled == 1 &&
+              opened.StageFilePresent(GL_FRAGMENT_SHADER, fragmentDigest, &fragmentBytes),
+              "renderer miss compiles and persists the stage itself");
+        glDeleteProgram(missed);
+        Check(!opened.CommitFormation(1), "marker refuses an implausible byte total");
+        Check(opened.CommitFormation(formedBytes + fragmentBytes) && !Find(formRoot, "complete.bin").empty(),
+              "complete formation commits the marker");
+        Stream again{source.bytes}; Bl2ShaderStageCache reopened;
+        Check(reopened.OpenStream(again.Reader(), formRoot) && reopened.Complete(),
+              "a later launch opens complete from the marker");
+        std::filesystem::create_directory(formRoot + "/bl2-stage-cache-STALE");
+        { FILE* stale = std::fopen((formRoot + "/bl2-stage-cache-STALE/v-1.bin").c_str(), "wb"); if (stale) std::fclose(stale); }
+        Check(reopened.RemoveStaleIdentities() == 1 && !std::filesystem::exists(formRoot + "/bl2-stage-cache-STALE") &&
+              !Find(formRoot, "complete.bin").empty(), "stale identity removed, own cache kept");
+        driver += " update";
+        Check(!reopened.MatchesCurrentDriver(), "a different driver never forms into this identity");
+        Check(shaders.empty() && programs.empty(), "formation leaks no GL objects");
+    }
     if (argc == 3) {
         FILE* f = std::fopen(argv[2], "rb");
         if (!f) return 2;

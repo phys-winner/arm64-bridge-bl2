@@ -17,7 +17,9 @@ namespace {
 
 constexpr const char* kTag = "BL2Hitch";
 std::atomic<uint32_t> g_jit_blocks{0}, g_draws{0}, g_swaps{0}, g_pipelines{0}, g_textures{0};
-std::atomic<uint64_t> g_pipeline_ns{0}, g_texture_bytes{0}, g_buffer_bytes{0};
+std::atomic<uint32_t> g_stages{0}, g_stage_compiles{0};
+std::atomic<uint64_t> g_pipeline_ns{0}, g_texture_bytes{0}, g_buffer_bytes{0}, g_stage_ns{0};
+std::atomic<uint64_t> g_frame_index{0};
 std::atomic<uint32_t> g_limit_bits{0};
 
 bool Enabled() {
@@ -47,6 +49,12 @@ void Bl2HitchAddPipelineNs(uint64_t ns) {
     g_pipelines.fetch_add(1, std::memory_order_relaxed);
     g_pipeline_ns.fetch_add(ns, std::memory_order_relaxed);
 }
+void Bl2HitchAddStageNs(uint64_t ns, bool compiled) {
+    g_stages.fetch_add(1, std::memory_order_relaxed);
+    if (compiled) g_stage_compiles.fetch_add(1, std::memory_order_relaxed);
+    g_stage_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+uint64_t Bl2HitchFrameIndex() { return g_frame_index.load(std::memory_order_relaxed); }
 void Bl2HitchAddTextureUpload(uint64_t bytes) {
     g_textures.fetch_add(1, std::memory_order_relaxed);
     g_texture_bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -64,6 +72,7 @@ void Bl2HitchSetFrameLimit(float fps) {
 }
 
 void Bl2HitchFrame() {
+    g_frame_index.fetch_add(1, std::memory_order_relaxed);
     if (!Enabled()) return;
     // State of the presenting thread; another presenter keeps its own.
     static thread_local uint64_t last_wall = 0, last_cpu = 0, last_game_cpu = 0;
@@ -72,7 +81,8 @@ void Bl2HitchFrame() {
     static thread_local uint32_t frames = 0, hitches = 0;
     static thread_local double worst_ms = 0, sum_ms = 0;
     static thread_local uint64_t sum_jit = 0, sum_pipelines = 0, sum_pipeline_ns = 0,
-                                 sum_texture_bytes = 0, sum_buffer_bytes = 0, sum_draws = 0;
+                                 sum_texture_bytes = 0, sum_buffer_bytes = 0, sum_draws = 0,
+                                 sum_stages = 0, sum_stage_compiles = 0, sum_stage_ns = 0;
     const uint64_t wall = NowNs(CLOCK_MONOTONIC);
     const uint64_t cpu = NowNs(CLOCK_THREAD_CPUTIME_ID);
     const pid_t game = Bl2PerfHintGameTid();
@@ -85,6 +95,9 @@ void Bl2HitchFrame() {
     const uint32_t textures = g_textures.exchange(0, std::memory_order_relaxed);
     const uint64_t texture_bytes = g_texture_bytes.exchange(0, std::memory_order_relaxed);
     const uint64_t buffer_bytes = g_buffer_bytes.exchange(0, std::memory_order_relaxed);
+    const uint32_t stages = g_stages.exchange(0, std::memory_order_relaxed);
+    const uint32_t stage_compiles = g_stage_compiles.exchange(0, std::memory_order_relaxed);
+    const uint64_t stage_ns = g_stage_ns.exchange(0, std::memory_order_relaxed);
     if (last_wall && wall > last_wall) {
         const double frame_ms = (wall - last_wall) / 1e6;
         const double render_ms = (cpu - last_cpu) / 1e6;
@@ -98,9 +111,11 @@ void Bl2HitchFrame() {
             ++hitches;
             __android_log_print(ANDROID_LOG_INFO, kTag,
                 "frame=%.1fms budget=%.1fms render_cpu=%.1fms game_cpu=%.1fms jit_blocks=%u "
-                "pipelines=%u/%.2fms textures=%u/%.1fKiB buffers=%.1fKiB draws=%u swaps=%u",
+                "pipelines=%u/%.2fms stages=%u/%.2fms compiled=%u textures=%u/%.1fKiB "
+                "buffers=%.1fKiB draws=%u swaps=%u",
                 frame_ms, budget_ms, render_ms, game_ms, jit, pipelines, pipeline_ns / 1e6,
-                textures, texture_bytes / 1024.0, buffer_bytes / 1024.0, draws, swaps);
+                stages, stage_ns / 1e6, stage_compiles, textures, texture_bytes / 1024.0,
+                buffer_bytes / 1024.0, draws, swaps);
         }
         ++frames;
         sum_ms += frame_ms;
@@ -111,6 +126,9 @@ void Bl2HitchFrame() {
         sum_texture_bytes += texture_bytes;
         sum_buffer_bytes += buffer_bytes;
         sum_draws += draws;
+        sum_stages += stages;
+        sum_stage_compiles += stage_compiles;
+        sum_stage_ns += stage_ns;
         if (!window_start) window_start = wall;
         if (wall - window_start >= 10'000'000'000ull && frames) {
             // pace=0 while presents are unpaced; late = frames shown after
@@ -118,11 +136,13 @@ void Bl2HitchFrame() {
             const Bl2FramePacerStats pace = Bl2FramePacerTakeStats();
             __android_log_print(ANDROID_LOG_INFO, kTag,
                 "summary frames=%u avg=%.2fms worst=%.1fms hitches=%u jit_blocks=%llu "
-                "pipelines=%llu/%.1fms textures=%.1fMiB buffers=%.1fMiB draws/frame=%.0f "
-                "pace=%.1fms depth=%.1fms late=%u",
+                "pipelines=%llu/%.1fms stages=%llu/%.1fms compiled=%llu textures=%.1fMiB "
+                "buffers=%.1fMiB draws/frame=%.0f pace=%.1fms depth=%.1fms late=%u",
                 frames, sum_ms / frames, worst_ms, hitches,
                 static_cast<unsigned long long>(sum_jit),
                 static_cast<unsigned long long>(sum_pipelines), sum_pipeline_ns / 1e6,
+                static_cast<unsigned long long>(sum_stages), sum_stage_ns / 1e6,
+                static_cast<unsigned long long>(sum_stage_compiles),
                 sum_texture_bytes / 1048576.0, sum_buffer_bytes / 1048576.0,
                 static_cast<double>(sum_draws) / frames, pace.interval_ns / 1e6,
                 pace.depth_ns / 1e6, pace.late);
@@ -131,6 +151,7 @@ void Bl2HitchFrame() {
             worst_ms = sum_ms = 0;
             sum_jit = sum_pipelines = sum_pipeline_ns = 0;
             sum_texture_bytes = sum_buffer_bytes = sum_draws = 0;
+            sum_stages = sum_stage_compiles = sum_stage_ns = 0;
         }
     }
     last_wall = wall;

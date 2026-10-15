@@ -130,6 +130,7 @@ public final class TouchPreferences {
             catch (NumberFormatException ignored) { }
             advancedGraphics[i] = value >= 0 && value <= (i == 10 ? 4 : 1) ? value : -1;
         }
+        advancedGraphics[1] = 0; // Motion Blur is disabled, including saved values from older builds.
         opacity = TouchInput.finiteClamp(number("opacity", .42f), .15f, .9f);
         scale = TouchInput.finiteClamp(number("scale", 1), .85f, 1.4f);
         look = TouchInput.finiteClamp(number("look", .22f), .04f, 1);
@@ -275,6 +276,7 @@ public final class TouchPreferences {
         int[] values = java.util.Arrays.copyOf(controls, SETTINGS_FIELDS + 2);
         values[22] = potatoGraphics ? 1 : 0;
         System.arraycopy(advancedGraphics, 0, values, 23, advancedGraphics.length);
+        values[24] = 0;
         for (int i = 0; i < performance.length; ++i) values[34+i] = performance[i] ? 1 : 0;
         values[37] = reloadButton ? 1 : 0;
         values[38] = radialTap ? 1 : 0;
@@ -289,7 +291,7 @@ public final class TouchPreferences {
         if (words == null || words.length != SETTINGS_FIELDS+3 || words[0] != SETTINGS_VERSION || words[1] < 1 || (words[2]&~31) != 0)
             return false;
         int base = 3;
-        if (words[base] < 50 || words[base] > 150 || words[base]%10 != 0
+        if (words[base] < 20 || words[base] > 150 || words[base]%10 != 0
                 || !wireFloat(words[base+1], .15f, .9f) || !wireFloat(words[base+2], .85f, 1.4f)
                 || !wireFloat(words[base+3], .04f, 1) || !wireFloat(words[base+4], .1f, 1)
                 || !wireFloat(words[base+11], .25f, 3) || !wireFloat(words[base+12], 0, 3)
@@ -316,6 +318,7 @@ public final class TouchPreferences {
         uiPercent=words[20]; showFPS=words[21]!=0; fpsLimit=words[22];
         potatoGraphics=words[23]!=0;
         System.arraycopy(words, 24, advancedGraphics, 0, advancedGraphics.length);
+        advancedGraphics[1] = 0;
         for (int i = 0; i < performance.length; ++i) performance[i] = words[35+i] != 0;
         reloadButton = words[38] != 0;
         radialTap = words[39] != 0;
@@ -326,7 +329,7 @@ public final class TouchPreferences {
     }
     public static int renderPercent(float value) {
         if (!Float.isFinite(value)) return 50;
-        return Math.round(Math.max(50, Math.min(150, value)) / 10) * 10;
+        return Math.round(Math.max(20, Math.min(150, value)) / 10) * 10;
     }
     public static int uiPercent(float value) {
         if (!Float.isFinite(value) || value == 125) return 125;

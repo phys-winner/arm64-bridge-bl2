@@ -163,13 +163,16 @@ struct StatusVm final : InventoryVmBase {
     Raw equipped{};
     bool retired=false,originalQueue=false,pendingMove=false,originalMouseDown=false;
     bool rolloverOnly=false,moveInstalled=false;
+    bool transferTargets=false,rearmCallbacks=false;
+    Raw pressCallback{};
+    unsigned transfers=0;
     float pendingX=0,pendingY=0,lastX=-1,lastY=-1;
     struct Button {std::uint32_t type;float x,y;};
     std::vector<Button> buttons,events;
     mutable unsigned reads=0;
     unsigned writes=0,calls=0;
     std::uint32_t nextScratch=0x23100000;
-    unsigned scriptInvokes=0,memberSets=0,dropReads=0;
+    unsigned scriptInvokes=0,memberSets=0,dropReads=0,onPressReads=0;
     bool failDrop=false,replaceDrop=false,replacePayload=false;
     std::vector<std::vector<std::uint32_t>> keyCalls;
     std::array<std::uint32_t,2> keyHandled{{0,1}};
@@ -210,6 +213,7 @@ struct StatusVm final : InventoryVmBase {
     explicit StatusVm(const char* fixture):InventoryVmBase(fixture) {
         vm.prop(vm.root,"inventory",top);equipped=vm.make(10);vm.visible(equipped,top);vm.prop(top,"equippedPanel",equipped);
         for(unsigned i=0;i<8;++i) {const auto c=vm.make(10);vm.visible(c,equipped);vm.prop(equipped,"cell"+std::to_string(i+1),c);}
+        pressCallback=vm.make(8);vm.prop(cell,"onPress",pressCallback);
     }
     void equipSource() {
         offers=true;vm.prop(panel,"_visible",boolean(false));vm.visible(cell,equipped);
@@ -226,6 +230,9 @@ struct StatusVm final : InventoryVmBase {
     static bool sourcePoint(double x,double y) {
         return x>=.18*1280 && x<=.23*1280 && y>=.37*720 && y<=.43*720;
     }
+    static bool destinationPoint(double x,double y) {
+        return x>=.57*1280 && x<=.63*1280 && y>=.47*720 && y<=.53*720;
+    }
     void advanceOriginal() {
         if(!originalQueue) return;
         const auto source=offers?equipped:panel;
@@ -235,8 +242,12 @@ struct StatusVm final : InventoryVmBase {
                 const auto found=vm.object(source).properties.find("currentOverClip");
                 // Authored handleStorageOnPress forwards only currentOverClip;
                 // onCellPressed alone sets bMouseDown, never the event's XY.
-                originalMouseDown=found!=vm.object(source).properties.end() && found->second==cell;
+                originalMouseDown=found!=vm.object(source).properties.end() && found->second==cell &&
+                    vm.object(cell).properties.at("onPress")==pressCallback;
             } else {
+                if(transferTargets && vm.object(manager).properties.at("_inDrag")==boolean(true) &&
+                    vm.object(manager).properties.at("dropTarget")==vm.object(equipped).properties.at("cell2"))
+                    ++transfers;
                 originalMouseDown=false;equipDelegate=false;nativeOrder.push_back("original-finish-equip");
             }
             if(rolloverOnly) {lastX=button.x;lastY=button.y;}
@@ -249,12 +260,26 @@ struct StatusVm final : InventoryVmBase {
                 // subsequent real motion invokes StorageMove197739/GetHitCell.
                 if(std::floor(pendingX)!=std::floor(lastX) || std::floor(pendingY)!=std::floor(lastY)) {
                     Raw nil{};nil[3]=1;
-                    const bool inside=sourcePoint(pendingX/2559*1280,pendingY/1439*720);
+                    const bool origin=sourcePoint(pendingX/2559*1280,pendingY/1439*720),
+                        destination=transferTargets && destinationPoint(pendingX/2559*1280,pendingY/1439*720);
+                    const bool inside=origin || destination;
                     if(!inside) {moveInstalled=false;vm.prop(source,"currentOverClip",nil);}
                     else if(!moveInstalled) {moveInstalled=true;vm.prop(source,"currentOverClip",nil);}
                     else {
                         if(originalMouseDown) vm.prop(manager,"_inDrag",boolean(true));
-                        vm.prop(source,"currentOverClip",cell);
+                        const auto next=origin?cell:vm.object(equipped).properties.at("cell2");
+                        if(rearmCallbacks && !originalMouseDown) {
+                            // EquippedPanel only calls a cell's RollOver when
+                            // its currentOverClip changes. InventoryCell then
+                            // restores onPress; an idle move inside the same
+                            // clip cannot repair a former drag destination.
+                            const auto previous=vm.object(source).properties.at("currentOverClip");
+                            if(previous!=next) {
+                                if(previous[3]==10) vm.prop(previous,"onPress",nil);
+                                vm.prop(next,"onPress",pressCallback);
+                            }
+                        }
+                        vm.prop(source,"currentOverClip",next);
                     }
                 }
                 lastX=pendingX;lastY=pendingY;
@@ -264,6 +289,11 @@ struct StatusVm final : InventoryVmBase {
                 vm.prop(source,"currentOverClip",origin?cell:Raw{});
             }
             pendingMove=false;
+            if(transferTargets) {
+                Raw nil{};nil[3]=1;
+                const bool destination=destinationPoint(pendingX/2559*1280,pendingY/1439*720);
+                vm.prop(manager,"dropTarget",destination?vm.object(equipped).properties.at("cell2"):nil);
+            }
         }
     }
     bool read(std::uint32_t p,void* out,std::size_t n) const override {++reads;return InventoryVmBase::read(p,out,n);}
@@ -271,6 +301,7 @@ struct StatusVm final : InventoryVmBase {
     bool call(std::uint32_t pc,const std::vector<std::uint32_t>& args,std::uint32_t& result) override {
         ++calls;
         if(pc==set) ++memberSets;
+        if(pc==get && vm.text(args[2])=="onPress") ++onPressReads;
         if(pc==get && vm.text(args[2])=="dropTarget") {
             ++dropReads;
             if(failDrop) return false;
@@ -347,7 +378,8 @@ struct StatusConsumer {
     Target inventoryOwner{},frameTarget{};
     std::optional<InventoryDragUpdate> inventoryStart,inventoryFinal;
     std::uint64_t inventoryPressedAt=100,now=100;
-    bool inventoryPressed=false,inventoryCleanup=false,inventoryHoverBoundary=false,alive=true,allowed=true,staleOnQuery=false;
+    bool inventoryPressed=false,inventoryCleanup=false,inventoryHoverBoundary=false,inventoryDropQueued=false,alive=true,allowed=true,staleOnQuery=false;
+    bool inventorySourcePrimed=false,inventoryPrimePending=false;
     bool inventoryReleaseReady=true;
     unsigned queries=0,clicks=0,moves=0,releases=0,drops=0,presses=0;
     mutable unsigned currentChecks=0,modelReads=0;
@@ -364,6 +396,7 @@ struct StatusConsumer {
     std::uint64_t epoch=10;
     bool preparedValid=true,frameValid=true;
     unsigned logs=0,keyRejects=0;
+    unsigned inventoryDiagnosticGestures=0;
     static constexpr std::uint32_t kMovieKey=0x01CC5E7C;
     explicit StatusConsumer(StatusVm& transport):vm(transport),host(transport) {
         frameTarget.owner=metadata.status;frameTarget.ownerToken=metadata.token(metadata.status);
@@ -393,7 +426,9 @@ struct StatusConsumer {
         const auto& sink=*static_cast<const StatusConsumer*>(context);++sink.modelReads;
         return Memory::read(&sink.metadata.memory,p,out,n);
     }
-    std::uint64_t tradingInventory(std::int32_t,bool) {assert(false);return 0;}
+    std::uint64_t tradingInventory(std::int32_t index,bool offers) {
+        assert(vm.trading && index==(offers?1:2));++vm.offeredQueries;return vm.offeredItem;
+    }
     std::optional<std::uint32_t> originalQuery(std::uint32_t object,const UiNativeMethod& fn,
         std::initializer_list<std::uint32_t> args,std::uint32_t offset) {
         const bool equipped=object==metadata.equipped;assert(object==metadata.backpack || equipped);
@@ -406,7 +441,7 @@ struct StatusConsumer {
         if(!current()) return {};
         GfxSession fresh(vm,widget_fixture::base,movie,scratch2,512,true);return captureInventory(fresh,x,y);
     }
-    void clearInventory() {inventoryPressed=false;inventoryHoverBoundary=false;inventoryStart.reset();inventoryFinal.reset();inventoryStatus={};inventoryStatusPanels={};inventoryTarget={};inventorySession.reset();inventoryTransport.reset();}
+    void clearInventory() {inventoryPressed=false;inventoryHoverBoundary=inventoryDropQueued=inventorySourcePrimed=inventoryPrimePending=false;inventoryStart.reset();inventoryFinal.reset();inventoryStatus={};inventoryStatusPanels={};inventoryTarget={};inventorySession.reset();inventoryTransport.reset();}
     void consumeHover() {
         vm.advanceOriginal();inventoryHoverBoundary=true;
         if(!vm.originalQueue) vm.vm.prop(vm.offers?vm.equipped:vm.panel,"currentOverClip",vm.cell);
@@ -415,9 +450,14 @@ struct StatusConsumer {
         consumeHover();now+=16;
         const auto owner=inventoryIdentity();
         if(const auto update=inventoryGesture.begin(owner,current(),false,now)) inventoryUpdate(*update);
-        if(inventoryGesture.captured() && inventoryTarget && current()) {
+        if((inventoryGesture.captured() || inventoryFinal) && inventoryTarget && current()) {
             inventoryFresh=freshInventorySource();
-            if(!inventoryFresh) {if(const auto update=inventoryGesture.cancel()) inventoryUpdate(*update);else clearInventory();}
+            if(!inventoryFresh) releaseInventory();
+        }
+        if(inventoryFinal) {
+            auto update=*inventoryFinal;
+            if(!inventoryFresh) update.command=InventoryDragCommand::Cancel;
+            finishInventory(update);
         }
         // Same production endTouchFrame ordering: input cancellation is already
         // processed before any deferred native press can be emitted.
@@ -446,6 +486,151 @@ struct StatusConsumer {
 
 int main(int argc,char** argv) {
     assert(argc==2);
+    // An original MouseUp clears a queued MouseMove. The final target must be
+    // consumed by the authored movie before its native release can transfer.
+    {
+        StatusVm vm(argv[1]);vm.originalQueue=vm.transferTargets=true;
+        {StatusConsumer sink(vm);sink.inventorySession.reset();assert(sink.inventoryDown(.2f,.4f));
+         const auto source=sink.inventoryTarget.source;
+         sink.inventoryGesture.begin(sink.inventoryIdentity(),true,false,sink.now);
+         sink.inventoryGesture.pointer({3,PointerPhase::Down,.2f,.4f,10,1,sink.now},source);
+         sink.consumeHover();
+         const auto move=sink.inventoryGesture.pointer({3,PointerPhase::Move,.5f,.5f,10,2,sink.now},source);
+         assert(move);sink.inventoryUpdate(*move);sink.originalFrame();
+         assert(sink.inventoryPressed && sink.freshInventorySource()==source);
+         const auto drop=sink.inventoryGesture.pointer({3,PointerPhase::Up,.6f,.5f,10,3,sink.now},source);
+         assert(drop);sink.inventoryUpdate(*drop);
+         assert(sink.inventoryFinal && sink.inventoryDropQueued && vm.pendingMove && !vm.nativeReleases);
+         sink.finishInventory(*sink.inventoryFinal); // Same-boundary retries cannot release early.
+         assert(vm.pendingMove && !vm.nativeReleases);
+         sink.originalFrame();sink.originalFrame();
+         assert(vm.transfers==1 && vm.nativeReleases==1 && sink.releases==1 && !vm.cancellations);
+        }
+        assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
+    }
+    for(unsigned fault=0;fault<5;++fault) {
+        StatusVm vm(argv[1]);vm.originalQueue=vm.transferTargets=true;
+        {StatusConsumer sink(vm);sink.inventorySession.reset();assert(sink.inventoryDown(.2f,.4f));
+         const auto source=sink.inventoryTarget.source;
+         sink.inventoryGesture.begin(sink.inventoryIdentity(),true,false,sink.now);
+         sink.inventoryGesture.pointer({3,PointerPhase::Down,.2f,.4f,10,1,sink.now},source);
+         sink.consumeHover();
+         const auto move=sink.inventoryGesture.pointer({3,PointerPhase::Move,.5f,.5f,10,2,sink.now},source);
+         assert(move);sink.inventoryUpdate(*move);sink.originalFrame();
+         const auto drop=sink.inventoryGesture.pointer({3,PointerPhase::Up,.6f,.5f,10,3,sink.now},source);
+         assert(drop);sink.inventoryUpdate(*drop);assert(sink.inventoryFinal && !sink.releases);
+         if(fault==0) sink.releaseInventory();
+         else if(fault==1) vm.vm.prop(vm.manager,"_data",vm.vm.make(8));
+         else if(fault==2) vm.vm.prop(vm.manager,"pressOrigin",vm.top);
+         else if(fault==3) sink.metadata.item=sink.metadata.object("Replaced during final motion",sink.metadata.weaponType);
+         else sink.alive=false;
+         sink.originalFrame();sink.originalFrame();
+         assert(!vm.transfers && !sink.drops && !sink.inventoryFinal);
+         assert(sink.releases==unsigned(fault==0 || fault==3) && vm.cancellations==unsigned(fault==0 || fault==3));
+        }
+        assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
+    }
+    // A finger may leave its item before the original first-entry RollOver
+    // installs onMouseMove. Normalize that captured DOWN to the fixed origin
+    // once, after real movement, without inventing jitter or pressing a target.
+    for(unsigned fault=0;fault<6;++fault) {
+        StatusVm vm(argv[1]);vm.originalQueue=vm.rolloverOnly=vm.transferTargets=true;
+        {StatusConsumer sink(vm);sink.inventorySession.reset();
+         sink.inventoryGesture.begin(sink.inventoryIdentity(),true,false,sink.now);
+         sink.pointer({3,PointerPhase::Down,.2f,.4f,10,1,sink.now});sink.originalFrame();
+         assert(vm.moveInstalled && vm.vm.object(vm.panel).properties.at("currentOverClip")[3]==1);
+         sink.pointer({3,PointerPhase::Move,.6f,.5f,10,2,sink.now});
+         assert(vm.pendingMove && !sink.presses);sink.originalFrame();
+         assert(vm.pendingMove && vm.pendingX==std::floor(.2f*2559) && vm.pendingY==std::floor(.4f*1439) && !sink.presses);
+         const auto primed=vm.events.size();
+         if(fault) {
+             if(fault<=3) sink.pointer({fault==3?4:3,
+                 fault==1?PointerPhase::Cancel:fault==2?PointerPhase::Up:PointerPhase::Down,.6f,.5f,10,3,sink.now});
+             else if(fault==4) sink.alive=false;
+             else sink.metadata.item=sink.metadata.object("Replaced while priming",sink.metadata.weaponType);
+             sink.originalFrame();sink.originalFrame();
+             assert(!sink.presses && !vm.nativeReleases && !vm.transfers && !sink.clicks && !vm.cancellations);
+             assert(!sink.inventoryPrimePending && !sink.inventoryStart);
+             assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
+             continue;
+         }
+         sink.pointer({3,PointerPhase::Move,.61f,.5f,10,3,sink.now});
+         assert(vm.events.size()==primed && vm.pendingX==std::floor(.2f*2559));
+         sink.originalFrame();assert(sink.presses==1 && sink.inventoryPressed);
+         assert(vm.events.back().type==1 && vm.events.back().x==std::floor(.61f*2559));
+         sink.originalFrame();assert(sink.inventoryDragData.data==vm.dragData[4]);
+         sink.pointer({3,PointerPhase::Up,.6f,.5f,10,4,sink.now});sink.originalFrame();sink.originalFrame();
+         assert(vm.transfers==1 && vm.nativeReleases==1 && !vm.cancellations && !sink.clicks);
+         assert(std::count_if(vm.events.begin(),vm.events.end(),[](const auto& event) {
+             return event.type==1 && event.x==std::floor(.2f*2559) && event.y==std::floor(.4f*1439);
+         })==3); // Initial DOWN/hover plus exactly one fixed-origin prime.
+        }
+        assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
+    }
+    // A previous drop can leave currentOverClip at its destination without a
+    // normal RollOver, so onPress is NULL although native input is released
+    // and its cursor is correctly inside that same cell (device second551).
+    // Genuine outward motion and the consumed captured-origin prime must
+    // rearm that callback before the next original DOWN is accepted.
+    for(unsigned fault=0;fault<6;++fault) {
+        StatusVm vm(argv[1]);vm.equipSource();
+        vm.originalQueue=vm.rolloverOnly=vm.transferTargets=vm.rearmCallbacks=true;
+        vm.moveInstalled=true;vm.lastX=std::floor(.2f*2559);vm.lastY=std::floor(.4f*1439);
+        Raw nil{};nil[3]=1;
+        vm.vm.prop(vm.equipped,"currentOverClip",vm.cell);vm.vm.prop(vm.cell,"onPress",nil);
+        {StatusConsumer sink(vm);sink.inventorySession.reset();
+         sink.inventoryGesture.begin(sink.inventoryIdentity(),true,false,sink.now);
+         sink.pointer({3,PointerPhase::Down,.2f,.4f,10,1,sink.now});sink.originalFrame();
+         assert(vm.vm.object(vm.equipped).properties.at("currentOverClip")==vm.cell &&
+             vm.vm.object(vm.cell).properties.at("onPress")==nil && !vm.originalMouseDown);
+         sink.pointer({3,PointerPhase::Move,.212f,.4f,10,2,sink.now});
+         assert(!sink.presses && sink.inventoryStart && vm.pendingMove && !sink.inventorySourcePrimed);
+         sink.originalFrame();const auto forwarded=sink.moves;
+         for(unsigned i=0;i<3;++i) sink.originalFrame();
+         assert(!sink.presses && !sink.inventorySourcePrimed && sink.moves==forwarded &&
+             vm.vm.object(vm.cell).properties.at("onPress")==nil);
+         if(fault) {
+             if(fault<=3) sink.pointer({fault==3?4:3,
+                 fault==1?PointerPhase::Cancel:fault==2?PointerPhase::Up:PointerPhase::Down,.212f,.4f,10,3,sink.now});
+             else if(fault==4) sink.metadata.item=sink.metadata.object("Replaced before callback rearm",sink.metadata.weaponType);
+             else sink.alive=false;
+             sink.originalFrame();sink.originalFrame();
+             assert(!sink.presses && !vm.nativeReleases && !vm.transfers && !sink.clicks && !vm.cancellations);
+             continue;
+         }
+         sink.pointer({3,PointerPhase::Move,.6f,.5f,10,3,sink.now});sink.originalFrame();
+         assert(!sink.presses && sink.inventoryPrimePending &&
+             vm.pendingX==std::floor(.2f*2559) && vm.pendingY==std::floor(.4f*1439));
+         sink.originalFrame();
+         assert(sink.presses==1 && vm.vm.object(vm.cell).properties.at("onPress")==vm.pressCallback);
+         sink.originalFrame();assert(sink.inventoryDragData.data==vm.dragData[4]);
+         sink.pointer({3,PointerPhase::Up,.6f,.5f,10,4,sink.now});sink.originalFrame();sink.originalFrame();
+         assert(vm.transfers==1 && vm.nativeReleases==1 && !vm.cancellations && !sink.clicks);
+        }
+        assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
+    }
+    // Readiness is narrowed to the confirmed Status Inventory bug. Other
+    // families keep their existing over-only press gate without querying a
+    // callback, whether their authored cell currently has onPress or not.
+    for(unsigned family=0;family<5;++family) for(const bool ready:{false,true}) {
+        StatusVm vm(argv[1]);
+        if(family==3) vm.makeBackpack();else if(family==4) vm.makeOffers();
+        const auto callback=ready?vm.pressCallback:Raw{};vm.vm.prop(vm.cell,"onPress",callback);
+        {StatusConsumer sink(vm);sink.inventorySession.reset();
+         sink.frameTarget.direct.movieClass=family==0?"BankGFxMovie":family==1?"StashGFxMovie":
+             family==2?"VendingMachineExGFxMovie":"TradingGFxMovie";
+         assert(sink.inventoryDown(.2f,.4f));const auto source=sink.inventoryTarget.source;
+         sink.inventoryGesture.begin(sink.inventoryIdentity(),true,false,sink.now);
+         sink.inventoryGesture.pointer({3,PointerPhase::Down,.2f,.4f,10,1,sink.now},source);
+         vm.vm.prop(vm.panel,"currentOverClip",vm.cell);sink.inventoryHoverBoundary=true;
+         const auto move=sink.inventoryGesture.pointer({3,PointerPhase::Move,.5f,.5f,10,2,sink.now},source);
+         const auto memberSets=vm.memberSets;assert(move);sink.inventoryUpdate(*move,true);
+         assert(sink.presses==1 && !sink.inventoryStart && !vm.onPressReads &&
+             !vm.nativeReleases && !vm.cancellations && vm.memberSets==memberSets);
+         sink.clearInventory();
+        }
+        assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
+    }
     for(unsigned fault=0;fault<8;++fault) {
         DynarmicHost host;uiNativeReleaseBase=0;
         if(fault<3) host.words[DynarmicHost::base+0x01CC6348+fault*4]^=1;
@@ -511,6 +696,7 @@ int main(int argc,char** argv) {
         InventoryDragUpdate finish;finish.command=cancel?InventoryDragCommand::Cancel:InventoryDragCommand::Drop;
         finish.source=sink.inventoryTarget.source;finish.x=.6f;finish.y=.5f;
         sink.finishInventory(finish);
+        if(sink.inventoryFinal && !cancel) sink.originalFrame();
         assert(vm.nativeReleases==1 && sink.releases==unsigned(gate==0));
         assert(sink.drops==unsigned(!cancel && gate==0) && vm.cancellations==unsigned(cancel));
         assert(vm.queuedMouseRelease==(gate==1 || gate==2));
@@ -777,8 +963,9 @@ int main(int argc,char** argv) {
         }
         assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
     }
-    // A genuine source hover must not authorize a press after the latest real
-    // sample leaves that source. The new hit guard uses actual native capture.
+    // The consumed hover belongs to the captured source. A later physical
+    // sample may leave it; native DOWN must still use that source, never the
+    // new destination's cell, and a subsequent Cancel must remain a cancel.
     {
         StatusVm vm(argv[1]);vm.originalQueue=vm.rolloverOnly=true;
         {StatusConsumer sink(vm);sink.inventorySession.reset();
@@ -790,11 +977,11 @@ int main(int argc,char** argv) {
          sink.inventoryFresh=sink.freshInventorySource();
          assert(vm.vm.object(vm.panel).properties.at("currentOverClip")==vm.cell);
          sink.pointer({3,PointerPhase::Move,.6f,.4f,10,3,sink.now});
-         assert(!sink.presses && !sink.inventoryHoverBoundary && vm.pendingX==std::floor(.6f*2559));
-         sink.originalFrame();
-         assert(vm.vm.object(vm.panel).properties.at("currentOverClip")[3]==1 && !sink.presses);
+         assert(sink.presses==1 && sink.inventoryPressed && vm.pendingX==std::floor(.6f*2559));
+         vm.vm.prop(vm.manager,"_inDrag",boolean(true));
+         assert(sink.freshInventorySource()==sink.inventoryTarget.source);
          sink.pointer({3,PointerPhase::Cancel,.6f,.4f,10,4,sink.now});
-         assert(!sink.presses && !sink.releases && !vm.cancellations && !sink.clicks);
+         assert(sink.presses==1 && sink.releases==1 && vm.cancellations==1 && !sink.drops && !sink.clicks);
         }
         assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
     }
@@ -853,7 +1040,7 @@ int main(int argc,char** argv) {
         diagnosticsProperty=diagnostic?"1":"0";diagnosticsLines.clear();
         StatusVm vm(argv[1]);std::array<unsigned,10> counts{};
         {
-            StatusConsumer sink(vm);sink.inventorySession.reset();assert(sink.inventoryDown(.2f,.4f));
+            StatusConsumer sink(vm);sink.inventoryInputDiagnostics=12;sink.inventorySession.reset();assert(sink.inventoryDown(.2f,.4f));
             const auto source=sink.inventoryTarget.source;const auto owner=sink.inventoryIdentity();
             sink.inventoryGesture.begin(owner,true,false,100);
             sink.inventoryGesture.pointer({3,PointerPhase::Down,.2f,.4f,10,1,100},source);
@@ -1140,6 +1327,7 @@ int main(int argc,char** argv) {
         {
             StatusConsumer sink(vm);sink.inventorySession.reset();
             sink.inventoryDropDiagnostics={4,4}; // Isolate the retained scalar-only logger parity check.
+            sink.inventoryInputDiagnostics=12;
             if(fault==1) vm.vm.prop(vm.managerClass,"_instance",Raw{});
             else if(fault==2) vm.vm.prop(vm.managerClass,"_instance",num(1));
             else if(fault==3) vm.vm.prop(vm.top,"_visible",boolean(false));
@@ -1159,6 +1347,7 @@ int main(int argc,char** argv) {
                 assert(sink.freshInventorySource()==source);
                 const auto up=sink.inventoryGesture.pointer({3,PointerPhase::Up,.6f,.5f,10,3,100},source);
                 assert(up);sink.inventoryUpdate(*up);
+                sink.originalFrame();
                 assert(sink.drops==1 && !vm.cancellations && !sink.clicks);
             }
             counts={vm.reads,vm.writes,vm.calls,sink.modelReads,sink.currentChecks,sink.queries,
@@ -1212,6 +1401,7 @@ int main(int argc,char** argv) {
     // continuation/completion with that exact budget state; no new GFx calls.
     for(unsigned sample=0;sample<3;++sample) {
         StatusVm vm(argv[1]);StatusConsumer sink(vm);diagnosticsProperty="1";diagnosticsLines.clear();
+        sink.inventoryDiagnosticGestures=3;
         for(unsigned i=0;i<32;++i) sink.inventoryDiagnostic("budget","distinct",nullptr,nullptr,nullptr,nullptr,-1,-1,static_cast<int>(i));
         sink.inventorySession.reset();assert(sink.inventoryDown(.2f,.4f));
         const auto source=sink.inventoryTarget.source;const auto owner=sink.inventoryIdentity();
@@ -1228,6 +1418,7 @@ int main(int argc,char** argv) {
         }
         const auto finish=sink.inventoryGesture.pointer({3,sample?PointerPhase::Cancel:PointerPhase::Up,.6f,.5f,10,3,100},source);
         assert(finish);sink.inventoryUpdate(*finish);
+        if(sink.inventoryFinal && !sample) sink.originalFrame();
         assert(sink.drops==unsigned(sample==0) && vm.cancellations==unsigned(sample!=0) && sink.releases==1 && !sink.clicks);
         assert(std::any_of(diagnosticsLines.begin(),diagnosticsLines.end(),[&](const auto& line) {
             return line.find(sample?"reason=cancel-release-outside":"reason=original-drop-queued")!=std::string::npos;
@@ -1235,6 +1426,36 @@ int main(int argc,char** argv) {
         assert(sink.inventoryDiagnostics==32 && sink.inventoryTerminalDiagnostics>0 && sink.inventoryTerminalDiagnostics<=8);
     }
     diagnosticsProperty="0";diagnosticsLines.clear();
+    for(const bool equipped:{false,true}) {
+        StatusVm vm(argv[1]);if(equipped) vm.equipSource();StatusConsumer sink(vm);
+        sink.inventorySession.reset();assert(sink.inventoryDown(.2f,.4f));
+        const auto panel=equipped?vm.equipped:vm.panel;
+        vm.vm.prop(panel,"bMouseDown",boolean(false));vm.vm.prop(panel,"currentOverClip",vm.cell);
+        vm.vm.prop(vm.cell,"bMouseDown",boolean(true));vm.vm.prop(vm.cell,"onPress",vm.vm.make(8));
+        vm.vm.prop(vm.vm.root,"_xmouse",num(400));vm.vm.prop(vm.vm.root,"_ymouse",num(280));
+        const auto refs=vm.vm.refs;const auto movies=vm.vm.movieRefs;const auto calls=sink.inventorySession->calls(),
+            invokes=vm.scriptInvokes,sets=vm.memberSets;
+        diagnosticsProperty="1";diagnosticsLines.clear();sink.inventoryInputDiagnostic("source-probe",sink.frameTarget);
+        assert(diagnosticsLines.size()==1 && diagnosticsLines[0].find("panel=(1,1,0) cell=(1,1,8) hover=(10,")!=std::string::npos);
+        assert(diagnosticsLines[0].find("mouse=(1,400.00,280.00)")!=std::string::npos);
+        assert(vm.vm.refs==refs && vm.vm.movieRefs==movies && sink.inventorySession->calls()==calls && sink.inventorySession->good());
+        assert(vm.scriptInvokes==invokes && vm.memberSets==sets && !sink.presses && !sink.releases && !vm.cancellations);
+        diagnosticsProperty="0";
+    }
+    {
+        StatusVm vm(argv[1]);StatusConsumer sink(vm);diagnosticsProperty="0";diagnosticsLines.clear();
+        const auto calls=vm.calls,writes=vm.writes;
+        sink.inventoryDiagnosticGesture();assert(!sink.inventoryDiagnosticGestures);
+        diagnosticsProperty="1";
+        for(unsigned gesture=0;gesture<4;++gesture) {
+            sink.inventoryDiagnosticGesture();
+            for(unsigned row=0;row<100;++row) sink.inventoryDiagnostic("gesture","bounded",nullptr,nullptr,nullptr,nullptr,-1,-1,static_cast<int>(row));
+            for(unsigned row=0;row<100;++row) sink.inventoryDiagnostic("finish","bounded",nullptr,nullptr,nullptr,nullptr,-1,-1,static_cast<int>(row));
+            assert(sink.inventoryDiagnosticGestures==std::min(gesture+1,3u) && sink.inventoryDiagnostics==32 && sink.inventoryTerminalDiagnostics==8);
+            assert(diagnosticsLines.size()==std::min(gesture+1,3u)*40);
+        }
+        assert(vm.calls==calls && vm.writes==writes);diagnosticsProperty="0";diagnosticsLines.clear();
+    }
     for(const bool equipped:{false,true}) for(const bool cancel:{false,true}) {
         StatusVm vm(argv[1]);if(equipped) vm.equipSource();
         {
@@ -1257,6 +1478,7 @@ int main(int argc,char** argv) {
             assert(sink.freshInventorySource()==source && vm.hitQueries==hits);
             const auto end=cancel?sink.inventoryGesture.cancel():sink.inventoryGesture.pointer({3,PointerPhase::Up,.6f,.5f,10,3,100},source);
             assert(end);sink.inventoryUpdate(*end);
+            if(sink.inventoryFinal && !cancel) sink.originalFrame();
             assert(sink.presses==1 && sink.releases==1 && sink.drops==unsigned(!cancel) && vm.cancellations==unsigned(cancel) && !sink.clicks);
         }
         assert(vm.vm.refs.empty() && vm.vm.movieRefs==1 && !vm.vm.abandoned);
@@ -1329,6 +1551,7 @@ int main(int argc,char** argv) {
          vm.vm.prop(vm.manager,"_inDrag",boolean(true));sink.now=116;
          assert(sink.freshInventorySource()==source && sink.inventoryDragData.data==vm.dragData[4]);
          sink.finishInventory(*sink.inventoryFinal);
+         if(sink.inventoryFinal && !cancel) sink.originalFrame();
          assert(sink.releases==1 && sink.drops==unsigned(!cancel) && vm.cancellations==unsigned(cancel) && !sink.clicks);
         }
         assert(vm.vm.refs.empty() && vm.vm.movieRefs==1);
@@ -1425,5 +1648,5 @@ int main(int argc,char** argv) {
         }
         assert(vm.vm.refs.empty() && vm.vm.movieRefs==1);
     }
-    std::puts("PASS: Gate35 original filter8/controller4 positives, 62 metadata/link +7 lifetime negatives, independent Top budget +2387-field positive/4097-field refusal/524288-byte cap/unreadable distinction; extracted keyName handled/0-1/owner-loss/budget controls; prior real MOVE, typed Top/Movie, item/drop/cancel/foreign controls retained");
+    std::puts("PASS: reused drop destination requires restored onPress; genuine outward MOVE plus one consumed origin prime, with idle/cancel/up/second-finger/item/lifetime controls; first-enter prime/final-motion transfer and prior typed Top/Movie/key/item/drop/cancel/foreign controls retained");
 }

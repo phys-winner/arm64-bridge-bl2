@@ -104,6 +104,11 @@ bool VerifyBl2TouchInput(const std::uint8_t* bytes, std::size_t size);
 
 std::uint64_t Bl2TouchLifetimeGeneration();
 
+// Any thread: the last input boundary saw on-foot play, a vehicle or a
+// cinematic, and recently (the game thread skips input while loading). False
+// in menus, dialogs and loading screens, the idle phases for background work.
+bool Bl2TouchPlayerInWorld();
+
 // Before guest JNI_OnLoad or worker creation. Default is off. The explicit
 // debug.bl2.native_touch=observe mode installs an input-boundary context probe.
 // This first integration stage publishes NO input capabilities and must not

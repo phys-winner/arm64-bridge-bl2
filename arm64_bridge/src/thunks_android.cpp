@@ -1,5 +1,8 @@
 #include "thunks_android.h"
 #include "thunk_manager.h"
+// bl2_auto_flush.cpp: submit long frames in parts on the drawing thread.
+void Bl2AutoFlushNoteDraw();
+void Bl2AutoFlushReset();
 #include "thunk_types.h"
 #include "dynarmic_host.h"
 #include "jni_fake_env.h"
@@ -148,6 +151,15 @@ uint32_t CopyHostString(DynarmicHost& host, const char* value) {
     if (guest) memcpy(host.GetGuestMemoryBase() + guest, value, size);
     return guest;
 }
+}
+
+// bl2_gl_worker.cpp: whether a guest surface handle is a window surface.
+bool Bl2EglIsWindowSurfaceHandle(uint32_t handle) {
+    if (!handle) return false;
+    std::lock_guard lock(window_surfaces_mutex);
+    for (const auto& item : window_surfaces)
+        if (item.second.surface_handle == handle) return true;
+    return false;
 }
 
 struct AndroidStrings {
@@ -553,6 +565,7 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
         {
             HornPerfScope perf(HornPerfCategory::Swap);
             result = eglSwapBuffers(display, surface);
+            Bl2AutoFlushReset();
         }
         const EGLint error = eglGetError();
         if (result == EGL_TRUE) {
@@ -583,6 +596,10 @@ void RegisterAndroidThunks(ThunkManager& manager, DynarmicHost& host) {
                        (cpu - last_cpu) * 10 < (wall - last_wall) * 7) {
                 host.WarmLearnedBlocksInCallback(jit, 1000000);
             }
+            // Learned shader stages are imported ahead of the game (menus,
+            // loading screens, paced idle time; thunks_gl.cpp).
+            extern void Bl2LegacyStagePrewarmFrame(uint64_t next_start_ns);
+            Bl2LegacyStagePrewarmFrame(next_start);
             Bl2FramePacerWait(next_start);
             last_wall = clock_ns(CLOCK_MONOTONIC);
             last_cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);

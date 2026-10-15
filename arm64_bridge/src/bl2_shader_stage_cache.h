@@ -12,12 +12,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
 
@@ -59,6 +61,7 @@ public:
                        Progress progress = nullptr, void* progressOpaque = nullptr) {
         ready_ = false;
         stats_ = {};
+        durable_exports_ = true;
         const auto fail = [&] {
             if (!stats_.failed) ++stats_.failed;
             if (progress) progress(progressOpaque, 0, 0);
@@ -113,11 +116,41 @@ public:
         }
     }
 
+    // Background formation (bl2_shader_former): validates only the header,
+    // binds the driver identity and directory and reads the marker. Stages are
+    // then formed by worker threads while LoadProgram serves the renderer at
+    // once: a present binary is imported, a missing stage is genuinely compiled
+    // and persisted on the caller's thread. Complete(): nothing left to form.
+    bool OpenStream(const Reader& reader, std::string_view directory) {
+        ready_ = false;
+        stats_ = {};
+        durable_exports_ = false;
+        try {
+            if (!reader.read || !reader.rewind || reader.bytes <= kHeaderBytes ||
+                reader.bytes > kMaxTableBytes || !reader.rewind(reader.opaque) ||
+                !ReadExact(reader, header_.data(), header_.size()) || !HeaderValid(reader.bytes) ||
+                !Open(directory) || !MakeDirectory()) {
+                ++stats_.failed;
+                return false;
+            }
+            stats_.stageCount = Read32(header_.data() + 12);
+            stats_.preparedFromMarker = ReadMarker();
+            ready_ = true;
+            return true;
+        } catch (...) {
+            ++stats_.failed;
+            return false;
+        }
+    }
+    bool Complete() const { return ready_ && stats_.preparedFromMarker; }
+    const std::array<uint8_t, kHeaderBytes>& Header() const { return header_; }
+
     // A missing/rejected binary is genuinely compiled and persisted if possible.
     // A successful runtime compile remains usable even if disk export fails.
     // Original source is retained by the renderer for its monolithic fallback.
+    // importOnly: return zero instead of compiling a stage without a binary.
     GLuint LoadProgram(GLenum target, std::string_view originalNormalizedSource,
-                       std::string_view paddedSsoSource) {
+                       std::string_view paddedSsoSource, bool importOnly = false) {
         if (!ready_ || !TargetValid(target) || originalNormalizedSource.empty() ||
             originalNormalizedSource.size() > kMaxStageBytes || paddedSsoSource.empty() ||
             paddedSsoSource.size() > kMaxStageBytes ||
@@ -128,16 +161,114 @@ public:
             std::string expected;
             if (!legacy_glsl::CompleteSsoInterface(originalNormalizedSource, target == GL_VERTEX_SHADER, &expected) ||
                 expected != paddedSsoSource) return 0;
-            bool persisted = false;
+            const Digest original = Hash(originalNormalizedSource);
+            const Digest padded = Hash(paddedSsoSource);
             uint64_t fileBytes = 0;
-            const GLuint program = Load(target, Hash(originalNormalizedSource),
-                                        Hash(paddedSsoSource), paddedSsoSource, persisted, fileBytes);
+            if (importOnly) return Import(target, original, padded, fileBytes);
+            bool persisted = false;
+            const GLuint program = Load(target, original, padded, paddedSsoSource, persisted, fileBytes);
             if (!persisted) std::remove(MarkerPath().c_str());
             return program;
         } catch (...) {
             ++stats_.failed;
             return 0;
         }
+    }
+
+    // Learned stage prewarm (renderer thread, its context current): imports the
+    // persisted binary of a stage known only by its digests. Zero when absent,
+    // stale or rejected; nothing is ever compiled here.
+    GLuint ImportStage(GLenum target, const Digest& original, const Digest& padded) {
+        if (!ready_ || !TargetValid(target) || eglGetCurrentContext() == EGL_NO_CONTEXT) return 0;
+        try {
+            uint64_t fileBytes = 0;
+            return Import(target, original, padded, fileBytes);
+        } catch (...) {
+            ++stats_.failed;
+            return 0;
+        }
+    }
+
+    // Formation helpers. After OpenStream they are safe on any thread with its
+    // own current context of the same driver: identity, path and formats are
+    // fixed then, and they never touch the renderer's statistics.
+    // The current context reports the identity this cache was opened with.
+    bool MatchesCurrentDriver() const {
+        Digest identity{};
+        std::vector<GLint> formats;
+        return ready_ && ComputeIdentity(identity, formats) && identity == identity_;
+    }
+    bool StageFilePresent(GLenum target, const Digest& original, uint64_t* bytes = nullptr) const {
+        struct stat info{};
+        if (::stat(BinaryPath(target, original).c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+            info.st_size <= static_cast<off_t>(kBinaryHeaderBytes)) return false;
+        if (bytes) *bytes = static_cast<uint64_t>(info.st_size);
+        return true;
+    }
+    // Compiles one canonical padded stage on the calling thread's context and
+    // persists its binary without a per-file sync (CommitFormation syncs once).
+    bool FormStage(GLenum target, const Digest& original, std::string_view paddedSsoSource,
+                   uint64_t& fileBytes) const {
+        if (!ready_ || !TargetValid(target) || paddedSsoSource.empty() ||
+            paddedSsoSource.size() > kMaxStageBytes) return false;
+        OwnedProgram program{CompileProgram(target, paddedSsoSource)};
+        return program.name &&
+               Export(program.name, target, original, Hash(paddedSsoSource), fileBytes, false);
+    }
+    // Every catalogue stage is present: one filesystem sync makes the binaries
+    // durable before the marker that lets later launches skip formation.
+    bool CommitFormation(uint64_t binaryBytes) const {
+        if (!ready_ || binaryBytes > kMaxCacheBytes ||
+            binaryBytes < uint64_t(Read32(header_.data() + 12)) * (kBinaryHeaderBytes + 1)) return false;
+        const int directory = ::open(path_.c_str(), O_RDONLY | O_DIRECTORY);
+        if (directory < 0) return false;
+        const bool synced = ::syscall(SYS_syncfs, directory) == 0;  // libc syncfs is API 28+
+        ::close(directory);
+        return synced && WriteMarker(binaryBytes);
+    }
+    // Stage binaries already on disk (v-/f-<sha>.bin): where a resumed
+    // formation starts. One directory listing, no file is opened.
+    size_t CountStageFiles() const {
+        if (!ready_) return 0;
+        size_t count = 0;
+        if (DIR* listing = ::opendir(path_.c_str())) {
+            while (const dirent* entry = ::readdir(listing)) {
+                const std::string_view name(entry->d_name);
+                if (name.size() == 70 && (name[0] == 'v' || name[0] == 'f') && name[1] == '-' &&
+                    name.ends_with(".bin")) ++count;
+            }
+            ::closedir(listing);
+        }
+        return count;
+    }
+    // Directories of other identities (an older driver or catalogue) are never
+    // read again; returns how many were removed.
+    size_t RemoveStaleIdentities() const {
+        if (!ready_) return 0;
+        const size_t slash = path_.find_last_of('/');
+        if (slash == std::string::npos) return 0;
+        const std::string parent = path_.substr(0, slash), own = path_.substr(slash + 1);
+        std::vector<std::string> stale;
+        if (DIR* listing = ::opendir(parent.c_str())) {
+            while (const dirent* entry = ::readdir(listing)) {
+                const std::string_view name(entry->d_name);
+                if (name.starts_with("bl2-stage-cache-") && name != own)
+                    stale.emplace_back(parent + "/" + entry->d_name);
+            }
+            ::closedir(listing);
+        }
+        size_t removed = 0;
+        for (const auto& directory : stale) {
+            if (DIR* listing = ::opendir(directory.c_str())) {
+                while (const dirent* entry = ::readdir(listing)) {
+                    if (entry->d_name[0] == '.') continue;
+                    ::unlink((directory + "/" + entry->d_name).c_str());
+                }
+                ::closedir(listing);
+            }
+            if (::rmdir(directory.c_str()) == 0) ++removed;
+        }
+        return removed;
     }
 
     // Linked (non-separable) original GLSL of one vertex+fragment pair, kept
@@ -214,6 +345,7 @@ private:
     std::string path_;
     Statistics stats_{};
     bool ready_ = false;
+    bool durable_exports_ = true;  // False once opened for background formation.
 
     static bool TargetValid(GLenum target) { return target == GL_VERTEX_SHADER || target == GL_FRAGMENT_SHADER; }
     static uint32_t Read32(const uint8_t* p) {
@@ -291,7 +423,13 @@ private:
     }
     bool Open(std::string_view directory) {
         if (directory.empty() || directory.size() > 3500 || directory.find('\0') != directory.npos ||
-            eglGetCurrentContext() == EGL_NO_CONTEXT) return false;
+            !ComputeIdentity(identity_, formats_)) return false;
+        path_ = std::string(directory) + "/bl2-stage-cache-" + ObbSha256::Hex(identity_).data();
+        return true;
+    }
+    // Driver identity of the current context for this catalogue header.
+    bool ComputeIdentity(Digest& identity, std::vector<GLint>& formats) const {
+        if (eglGetCurrentContext() == EGL_NO_CONTEXT) return false;
         GLint major = 0, minor = 0, count = 0, vertex = 0, fragment = 0;
         glGetIntegerv(GL_MAJOR_VERSION, &major); glGetIntegerv(GL_MINOR_VERSION, &minor);
         glGetIntegerv(GL_MAX_VERTEX_OUTPUT_COMPONENTS, &vertex);
@@ -299,9 +437,9 @@ private:
         glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &count);
         if (major < 3 || (major == 3 && minor < 2) || vertex < 56 || fragment < 56 || count <= 0 || count > 64)
             return false;
-        formats_.resize(static_cast<size_t>(count));
-        glGetIntegerv(GL_PROGRAM_BINARY_FORMATS, formats_.data());
-        std::sort(formats_.begin(), formats_.end());
+        formats.resize(static_cast<size_t>(count));
+        glGetIntegerv(GL_PROGRAM_BINARY_FORMATS, formats.data());
+        std::sort(formats.begin(), formats.end());
         ObbSha256 h;
         constexpr std::string_view policy = "BL2SSO1:Normalize320ProjectedSwizzles:UnTexcoord0-7-12-13:highp-smooth-vec4:UBO0:MultiDraw0";
         h.Update(reinterpret_cast<const uint8_t*>(policy.data()), policy.size());
@@ -322,11 +460,10 @@ private:
             Put32(word.data(), static_cast<uint32_t>(size)); h.Update(word.data(), word.size());
             h.Update(reinterpret_cast<const uint8_t*>(value), size);
         }
-        for (GLint format : formats_) {
+        for (GLint format : formats) {
             Put32(word.data(), static_cast<uint32_t>(format)); h.Update(word.data(), word.size());
         }
-        h.Update(header_.data(), header_.size()); identity_ = h.Finalize();
-        path_ = std::string(directory) + "/bl2-stage-cache-" + ObbSha256::Hex(identity_).data();
+        h.Update(header_.data(), header_.size()); identity = h.Finalize();
         return true;
     }
     bool MakeDirectory() const {
@@ -361,18 +498,21 @@ private:
         stats_.binaryBytes = Read64(bytes.data() + 76);
         return true;
     }
-    static bool AtomicWrite(const std::string& path, std::span<const uint8_t> bytes) {
+    // durable=false skips both fsyncs: a stage binary torn by a power loss fails
+    // its SHA-256 check on import and is compiled again, and the marker is only
+    // written after CommitFormation's filesystem sync.
+    static bool AtomicWrite(const std::string& path, std::span<const uint8_t> bytes, bool durable = true) {
         std::string temporary = path + ".tmp.XXXXXX";
         const int fd = ::mkstemp(temporary.data());
         if (fd < 0) return false;
         FILE* file = ::fdopen(fd, "wb");
         if (!file) { ::close(fd); std::remove(temporary.c_str()); return false; }
         bool good = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
-        good = good && std::fflush(file) == 0 && ::fsync(::fileno(file)) == 0;
+        good = good && std::fflush(file) == 0 && (!durable || ::fsync(::fileno(file)) == 0);
         const int closed = std::fclose(file);
         good = good && closed == 0 && std::rename(temporary.c_str(), path.c_str()) == 0;
         if (!good) std::remove(temporary.c_str());
-        if (good) {
+        if (good && durable) {
             const std::string parent = path.substr(0, path.find_last_of('/'));
             const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
             if (directory < 0) return false;
@@ -381,12 +521,13 @@ private:
         }
         return good;
     }
-    bool WriteMarker() const {
+    bool WriteMarker() const { return WriteMarker(stats_.binaryBytes); }
+    bool WriteMarker(uint64_t binaryBytes) const {
         std::array<uint8_t, kMarkerBytes> bytes{};
         std::copy(kMarkerMagic.begin(), kMarkerMagic.end(), bytes.begin());
         std::copy(identity_.begin(), identity_.end(), bytes.begin() + 8);
         std::copy(header_.begin() + 24, header_.end(), bytes.begin() + 40);
-        Put32(bytes.data() + 72, stats_.stageCount); Put64(bytes.data() + 76, stats_.binaryBytes);
+        Put32(bytes.data() + 72, Read32(header_.data() + 12)); Put64(bytes.data() + 76, binaryBytes);
         const Digest digest = Hash(std::span(bytes).first(84));
         std::copy(digest.begin(), digest.end(), bytes.begin() + 84);
         const bool good = AtomicWrite(MarkerPath(), bytes);
@@ -424,11 +565,15 @@ private:
         const GLuint result = program.name; program.name = 0; return result;
     }
     GLuint Compile(GLenum target, std::string_view source) {
+        ++stats_.compiled;
+        return CompileProgram(target, source);
+    }
+    static GLuint CompileProgram(GLenum target, std::string_view source) {
         OwnedShader shader{glCreateShader(target)};
         if (!shader.name) return 0;
         const GLchar* text = source.data(); const GLint length = static_cast<GLint>(source.size());
         glShaderSource(shader.name, 1, &text, &length);
-        ++stats_.compiled; glCompileShader(shader.name);
+        glCompileShader(shader.name);
         GLint compiled = GL_FALSE; glGetShaderiv(shader.name, GL_COMPILE_STATUS, &compiled);
         if (compiled != GL_TRUE) return 0;
         OwnedProgram program{glCreateProgram()};
@@ -442,7 +587,8 @@ private:
         if (linked != GL_TRUE || separable != GL_TRUE) return 0;
         const GLuint result = program.name; program.name = 0; return result;
     }
-    bool Export(GLuint program, GLenum target, const Digest& original, const Digest& padded, uint64_t& fileBytes) {
+    bool Export(GLuint program, GLenum target, const Digest& original, const Digest& padded,
+                uint64_t& fileBytes, bool durable = true) const {
         GLint length = 0; glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &length);
         if (length <= 0 || static_cast<size_t>(length) > kMaxBinaryBytes) return false;
         std::vector<uint8_t> bytes(kBinaryHeaderBytes + static_cast<size_t>(length));
@@ -458,7 +604,7 @@ private:
         Put32(bytes.data() + 108, format); Put32(bytes.data() + 112, static_cast<uint32_t>(written));
         const Digest digest = Hash(std::span(bytes).subspan(kBinaryHeaderBytes));
         std::copy(digest.begin(), digest.end(), bytes.begin() + 116);
-        if (!AtomicWrite(BinaryPath(target, original), bytes)) return false;
+        if (!AtomicWrite(BinaryPath(target, original), bytes, durable)) return false;
         fileBytes = bytes.size(); return true;
     }
     GLuint Load(GLenum target, const Digest& original, const Digest& padded, std::string_view source,
@@ -468,7 +614,9 @@ private:
         }
         OwnedProgram program{Compile(target, source)};
         if (!program.name) { ++stats_.failed; return 0; }
-        persisted = Export(program.name, target, original, padded, fileBytes);
+        // A blocking preparation keeps durable files; a renderer-side miss must
+        // not wait for two fsyncs inside a frame.
+        persisted = Export(program.name, target, original, padded, fileBytes, durable_exports_);
         if (!persisted) ++stats_.failed;
         const GLuint result = program.name; program.name = 0; return result;
     }

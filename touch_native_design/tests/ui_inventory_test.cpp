@@ -93,7 +93,7 @@ struct InventoryConsumer {
     Target inventoryOwner{},frameTarget{};
     std::optional<InventoryDragUpdate> inventoryFinal;
     std::uint64_t inventoryPressedAt=100,now=100;
-    bool inventoryPressed=true,inventoryCleanup=false,alive=true,allowed=true;
+    bool inventoryPressed=true,inventoryCleanup=false,inventoryHoverBoundary=true,inventoryDropQueued=false,alive=true,allowed=true;
     unsigned moves=0,releases=0,drops=0;
     explicit InventoryConsumer(InventoryVm& transport):vm(transport) {
         if(vm.trading) vm.offeredItem=model.itemToken();
@@ -109,6 +109,7 @@ struct InventoryConsumer {
     bool current() const {return allowed && alive;}
     bool inventoryDiagnosticEnabled() const {return false;}
     template<class... T> void inventoryDiagnostic(T&&...) {}
+    template<class... T> void inventoryInputDiagnostic(T&&...) {}
     bool statusInventoryItemCurrent() {assert(false);return false;}
     InventoryDragFamily inventoryFamily() const {return vm.trading?InventoryDragFamily::Trading:InventoryDragFamily::Bank;}
     static bool copyMemory(const void* context,std::uint32_t p,void* out,std::size_t n) {
@@ -119,7 +120,15 @@ struct InventoryConsumer {
         assert(x==.2f && y==.4f);
         GfxSession fresh(vm,widget_fixture::base,movie,scratch2,512,true);return vm.hit(fresh);
     }
-    void clearInventory() {inventoryPressed=false;inventoryFinal.reset();inventorySession.reset();}
+    void clearInventory() {inventoryPressed=false;inventoryHoverBoundary=inventoryDropQueued=false;inventoryFinal.reset();inventorySession.reset();}
+    void originalFrame() {
+        now+=16;inventoryHoverBoundary=true;
+        if(inventoryFinal) {
+            auto update=*inventoryFinal;
+            if(!freshInventorySource()) update.command=InventoryDragCommand::Cancel;
+            finishInventory(update);
+        }
+    }
     bool mouse(std::uint32_t type,float,float) {
         assert(current());if(type==1) ++moves;else if(type==3) {++releases;++drops;}return true;
     }
@@ -244,6 +253,7 @@ int main(int argc,char** argv) {
          // Advance. Completion from that same Android batch must wait for it.
          vm.vm.prop(vm.manager,"_inDrag",boolean(true));original.now=116;
          original.finishInventory(*original.inventoryFinal);
+         if(original.inventoryFinal && !canceled) original.originalFrame();
          assert(!original.inventoryPressed && original.releases==1 && original.drops==unsigned(!canceled));
          assert(vm.cancellations==unsigned(canceled) && vm.drops==0);}
         assert(vm.vm.refs.empty() && vm.vm.movieRefs==1);

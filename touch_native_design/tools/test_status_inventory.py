@@ -14,20 +14,37 @@ args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 path = root / "arm64_bridge/src/bl2_touch_ui_sink.cpp"
 source = path.read_text(encoding="utf8")
-methods = []
-for name in ("bool inventoryDiagnosticEnabled(", "void inventoryDiagnostic(",
-             "InventoryDragFamily inventoryFamily(", "InventoryWidgetTarget captureInventory(", "bool inventoryDown(",
-             "bool statusInventoryItemCurrent(", "InventoryDragSource freshInventorySource(", "void finishInventory(", "void inventoryUpdate("):
-    begin = source.index(name)
+def definition(signature):
+    begin = source.index(signature)
     at = source.index("{", begin)
     depth, end = 1, at + 1
     while depth:
         depth += (source[end] == "{") - (source[end] == "}")
         end += 1
-    methods.append(source[begin:end])
+    return source[begin:end]
+
+methods = [definition(name) for name in ("bool inventoryDiagnosticEnabled(", "void inventoryDiagnosticGesture(", "void inventoryDiagnostic(",
+             "bool inventoryDropDiagnosticEnabled(", "void inventoryDropDiagnostic(",
+             "void inventoryInputDiagnostic(", "std::string inventoryGateObservation(", "void inventoryGateDiagnostic(",
+             "std::uint32_t keyReturnCallback(", "bool keyName(", "bool inventoryMouseUpFor(",
+             "InventoryDragFamily inventoryFamily(", "InventoryWidgetTarget captureInventory(", "bool inventoryDown(",
+             "bool statusInventoryItemCurrent(", "InventoryDragSource freshInventorySource(", "void finishInventory(",
+             "void inventoryUpdate(", "void releaseInventory(")]
 args.output.mkdir(parents=True, exist_ok=True)
 generated = args.output / "ui_status_inventory_consumer.inc"
 generated.write_text("\n".join(methods), encoding="utf8")
+for stem, scope, boundary, installer in (
+    ("ui_key_return", "struct UiKeyReturnScope", "std::uint32_t uiKeyReturnProbeBase=0;", "bool InstallUiKeyReturnProbe("),
+    ("ui_native_release", "struct UiNativeReleaseScope", "std::uint32_t uiNativeReleaseBase=0;", "bool InstallUiNativeRelease("),
+):
+    (args.output / f"{stem}_scope.inc").write_text(source[source.index(scope):source.index(boundary)], encoding="utf8")
+    (args.output / f"{stem}_install.inc").write_text(boundary + "\n" + definition(installer), encoding="utf8")
+(args.output / "ui_status_inventory_hover.inc").write_text(
+    definition("void Ue3UiSink::hover(").replace("Ue3UiSink::", "", 1), encoding="utf8")
+pointer = definition("void Ue3UiSink::pointer(")
+(args.output / "ui_status_inventory_pointer.inc").write_text(
+    pointer[pointer.index("if(event.phase==PointerPhase::Down && s.inventoryFinal)"):
+            pointer.index('if (s.frameTarget.direct.movieClass == "ItemInspectionGFxMovie")')], encoding="utf8")
 fixture_path = root / "touch_native_design/tests/ui_model_test.cpp"
 fixture = fixture_path.read_text(encoding="utf8").split("struct TradingFixture", 1)[0]
 # Both real readers share one rebased image in the combined consumer fixture.

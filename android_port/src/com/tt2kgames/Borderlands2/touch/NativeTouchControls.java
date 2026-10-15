@@ -17,6 +17,7 @@ import android.util.SparseArray;
 import android.view.Choreographer;
 import android.view.InputDevice;
 import android.view.MotionEvent;
+import android.view.PointerIcon;
 import android.view.SurfaceHolder;
 import android.view.Surface;
 import android.view.SurfaceView;
@@ -145,6 +146,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
      *  until the game loop publishes its first frame (mailbox frame differs). */
     private boolean startupLoading;
     private long startupLoadingFrame, startupLoadingUntil;
+    /** Background shader formation in the main menu: per mille, -1 hides the line. */
+    private int shaderProgress = -1;
     private float movieDownX, movieDownY;
     private long movieDownTime;
     private final RectF movieSkipRect = new RectF();
@@ -164,6 +167,17 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private long hintUntil;
     private int hintKind;
     private int nextLegacyId=100000, accessibilityFocus=View.NO_ID, hoverTarget=View.NO_ID;
+    /** UI pointer id of a mouse cursor's hover; no touchscreen reports it. */
+    private static final int MOUSE_HOVER_ID = 0x7FFF0000;
+    /** Camera degrees per captured mouse count at the default look sensitivity. */
+    private static final float MOUSE_DEGREES = .08f;
+    private final android.hardware.input.InputManager inputManager;
+    private android.hardware.input.InputManager.InputDeviceListener mouseListener;
+    /** A mouse is connected; without one nothing below changes focus or capture. */
+    private boolean mousePresent, mouseCapture, cursorHidden, mouseStream;
+    private int mouseButtons;
+    private long mouseCaptureRetry;
+    private PointerIcon hiddenCursor;
 
     private NativeTouchControls(Activity owner, View renderSurface) {
         super(owner);
@@ -202,6 +216,16 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             SurfaceHolder holder = ((SurfaceView) surface).getHolder();
             surfaceAlive = holder.getSurface().isValid();
             holder.addCallback(this);
+        }
+        inputManager = (android.hardware.input.InputManager)owner.getSystemService(android.content.Context.INPUT_SERVICE);
+        if (inputManager != null) {
+            mouseListener = new android.hardware.input.InputManager.InputDeviceListener() {
+                @Override public void onInputDeviceAdded(int id) { mousePresent = scanMice(); updateMouse(); }
+                @Override public void onInputDeviceRemoved(int id) { mousePresent = scanMice(); updateMouse(); }
+                @Override public void onInputDeviceChanged(int id) { mousePresent = scanMice(); updateMouse(); }
+            };
+            inputManager.registerInputDeviceListener(mouseListener, null);
+            mousePresent = scanMice();
         }
     }
     public static void attach(Activity owner, View renderSurface) {
@@ -363,6 +387,11 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if (context.mode == FRONTEND) inWorld = false;
             else if (context.mode == GAMEPLAY || context.mode == VEHICLE || context.mode == CINEMATIC
                     || context.mode == DEAD) inWorld = true;
+            // Redrawn per whole percent; outside the main menu the line is hidden.
+            int nextShader = context.mode == FRONTEND ? bridge.shaderProgress() : -1;
+            boolean shaderChanged = nextShader < 0 ? shaderProgress >= 0
+                    : shaderProgress < 0 || nextShader / 10 != shaderProgress / 10;
+            if (shaderChanged) { shaderProgress = nextShader; invalidate(); }
             if (!context.menu()) clearMenuMore();
             if (eligible) updateMenuMore(now);
             if (layoutEditPending && eligible && context.gameplay()) {
@@ -374,6 +403,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             publishRoute(true);
             if (eligible) { input.setContext(next); input.heartbeat(); }
             updateSensor();
+            updateMouse();
             fallbackYaw=fallbackPitch=0;
             if (layoutDirty) { buildButtons(); invalidate(); }
             if ((hintKind == HINT_MAP && (!context.gameplay() || mapTarget.isEmpty() || !context.allows(MAP)))
@@ -916,18 +946,48 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
         drawSlots(canvas);
         drawHint(canvas);
+        drawShaderProgress(canvas);
         canvas.restore();
+    }
+    /** Main menu, bottom left (clear of the menu list and the right-hand buttons):
+     *  the cache the first launch used to build before the menu now forms meanwhile. */
+    private void drawShaderProgress(Canvas canvas) {
+        if (shaderProgress < 0 || context.mode != FRONTEND || editing) return;
+        int percent = shaderProgress / 10;
+        String text = label("Preparing graphics in the background: " + percent + "%",
+                "Подготовка графики в фоне: " + percent + "%");
+        paint.setTextSize(dp(12)); paint.setTextAlign(Paint.Align.LEFT); paint.setStyle(Paint.Style.FILL);
+        float width = paint.measureText(text), left = safe.left + dp(16), base = safe.bottom - dp(22);
+        paint.setColor(Color.BLACK); paint.setAlpha(150);
+        canvas.drawRoundRect(left - dp(10), base - dp(17), left + width + dp(10), base + dp(13), dp(8), dp(8), paint);
+        paint.setColor(Color.WHITE); paint.setAlpha(220);
+        canvas.drawText(text, left, base, paint);
+        float barTop = base + dp(5), barBottom = barTop + dp(3);
+        paint.setAlpha(60);
+        canvas.drawRect(left, barTop, left + width, barBottom, paint);
+        paint.setColor(0xFFFFD569); paint.setAlpha(230);
+        canvas.drawRect(left, barTop, left + width * shaderProgress / 1000f, barBottom, paint);
     }
     @Override public boolean onTouchEvent(MotionEvent event) {
         if ((movieState & MOVIE_PLAYING) != 0 || movieStream) return movieTouch(event);
         int action = event.getActionMasked(), index = event.getActionIndex();
+        boolean mouse = event.isFromSource(InputDevice.SOURCE_MOUSE);
         if (action == MotionEvent.ACTION_DOWN) {
-            streamOwned = event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)
+            // A mouse clicks like a finger only where its arrow is shown (menus
+            // and the layout editor) and with the primary button; play captures it.
+            mouseStream = mouse;
+            // A touchpad tap or an injected click may carry no button state.
+            int buttons = event.getButtonState();
+            boolean source = mouse ? (buttons == 0 || (buttons & MotionEvent.BUTTON_PRIMARY) != 0)
+                    && (context.menu() || editing) : event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN);
+            streamOwned = source
                     && eligible && (editing || context.gameplay()
                     || hit(event.getX(), event.getY()) != null
                     || (context.menu() && (fallback || context.has(DIRECT_UI | UI_TAP_TEST | UI_WIDGETS)) && viewport.contains(event.getX(), event.getY())));
         }
-        if (!streamOwned) return false;
+        // A mouse never reaches the original touch path: it maps the cursor's
+        // display pixels onto the smaller render surface (render resolution).
+        if (!streamOwned) return mouse || mouseStream;
         if (action == MotionEvent.ACTION_CANCEL) {
             cancelInput(); streamOwned = false; return true;
         }
@@ -1260,6 +1320,30 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
         return sessionRenderPercent;
     }
+    /**
+     * UE3JavaApp's text entry (chat, character names) asks for the keyboard
+     * right after AlertDialog.show(), before the dialog window has focus, and
+     * current Android ignores that request. Keep the keyboard up for the dialog
+     * and ask again once its window really owns focus.
+     */
+    public static void keyboardDialog(android.app.AlertDialog dialog, final android.widget.EditText edit) {
+        if (dialog == null || edit == null) return;
+        android.view.Window window = dialog.getWindow();
+        if (window != null) window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+        edit.requestFocus();
+        edit.setSelection(edit.getText().length());
+        final android.view.ViewTreeObserver observer = edit.getViewTreeObserver();
+        observer.addOnWindowFocusChangeListener(new android.view.ViewTreeObserver.OnWindowFocusChangeListener() {
+            @Override public void onWindowFocusChanged(boolean hasFocus) {
+                if (!hasFocus) return;
+                if (edit.getViewTreeObserver().isAlive()) edit.getViewTreeObserver().removeOnWindowFocusChangeListener(this);
+                edit.requestFocus();
+                android.view.inputmethod.InputMethodManager manager = (android.view.inputmethod.InputMethodManager)
+                        edit.getContext().getSystemService(android.content.Context.INPUT_METHOD_SERVICE);
+                if (manager != null) manager.showSoftInput(edit, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+            }
+        });
+    }
     public static boolean microphoneEnabled(Activity owner) {
         NativeTouchControls controls=active.get();
         return (controls!=null && controls.activity==owner ? controls.preferences : new TouchPreferences(owner)).microphoneEnabled;
@@ -1439,6 +1523,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         closeRadial();clearMenuMore();utilityPointers.clear();legacyPointers.clear();
         hudGesture.cancel(); hudTaps.cancel(); closeSlots(); hudPointers.clear(); hintUntil = 0;
         uiPointers.clear(); menuPointer = -1; editPointer=-1; editButton=null; eligible=false; layoutDirty=true;
+        mouseButtons = 0; // input.cancel() below releases the actions they held
         if (!linkageFailed) {
             try { input.cancel(); } catch (UnsatisfiedLinkError error) {
                 linkageFailed=true; Log.e(TAG,"Touch JNI is not linked",error);
@@ -1451,9 +1536,117 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         event.setPackageName(activity.getPackageName());event.setClassName("android.widget.Button");
         if(getParent()!=null) getParent().requestSendAccessibilityEvent(this,event);
     }
+    private boolean scanMice() {
+        if (inputManager == null) return false;
+        for (int id : inputManager.getInputDeviceIds()) {
+            InputDevice device = inputManager.getInputDevice(id);
+            // A captured mouse reports SOURCE_MOUSE_RELATIVE until it is released.
+            if (device != null && !device.isVirtual() && (device.supportsSource(InputDevice.SOURCE_MOUSE)
+                    || device.supportsSource(InputDevice.SOURCE_MOUSE_RELATIVE))) return true;
+        }
+        return false;
+    }
+    /**
+     * A mouse plays like the PC game. In play the pointer is captured (no arrow):
+     * it turns the camera, the buttons fire and aim, the wheel changes weapons.
+     * Menus and the layout editor keep the arrow; elsewhere it is hidden.
+     */
+    private void updateMouse() {
+        // Everywhere but menus and the editor: a flicker of the overlay itself
+        // (a context change, a device change) never brings the arrow back.
+        boolean play = mousePresent && focused && resumed && !editing && !disposed && !linkageFailed
+                && !context.menu() && android.os.Build.VERSION.SDK_INT >= 26;
+        if (play) {
+            long now = SystemClock.uptimeMillis();
+            if (!hasPointerCapture() && now >= mouseCaptureRetry) {
+                // Captured events reach the focused view; a refusal is retried calmly.
+                mouseCaptureRetry = now + 1000;
+                setFocusable(true); setFocusableInTouchMode(true);
+                if (!isFocused()) requestFocus();
+                requestPointerCapture();
+            }
+            mouseCapture = true;
+        } else if (mouseCapture) {
+            mouseCapture = false; releaseMouseButtons();
+            if (android.os.Build.VERSION.SDK_INT >= 26 && hasPointerCapture()) releasePointerCapture();
+        }
+        boolean hide = !(eligible && (context.menu() || editing));
+        if (hide != cursorHidden) {
+            cursorHidden = hide;
+            if (hiddenCursor == null) hiddenCursor = PointerIcon.getSystemIcon(getContext(), PointerIcon.TYPE_NULL);
+            setPointerIcon(hide ? hiddenCursor : null);
+        }
+    }
+    private void releaseMouseButtons() {
+        if (mouseButtons != 0) { input.mouseButton(FIRE, false); input.mouseButton(AIM, false); }
+        mouseButtons = 0;
+    }
+    @Override public void onPointerCaptureChange(boolean hasCapture) {
+        if (!hasCapture) releaseMouseButtons();
+    }
+    @Override public boolean onCapturedPointerEvent(MotionEvent event) {
+        if ((movieState & MOVIE_PLAYING) != 0) {
+            // A click works like a tap: the intro ends, another movie shows its
+            // Skip pill and the next click takes it.
+            if (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS) {
+                if ((movieState & MOVIE_STARTUP) != 0 || !movieSkipShown) movieTap(-1, -1);
+                else { movieSkipShown = false; bridge.skipMovie(); invalidate(); }
+            }
+            return true;
+        }
+        if (!mouseCapture || !eligible || !context.gameplay()) { releaseMouseButtons(); return true; }
+        if (event.getActionMasked() == MotionEvent.ACTION_SCROLL) {
+            float wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+            int weapon = wheel < 0 ? NEXT_WEAPON : PREV_WEAPON;
+            if (wheel != 0 && context.allows(weapon)) input.pulse(weapon);
+            return true;
+        }
+        int buttons = event.getButtonState();
+        input.mouseButton(FIRE, (buttons & MotionEvent.BUTTON_PRIMARY) != 0);
+        input.mouseButton(AIM, (buttons & MotionEvent.BUTTON_SECONDARY) != 0);
+        if ((buttons & ~mouseButtons & MotionEvent.BUTTON_TERTIARY) != 0 && context.allows(MELEE)) input.pulse(MELEE);
+        mouseButtons = buttons;
+        // Relative counts: each batched sample carries its own movement.
+        float dx = event.getX(), dy = event.getY();
+        for (int h = 0; h < event.getHistorySize(); ++h) { dx += event.getHistoricalX(h); dy += event.getHistoricalY(h); }
+        float gain = MOUSE_DEGREES * preferences.look / .22f;
+        if (dx != 0 || dy != 0) input.relativeLook(dx * gain, -dy * gain * (preferences.invertY ? -1 : 1));
+        return true;
+    }
+    /** The menu arrow highlights like the PC game's own cursor (native MouseMove only). */
+    private void mouseHover(MotionEvent event) {
+        int action = event.getActionMasked();
+        float x = event.getX(), y = event.getY();
+        if ((action != MotionEvent.ACTION_HOVER_MOVE && action != MotionEvent.ACTION_HOVER_ENTER) || !eligible || fallback
+                || streamOwned || uiPointers.size() > 0 || !context.menu() || !context.has(DIRECT_UI | UI_TAP_TEST | UI_WIDGETS)
+                || !viewport.contains(x, y) || hit(x, y) != null) return;
+        sendUi(MOUSE_HOVER_ID, HOVER, x, y);
+    }
+    @Override public boolean onGenericMotionEvent(MotionEvent event) {
+        if (!event.isFromSource(InputDevice.SOURCE_MOUSE) || linkageFailed) return super.onGenericMotionEvent(event);
+        // UE3JavaApp's NVIDIA mouse path is live on every device (AXIS_RELATIVE_X
+        // exists): its button events would click again at unscaled display pixels.
+        if (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS
+                && event.getActionButton() == MotionEvent.BUTTON_SECONDARY && (context.menu() || editing || radialOpen)) {
+            // The right button steps back in menus, like the PC game's Escape.
+            back(); invalidate();
+            return true;
+        }
+        if (event.getActionMasked() != MotionEvent.ACTION_SCROLL) return true;
+        // One list row per wheel notch in menus; weapons in play without capture.
+        float wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+        int command = context.menu() ? (wheel > 0 ? UI_UP : UI_DOWN) : context.gameplay() ? (wheel < 0 ? NEXT_WEAPON : PREV_WEAPON) : -1;
+        if (wheel != 0 && command >= 0 && eligible && !editing) {
+            if (fallback && context.menu()) activate(nextLegacyId++, command, 0, 0);
+            else if (context.allows(command)) input.pulse(command);
+        }
+        return true;
+    }
     @Override public boolean dispatchHoverEvent(MotionEvent event) {
         AccessibilityManager manager=(AccessibilityManager)activity.getSystemService(android.content.Context.ACCESSIBILITY_SERVICE);
-        if(!eligible || manager==null || !manager.isTouchExplorationEnabled()) return super.dispatchHoverEvent(event);
+        boolean exploring=manager!=null && manager.isTouchExplorationEnabled();
+        if(!exploring && event.isFromSource(InputDevice.SOURCE_MOUSE)) { mouseHover(event); return true; }
+        if(!eligible || !exploring) return super.dispatchHoverEvent(event);
         Button b=event.getActionMasked()==MotionEvent.ACTION_HOVER_EXIT?null:hit(event.getX(),event.getY());
         int id=b==null?View.NO_ID:b.action+4;
         if(id!=hoverTarget) {
@@ -1514,6 +1707,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private void dispose() {
         if (disposed) return;
         disposed=true; cancelInput(); unschedule();
+        if (inputManager != null && mouseListener != null) inputManager.unregisterInputDeviceListener(mouseListener);
+        if (android.os.Build.VERSION.SDK_INT >= 26 && hasPointerCapture()) releasePointerCapture();
         saveLayout(); preferences.flush();
         publishRoute(false);
         if (surface instanceof SurfaceView) ((SurfaceView)surface).getHolder().removeCallback(this);

@@ -9,12 +9,58 @@
 #if defined(BL2_NATIVE_ARM32)
 bool Bl2NativeSha256Transform(uint32_t* state, const uint8_t* block, const uint32_t* rounds);
 #endif
+#if defined(BL2_ARM64_SHA2)
+// ARMv8 SHA-256 instructions over whole 64-byte blocks; false without them.
+bool Bl2Arm64Sha256Blocks(uint32_t* state, const uint8_t* blocks, size_t count);
+#endif
 
 // Small streaming SHA-256 for direct OBB integrity checks. It keeps at most
 // one 64-byte block, so a whole-container split never needs to be extracted.
 class ObbSha256 {
 public:
     using Digest = std::array<uint8_t, 32>;
+
+    // Within a scope, hashing exactly the scoped bytes reuses one digest: the
+    // startup checks of several modules verify the same immutable guest ELF.
+    class MappingScope {
+    public:
+        MappingScope(const uint8_t* data, size_t size) : previous_(Current()) {
+            ObbSha256 hash;
+            valid_ = data && hash.Update(data, size);
+            if (valid_) digest_ = hash.Finalize();
+            data_ = data;
+            size_ = size;
+            Current() = this;
+        }
+        ~MappingScope() { Current() = previous_; }
+        MappingScope(const MappingScope&) = delete;
+        MappingScope& operator=(const MappingScope&) = delete;
+
+    private:
+        friend class ObbSha256;
+        static MappingScope*& Current() {
+            static thread_local MappingScope* current = nullptr;
+            return current;
+        }
+        MappingScope* previous_;
+        const uint8_t* data_ = nullptr;
+        size_t size_ = 0;
+        bool valid_ = false;
+        Digest digest_{};
+    };
+    // Digest of data[0, size), from an enclosing MappingScope when it covers
+    // exactly these bytes. False when hashing fails.
+    static bool OfMapping(const uint8_t* data, size_t size, Digest& digest) {
+        if (const MappingScope* scope = MappingScope::Current();
+            scope && scope->data_ == data && scope->size_ == size) {
+            digest = scope->digest_;
+            return scope->valid_;
+        }
+        ObbSha256 hash;
+        if (!data || !hash.Update(data, size)) return false;
+        digest = hash.Finalize();
+        return true;
+    }
 
     constexpr bool Update(const uint8_t* data, size_t length) {
         if (finalized_ || invalid_ || (!data && length != 0) ||
@@ -25,6 +71,16 @@ public:
         total_bytes_ += length;
         if (!std::is_constant_evaluated()) {
             while (length != 0) {
+#if defined(BL2_ARM64_SHA2)
+                if (block_used_ == 0 && length >= block_.size()) {
+                    const size_t blocks = length / block_.size();
+                    if (Bl2Arm64Sha256Blocks(state_.data(), data, blocks)) {
+                        data += blocks * block_.size();
+                        length -= blocks * block_.size();
+                        continue;
+                    }
+                }
+#endif
                 const size_t capacity = block_.size() - block_used_;
                 const size_t count = length < capacity ? length : capacity;
                 std::memcpy(block_.data() + block_used_, data, count);
@@ -113,6 +169,9 @@ private:
 #if defined(BL2_NATIVE_ARM32)
         if (!std::is_constant_evaluated() &&
             Bl2NativeSha256Transform(state_.data(), block_.data(), rounds.data())) return;
+#endif
+#if defined(BL2_ARM64_SHA2)
+        if (!std::is_constant_evaluated() && Bl2Arm64Sha256Blocks(state_.data(), block_.data(), 1)) return;
 #endif
         std::array<uint32_t, 64> words{};
         for (size_t i = 0; i < 16; ++i) {

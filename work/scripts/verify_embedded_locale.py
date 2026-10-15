@@ -15,8 +15,7 @@ def verify(source, apk=None):
     descriptor = (source / "pack.json").read_bytes()
     pack = json.loads(descriptor)
     header = (ROOT / "arm64_bridge/src/bl2_locale_payload.h").read_text("utf-8")
-    assert hashlib.sha256(descriptor).hexdigest().upper() == re.search(
-        r'kDescriptorSha256\[\] = "([0-9A-F]+)"', header)[1]
+    assert not re.search(r'"(?:[^"\n]*sha256|bytes|payload_bytes)"\s*:', descriptor.decode('utf-8'))
     assert (pack["schema"], pack["package"], pack["version_code"],
             pack["language"], pack["engine_language"]) == (
                 2, "com.tt2kgames.Borderlands2", 33, "ru", "INT")
@@ -26,12 +25,10 @@ def verify(source, apk=None):
         relative = Path(item["asset"]).relative_to(RELATIVE)
         assert ".." not in relative.parts
         path = source / relative
-        assert path.stat().st_size == item["bytes"]
         with path.open("rb") as stream:
-            assert hashlib.file_digest(stream, "sha256").hexdigest() == item["sha256"]
-        assert f'{{"assets/{item["asset"]}", {item["bytes"]}, "{item["sha256"].upper()}"}}' in header
-        expected["assets/" + item["asset"]] = (item["bytes"], item["sha256"])
-    assert sum(item["bytes"] for item in pack["files"]) == pack["payload_bytes"]
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        assert f'{{"assets/{item["asset"]}"}}' in header
+        expected["assets/" + item["asset"]] = (path.stat().st_size, digest)
     if apk:
         with zipfile.ZipFile(apk) as archive:
             names = archive.namelist()
@@ -41,7 +38,7 @@ def verify(source, apk=None):
                 assert entry.compress_type == zipfile.ZIP_STORED and entry.file_size == size
                 with archive.open(entry) as stream:
                     assert hashlib.file_digest(stream, "sha256").hexdigest() == digest
-    return pack["payload_bytes"]
+    return sum(size for name, (size, digest) in expected.items() if not name.endswith('/pack.json'))
 
 
 if __name__ == "__main__":

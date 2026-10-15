@@ -2,6 +2,7 @@
 #include "thunk_manager.h"
 #include "bridge_log.h"
 #include "bl2_locale.h"
+#include "bl2_bink_audio.h"
 #include "bl2_directory_cache.h"
 #include "bl2_io_failure_probe.h"
 #include "dynarmic_host.h"
@@ -12,6 +13,8 @@
 #include "obb_pair_selection.h"
 #include "obb_split_inventory.h"
 #include "obb_sha256.h"
+#include "bl2_obb_package_watch.h"
+#include "bl2_touch_runtime.h"
 #include "virtual_file_range.h"
 #include "zip_stored_entry_bounds.h"
 #include "arm32_network_abi.h"
@@ -229,6 +232,7 @@ struct ApkCookie {
     off_t base_offset;
     off_t file_size;
     off_t current_offset;
+    const Bl2BinkAudio* bink;
 };
 
 static int ApkRead(void* cookie, char* buf, int size) {
@@ -240,8 +244,8 @@ static int ApkRead(void* cookie, char* buf, int size) {
     }
     if (size <= 0) return 0;
 
-    ssize_t n = pread(c->apk_fd, buf, size,
-                      c->base_offset + c->current_offset);
+    ssize_t n = c->bink ? c->bink->Read(buf, size, c->current_offset)
+                       : pread(c->apk_fd, buf, size, c->base_offset + c->current_offset);
     if (n > 0) {
         c->current_offset += n;
         return static_cast<int>(n);
@@ -532,6 +536,8 @@ extern "C" int IndexObbSplitApks(const char* const* paths, size_t count) {
         if (i != pair.main_index && i != pair.patch_index) close(verified[i].fd);
     }
     g_verified_obb_pair = true;
+    SetBl2LocaleMainObb(g_verified_obb_entries[0].apk_fd,
+                       g_verified_obb_entries[0].data_offset, g_verified_obb_entries[0].file_size);
     LOGI("Selected verified embedded OBB pair: main_fd=%d patch_fd=%d",
          g_verified_obb_entries[0].apk_fd, g_verified_obb_entries[1].apk_fd);
     return 0;
@@ -608,7 +614,7 @@ static FILE* OpenApkEntryStream(const ApkEntry& entry) {
         errno = ENOMEM;
         return nullptr;
     }
-    *cookie = {stream_fd, entry.data_offset, entry.file_size, 0};
+    *cookie = {stream_fd, entry.data_offset, entry.file_size, 0, entry.bink};
     FILE* stream = funopen(cookie, ApkRead, nullptr, ApkSeek, ApkClose);
     if (!stream) {
         const int saved_errno = errno;
@@ -654,6 +660,7 @@ struct VirtualFd {
     size_t file_size;
     off_t file_offset; // offset within APK
     off_t current_pos; // 0 .. file_size
+    const Bl2BinkAudio* bink;
 };
 static std::unordered_map<int, VirtualFd> g_vfd_map;
 static int g_next_vfd = 1000;
@@ -4740,7 +4747,21 @@ void ThunkManager::RegisterLibcThunks() {
         std::lock_guard<std::mutex> lock(g_pthread_attr_mutex);
         jit.Regs()[0] = g_pthread_mutex_attrs.erase(jit.Regs()[0]) ? 0 : EINVAL;
     });
-    RegisterThunk("sched_yield", [](Dynarmic::A32::Jit& jit, DynarmicHost&) {
+    RegisterThunk("sched_yield", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+        // A guest spin-wait (appSleep(0) while another thread loads) is idle
+        // time too: translate a few learned blocks of this thread's role first.
+        // Returns at once for other threads and once the role's list is done.
+        // Not while the player is in the world: the game and render threads
+        // also yield inside every frame there (Redmi Note 8 Pro, whose lists
+        // last for minutes: 34.3 instead of 32.3 ms per frame in one scene).
+        // debug.bl2.yield_warmup=0 before launch turns it off (Pixel 10a warm
+        // start without movies: main menu 1.2 s later without it).
+        constexpr uint64_t kYieldWarmupNs = 100'000;
+        static const bool yield_warmup = [] {
+            char value[PROP_VALUE_MAX] = {};
+            return !(__system_property_get("debug.bl2.yield_warmup", value) > 0 && value[0] == '0');
+        }();
+        if (yield_warmup && !Bl2TouchPlayerInWorld()) host.WarmLearnedBlocksInCallback(jit, kYieldWarmupNs);
         std::this_thread::yield();
         jit.Regs()[0] = 0;
     });
@@ -5205,7 +5226,7 @@ void ThunkManager::RegisterLibcThunks() {
                 if (dup_fd >= 0) {
                     std::lock_guard<std::mutex> lock(g_vfd_mutex);
                     int vfd = g_next_vfd++;
-                    g_vfd_map[vfd] = { dup_fd, static_cast<size_t>(entry->file_size), entry->data_offset, 0 };
+                    g_vfd_map[vfd] = { dup_fd, static_cast<size_t>(entry->file_size), entry->data_offset, 0, entry->bink };
                     const uint32_t log_index =
                         g_apk_direct_open_log_count.fetch_add(1, std::memory_order_relaxed);
                     if (log_index < 4) {
@@ -5221,6 +5242,7 @@ void ThunkManager::RegisterLibcThunks() {
                              trace_index, path, flags, mode, vfd);
                     }
                     NoteBl2LocaleOpen(path, "open");
+                    Bl2ObbPackageWatchOpen(vfd, OriginalObbIndex(path), dup_fd, entry->data_offset);
                     jit.Regs()[0] = static_cast<uint32_t>(vfd);
                     return;
                 }
@@ -5236,6 +5258,7 @@ void ThunkManager::RegisterLibcThunks() {
         fd = open(path ? path : "", flags, mode);
         if (fd >= 0 && (flags & (O_CREAT | O_WRONLY | O_RDWR | O_TRUNC | O_APPEND)) == 0) {
             AuditUserConfig(fd, path);
+            Bl2ObbPackageWatchOpen(fd, OriginalObbIndex(path), fd, 0);
         }
         const int result_errno = fd >= 0 ? 0 : errno;
         if (trace) {
@@ -5253,12 +5276,14 @@ void ThunkManager::RegisterLibcThunks() {
             std::lock_guard<std::mutex> lock(g_vfd_mutex);
             auto it = g_vfd_map.find(fd);
             if (it != g_vfd_map.end()) {
+                Bl2ObbPackageWatchClose(fd);
                 close(it->second.real_apk_fd);
                 g_vfd_map.erase(it);
                 jit.Regs()[0] = 0;
                 return;
             }
         }
+        Bl2ObbPackageWatchClose(fd);
         NetworkResult(jit, host, ::close(fd));
     });
 
@@ -5281,7 +5306,9 @@ void ThunkManager::RegisterLibcThunks() {
                 }
                 size_t avail = vfd.file_size - vfd.current_pos;
                 size_t to_read = (count < avail) ? count : avail;
-                ssize_t nread = pread(vfd.real_apk_fd, buf, to_read, vfd.file_offset + vfd.current_pos);
+                Bl2ObbPackageWatchRead(fd, static_cast<uint64_t>(vfd.current_pos));
+                ssize_t nread = vfd.bink ? vfd.bink->Read(buf, to_read, vfd.current_pos)
+                                       : pread(vfd.real_apk_fd, buf, to_read, vfd.file_offset + vfd.current_pos);
                 const int error = errno;
                 if (nread > 0) {
                     vfd.current_pos += nread;
@@ -5293,6 +5320,10 @@ void ThunkManager::RegisterLibcThunks() {
             }
         }
 
+        if (Bl2ObbPackageWatched(fd)) {
+            const off_t position = ::lseek(fd, 0, SEEK_CUR);
+            if (position >= 0) Bl2ObbPackageWatchRead(fd, static_cast<uint64_t>(position));
+        }
         ssize_t res = ::read(fd, buf, count);
         const int error = errno;
         if (res > 0) perf.SetBytes(static_cast<uint64_t>(res));
@@ -5608,6 +5639,9 @@ void ThunkManager::RegisterLibcThunks() {
 
         if (len == 0) { jit.Regs()[0] = kMapFailed; return; }
 
+        // A mapped OBB window names the cooked package being loaded.
+        if (fd >= 0 && !(flags & kMapAnonymous)) Bl2ObbPackageWatchRead(fd, static_cast<uint64_t>(off));
+
         if (fd < 0 || (flags & kMapAnonymous)) {
             // Anonymous: fresh mapping space, which the arena zero-fills for us.
             const uint32_t va = host.GuestAllocMapping((len + page - 1) & ~(page - 1), page);
@@ -5623,6 +5657,20 @@ void ThunkManager::RegisterLibcThunks() {
             std::lock_guard<std::mutex> lock(g_vfd_mutex);
             auto it = g_vfd_map.find(fd);
             if (it != g_vfd_map.end()) {
+                if (it->second.bink) {
+                    if (off < 0 || uint64_t(off) > it->second.file_size ||
+                        len > it->second.file_size - uint64_t(off)) {
+                        SetGuestErrno(host, EINVAL); jit.Regs()[0] = kMapFailed; return;
+                    }
+                    // shortcut: mmap materializes the requested movie window; use scatter mappings if whole-movie maps appear.
+                    const size_t span = (uint64_t(len) + page - 1) & ~(page - 1);
+                    const uint32_t va = host.GuestAllocMapping(span, page);
+                    if (!va || uint64_t(va) + span > host.GetGuestMemorySize() ||
+                        it->second.bink->Read(host.GetGuestMemoryBase() + va, len, off) != len) {
+                        SetGuestErrno(host, EIO); jit.Regs()[0] = kMapFailed; return;
+                    }
+                    jit.Regs()[0] = va; return;
+                }
                 struct stat apk_stat{};
                 if (fstat(it->second.real_apk_fd, &apk_stat) != 0 || apk_stat.st_size < 0) {
                     SetGuestErrno(host, EBADF);

@@ -45,7 +45,9 @@ enum class Action : std::uint8_t {
 constexpr std::uint64_t actionBit(Action action) {
     return std::uint64_t{1} << static_cast<unsigned>(action);
 }
-enum class PointerPhase : std::uint8_t { Down = 0, Move = 1, Up = 2, Cancel = 3 };
+// Hover: a mouse cursor with no button pressed. Only its latest position is
+// kept; it never owns a pointer slot, starts a gesture or clicks.
+enum class PointerPhase : std::uint8_t { Down = 0, Move = 1, Up = 2, Cancel = 3, Hover = 4 };
 enum ResetReason : std::uint32_t {
     NoReset = 0, ContextChanged = 1u << 0, ManualReset = 1u << 1,
     QueueOverflow = 1u << 2, HeartbeatLost = 1u << 3,
@@ -215,5 +217,11 @@ struct MovieAccess {
 };
 void setMovieAccess(MovieAccess access);
 MovieAccess movieAccess();
+
+// Background shader formation for the main-menu progress line: per mille of
+// the stage catalogue with a binary, or -1 while none runs. The arm64 bridge
+// installs the source when formation starts; the native ARM32 build has none.
+void setShaderFormationProgress(std::int32_t (*permille)());
+std::int32_t shaderFormationProgress();
 
 } // namespace bl2::touch

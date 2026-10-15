@@ -11,6 +11,7 @@ public final class TouchBridge implements TouchInput.Sink {
     private static native int[] nativeSettingsExchange(int[] hostValues);
     private static native int nativeMovieState();
     private static native boolean nativeSkipMovie();
+    private static native int nativeShaderProgress();
 
     public TouchContract.Context snapshot() {
         return TouchContract.Context.decode(nativeSnapshot());
@@ -28,4 +29,7 @@ public final class TouchBridge implements TouchInput.Sink {
     public int movieState() { return nativeMovieState(); }
     /** Asks the player to stop the movie at its next frame; false if nothing to skip. */
     public boolean skipMovie() { return nativeSkipMovie(); }
+    /** Background shader formation: per mille of the stage catalogue ready on
+     *  this device, or -1 while none runs (always -1 in the native ARM32 build). */
+    public int shaderProgress() { return nativeShaderProgress(); }
 }

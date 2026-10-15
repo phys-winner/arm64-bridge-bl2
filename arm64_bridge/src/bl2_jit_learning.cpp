@@ -1,6 +1,7 @@
 #include "bl2_jit_learning.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -53,6 +54,8 @@ bool AtomicWrite(const std::string& path, const std::vector<uint8_t>& bytes) {
     std::string temporary = path + ".tmp.XXXXXX";
     const int fd = ::mkstemp(temporary.data());
     if (fd < 0) return false;
+    // Same access as the saves beside it: adb can collect a profile for QA.
+    ::fchmod(fd, 0660);
     size_t written = 0;
     while (written < bytes.size()) {
         const ssize_t count = ::write(fd, bytes.data() + written, bytes.size() - written);
@@ -190,6 +193,15 @@ bool LearnedProfile::Save() {
         dirty_ = true;
     }
     return good;
+}
+
+bool LearnedProfile::SaveNow() {
+    {
+        std::lock_guard lock(mutex_);
+        if (!ready_) return false;
+        dirty_ = true;
+    }
+    return Save();
 }
 
 size_t LearnedProfile::RecordedThisRun() const {

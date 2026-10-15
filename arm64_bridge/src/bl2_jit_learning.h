@@ -32,6 +32,8 @@ public:
     void Record(Role role, uint64_t descriptor);
     // Writes the union of loaded and recorded descriptors when it changed.
     bool Save();
+    // Writes it even when unchanged (QA export of a device's profile).
+    bool SaveNow();
     // Descriptors loaded at startup in discovery order (earliest first, i.e.
     // the common paths of earlier runs before situational ones), for warming.
     const std::vector<uint64_t>& Loaded(Role role) const { return loaded_[role]; }

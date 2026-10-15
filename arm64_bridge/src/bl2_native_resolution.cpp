@@ -853,9 +853,9 @@ bool VerifyBl2NativeResolutionInput(const uint8_t* data, size_t size) {
              kGuestFileBytes);
         return false;
     }
-    ObbSha256 digest;
-    if (!digest.Update(data, size)) return false;
-    const auto hex = ObbSha256::Hex(digest.Finalize());
+    ObbSha256::Digest digest{};
+    if (!ObbSha256::OfMapping(data, size, digest)) return false;
+    const auto hex = ObbSha256::Hex(digest);
     s_input_verified = std::strcmp(hex.data(), kGuestSha256) == 0;
     if (!s_input_verified) {
         LOGE("%s input refused: sha256=%s", kPolicy, hex.data());

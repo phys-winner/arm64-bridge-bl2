@@ -707,11 +707,12 @@ public final class TouchInputTest {
         check(!NativeTouchControls.menuPointerAllowed(mapMenu,7,2,false),"third map pointer cancels the sequence");
         check(!NativeTouchControls.menuPointerAllowed(new Context(1,MENU,DIRECT_UI,bit(BACK),1),7,1,false),
                 "other native menus retain second-pointer cancellation");
-        for (int percent=50; percent<=150; percent+=10)
+        for (int percent=20; percent<=150; percent+=10)
             check(TouchPreferences.renderPercent(percent)==percent,"render scale preserves ten-percent steps");
         check(TouchPreferences.renderPercent(54)==50 && TouchPreferences.renderPercent(55)==60,
                 "render scale rounds to nearest ten percent");
-        check(TouchPreferences.renderPercent(-1)==50 && TouchPreferences.renderPercent(999)==150,
+        check(TouchPreferences.renderPercent(-1)==20 && TouchPreferences.renderPercent(14)==20
+                && TouchPreferences.renderPercent(16)==20 && TouchPreferences.renderPercent(999)==150,
                 "render scale bounds");
         check(TouchPreferences.renderPercent(Float.NaN)==50 && TouchPreferences.renderPercent(Float.POSITIVE_INFINITY)==50,
                 "invalid render scale restores native default");
@@ -778,7 +779,8 @@ public final class TouchInputTest {
         TouchPreferences preferences = new TouchPreferences();
         check(preferences.uiPercent==125 && preferences.renderPercent==50 && !preferences.potatoGraphics,
                 "new graphics default is render50 and Potato OFF; UI remains125");
-        for (int value : preferences.advancedGraphics) check(value==-1,"absent graphics preference preserves original runtime default");
+        for (int i=0;i<preferences.advancedGraphics.length;++i)
+            check(preferences.advancedGraphics[i]==(i==1?0:-1),"Motion Blur stays OFF; other absent graphics preferences inherit the runtime default");
         check(preferences.performance[0] && preferences.performance[1] && preferences.performance[2],
                 "absent performance and frame pacing choices default ON");
         check(preferences.reloadButton && preferences.settingsWire(1)[37]==1,"absent Reload button choice defaults ON");
@@ -799,6 +801,11 @@ public final class TouchInputTest {
         java.lang.reflect.Field storeField=TouchPreferences.class.getDeclaredField("store");
         storeField.setAccessible(true);
         java.util.Properties store=(java.util.Properties)storeField.get(preferences);
+        store.setProperty("motionBlur","1");preferences.reload();
+        check(preferences.advancedGraphics[1]==0,"older saved Motion Blur ON is ignored");
+        preferences.advancedGraphics[1]=1;
+        check(preferences.settingsWire(1)[24]==0,"Motion Blur cannot be enabled through the host wire");
+        preferences.reload();
         java.util.Properties hintStore=(java.util.Properties)storeField.get(hints);
         java.io.ByteArrayOutputStream hintBytes=new java.io.ByteArrayOutputStream();
         try { hintStore.store(hintBytes,"cold tutorial preference check"); }
@@ -847,7 +854,10 @@ public final class TouchInputTest {
         edited[8]=1; edited[9]=1; edited[10]=0; edited[12]=0; edited[13]=0;
         edited[14]=Float.floatToIntBits(3); edited[15]=Float.floatToIntBits(3);
         edited[16]=1; edited[17]=0; edited[18]=0; edited[20]=190; edited[38]=0; edited[39]=1;
+        edited[25]=1;
         check(preferences.applySettingsWire(edited),"native control edits admitted before reset");
+        check(preferences.advancedGraphics[1]==0 && "0".equals(store.getProperty("motionBlur")),
+                "native Motion Blur ON is normalized to OFF before persistence");
         check(!preferences.reloadButton && preferences.settingsWire(2)[37]==0,"Reload button OFF is applied from the native page");
         check(preferences.radialTap && preferences.settingsWire(2)[38]==1,"radial tap ON is applied from the native page");
         preferences.reload();
@@ -862,7 +872,7 @@ public final class TouchInputTest {
         check(preferences.applySettingsWire(editedAndReset),"one poll admits both newer values and Reset");
         int[] expected=defaults.clone(); expected[3]=150; expected[11]=1; expected[19]=1; expected[20]=200;
         expected[21]=1;expected[22]=60;
-        expected[23]=1;expected[24]=0;expected[34]=2;
+        expected[23]=1;expected[24]=0;expected[25]=0;expected[34]=2;
         expected[35]=0;expected[36]=1;expected[37]=0;
         int[] applied=preferences.settingsWire(3);
         for(int i=3;i<expected.length;++i)

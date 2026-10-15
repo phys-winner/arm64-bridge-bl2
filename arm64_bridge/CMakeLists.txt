@@ -24,6 +24,9 @@ include(FetchContent)
 # hiding the rest drops the dynsym table and most of .rela.
 add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden
                     -ffunction-sections -fdata-sections)
+if(HORN_SILENT_LOGCAT)
+    add_compile_options(-g0)
+endif()
 add_link_options(-Wl,--gc-sections -Wl,--icf=all -Wl,--exclude-libs,ALL)
 
 # Boost Headers
@@ -176,6 +179,43 @@ if(NOT coprocessor_patch_result EQUAL 0)
     message(FATAL_ERROR "Coprocessor undefined patch is incompatible with the selected Dynarmic")
 endif()
 
+# ARM B<cond> closes its block as an If terminal and VST1/VFP doubleword stores
+# write whole registers (UserConfig::fuse_conditional_branches/wide_vector_transfers,
+# ported from the static recompiler).
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-branch-fusion-wide-stores.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE branch_fusion_patch_result)
+if(NOT branch_fusion_patch_result EQUAL 0)
+    message(FATAL_ERROR "Branch fusion/wide store patch is incompatible with the selected Dynarmic")
+endif()
+
+# FastDispatchHint terminals (PLT stubs, BLX/BX through registers) keep a
+# per-site inline cache of their last target; the return stack has 16 entries.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-inline-dispatch.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE inline_dispatch_patch_result)
+if(NOT inline_dispatch_patch_result EQUAL 0)
+    message(FATAL_ERROR "Inline dispatch patch is incompatible with the selected Dynarmic")
+endif()
+
+# Forward block links skip the halt poll; the remaining polls are relaxed loads
+# (the static recompiler's relaxed-halt change).
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-relaxed-halt.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE relaxed_halt_patch_result)
+if(NOT relaxed_halt_patch_result EQUAL 0)
+    message(FATAL_ERROR "Relaxed halt patch is incompatible with the selected Dynarmic")
+endif()
+
 # Reuse the Warband fastmem/FPSCR regression against this project's Dynarmic.
 add_executable(bl2_fastmem_fpsr_test EXCLUDE_FROM_ALL tests/fastmem_fpsr_test.cpp)
 target_link_libraries(bl2_fastmem_fpsr_test PRIVATE dynarmic)
@@ -226,6 +266,7 @@ set(BRIDGE_SOURCES
     src/bl2_io_failure_probe.cpp
     src/bl2_fog_audit.cpp
     src/bl2_locale.cpp
+    src/bl2_bink_audio.cpp
     src/bl2_touch_runtime.cpp
     src/bl2_touch_gameplay_sink.cpp
     src/bl2_touch_gameplay_hooks.cpp
@@ -263,11 +304,18 @@ set(BRIDGE_SOURCES
     src/bl2_audio_decode_fastpath.cpp
     src/bl2_perf_hint.cpp
     src/bl2_program_upgrade.cpp
+    src/bl2_shader_former.cpp
+    src/bl2_obb_package_watch.cpp
+    src/obb_sha256_arm64.cpp
     src/bl2_jit_learning.cpp
     src/bl2_hitch_report.cpp
     src/bl2_frame_pacer.cpp
     src/bl2_guest_integrity.cpp
     src/bl2_movie_skip.cpp
+    src/bl2_startup_screens.cpp
+    src/bl2_auto_flush.cpp
+    src/bl2_gc_defer.cpp
+    src/bl2_gl_worker.cpp
 )
 
 if(HORN_ENABLE_PERF_PROBE)
@@ -302,6 +350,9 @@ target_compile_definitions(${BRIDGE_TARGET} PRIVATE
     BL2_ENABLE_DEBUG_MENU_DEFAULT=$<BOOL:${BL2_ENABLE_DEBUG_MENU_DEFAULT}>)
 target_compile_definitions(bl2_touch_sources PRIVATE
     BL2_ENABLE_DEBUG_MENU_DEFAULT=$<BOOL:${BL2_ENABLE_DEBUG_MENU_DEFAULT}>)
+# ARMv8 SHA-256 (src/obb_sha256_arm64.cpp) in every unit including obb_sha256.h.
+target_compile_definitions(${BRIDGE_TARGET} PRIVATE BL2_ARM64_SHA2=1)
+target_compile_definitions(bl2_touch_sources PRIVATE BL2_ARM64_SHA2=1)
 
 if(HORN_ENABLE_PHYSX_COOKIE_WATCH)
     target_compile_definitions(${BRIDGE_TARGET} PRIVATE HORN_ENABLE_PHYSX_COOKIE_WATCH=1)

@@ -10,7 +10,11 @@
 #include <fcntl.h>
 #include <string_view>
 #include <sys/stat.h>
+#if defined(BL2_LOCALE_HOST_TEST)
+#include "bl2_locale_host_port.h"
+#else
 #include <unistd.h>
+#endif
 #include <vector>
 #include <zlib.h>
 

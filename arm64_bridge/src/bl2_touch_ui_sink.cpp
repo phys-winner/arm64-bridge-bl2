@@ -6,6 +6,7 @@
 #include "bl2_touch_widget_registry.h"
 #include "bl2_touch_widget_commands.h"
 #include "bl2_touch_text_chat.h"
+#include "bl2_locale.h"
 #include "bridge_log.h"
 #include "dynarmic_host.h"
 #include "elf_loader.h"
@@ -196,6 +197,8 @@ struct Ue3UiSink::State {
     std::uint64_t inventoryPressedAt=0;
     bool inventoryPressed=false,inventoryCleanup=false,inventoryHoverBoundary=false;
     bool inventoryReleaseReady=false;
+    bool inventoryDropQueued=false;
+    bool inventorySourcePrimed=false,inventoryPrimePending=false;
     UiTextChatKeyboard chatKeyboard;
     std::unique_ptr<GfxHostTransport> chatService,chatGeometry;
     TextChatOwner chatOwner{};
@@ -240,8 +243,10 @@ struct Ue3UiSink::State {
     std::array<unsigned,2> characterRoutes{};
     unsigned footerCaptures = 0,footerRoutes = 0,keyRejects = 0;
     unsigned chatDiagnostics = 0;
+    std::uint64_t qaTrainingOwner = 0;
     std::string lastChatDiagnostic;
-#if defined(BL2_NATIVE_ARM32) && HORN_ENABLE_LOGGING && defined(__ANDROID__)
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+    unsigned inventoryDiagnosticGestures = 0;
     unsigned inventoryDiagnostics = 0;
     std::array<std::uint64_t,32> inventoryDiagnosticKeys{};
     unsigned inventoryTerminalDiagnostics = 0;
@@ -255,7 +260,7 @@ struct Ue3UiSink::State {
 #endif
 
     bool inventoryDiagnosticEnabled() const {
-#if defined(BL2_NATIVE_ARM32) && HORN_ENABLE_LOGGING && defined(__ANDROID__)
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
         if(frameTarget.direct.movieClass!="StatusMenuExGFxMovie" ||
             (inventoryDiagnostics>=inventoryDiagnosticKeys.size() && inventoryTerminalDiagnostics>=inventoryTerminalDiagnosticKeys.size())) return false;
         char property[PROP_VALUE_MAX]{};__system_property_get("debug.bl2bridge.touch_diagnostics",property);
@@ -264,11 +269,19 @@ struct Ue3UiSink::State {
         return false;
 #endif
     }
+    void inventoryDiagnosticGesture() {
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+        if(frameTarget.direct.movieClass!="StatusMenuExGFxMovie" || inventoryDiagnosticGestures>=3) return;
+        char property[PROP_VALUE_MAX]{};__system_property_get("debug.bl2bridge.touch_diagnostics",property);
+        if(property[0]!='1' || property[1]) return;
+        if(inventoryDiagnosticGestures++) inventoryDiagnostics=inventoryTerminalDiagnostics=0;
+#endif
+    }
     void inventoryDiagnostic(const char* stage,const char* reason,const GfxSession* session=nullptr,
         const InventoryWidgetObservation* capture=nullptr,const InventoryDragObservation* manager=nullptr,
         const UiStatusInventoryModel* model=nullptr,float x=-1,float y=-1,int result=-1,
         const GfxIdentity* hovered=nullptr,std::uint32_t hoveredType=0) {
-#if defined(BL2_NATIVE_ARM32) && HORN_ENABLE_LOGGING && defined(__ANDROID__)
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
         if(!inventoryDiagnosticEnabled()) return;
         const bool terminal=inventoryDiagnostics>=inventoryDiagnosticKeys.size() &&
             ((std::strcmp(stage,"fresh-source")==0 && manager && manager->started) ||
@@ -392,12 +405,37 @@ struct Ue3UiSink::State {
 #endif
     }
     void inventoryInputDiagnostic(const char* stage,const Target& target) {
-#if defined(BL2_NATIVE_ARM32) && HORN_ENABLE_LOGGING && defined(__ANDROID__)
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
         if(target.direct.movieClass!="StatusMenuExGFxMovie" || target.direct.screen!=3 ||
             inventoryInputDiagnostics>=inventoryInputDiagnosticKeys.size()) return;
         char property[PROP_VALUE_MAX]{};__system_property_get("debug.bl2bridge.touch_diagnostics",property);
         if(property[0]!='1' || property[1]) return;
         const auto state=CaptureBl2StatusInventoryInputState({this,copyMemory},base,target.owner);
+        bool panelKnown=false,panelDownKnown=false,panelDown=false,cellDownKnown=false,cellDown=false;
+        bool mouseKnown=false;double mouseX=0,mouseY=0;
+        std::uint32_t hoverType=0,pressType=0;GfxIdentity hover{};
+        if(inventoryTarget && inventoryStatus.valid && current() && target.ownerToken==inventoryOwner.ownerToken) {
+            const auto model=CaptureBl2StatusInventory({this,copyMemory},base,target.owner);
+            const bool equipped=inventoryTarget.source.panel==inventoryStatusPanels[2];
+            if(model.valid && model.owner==inventoryStatus.owner && model.top==inventoryStatus.top &&
+                model.backpack==inventoryStatus.backpack && model.equipped==inventoryStatus.equipped) {
+                GfxHostTransport transport(host,[this,target] {return current() && frameTarget.ownerToken==target.ownerToken;});
+                GfxSession observer(transport,base,target.interface,transport.scratch(),24,false);
+                const auto panel=observer.pin(static_cast<std::uint32_t>((equipped?model.equipped:model.backpack)>>32)+0x3C);
+                GfxIdentity actual{};panelKnown=observer.identity(panel,actual) && actual==inventoryTarget.source.panel;
+                if(panelKnown) {
+                    const auto down=observer.member(panel,"bMouseDown"),over=observer.member(panel,"currentOverClip");
+                    panelDownKnown=observer.boolean(down,panelDown);hoverType=observer.type(over);observer.identity(over,hover);
+                    const auto cell=equipped?observer.member(panel,inventoryTarget.label.c_str()):over;
+                    if(observer.identity(cell,actual) && actual==inventoryTarget.source.cell) {
+                        const auto downCell=observer.member(cell,"bMouseDown"),press=observer.member(cell,"onPress");
+                        cellDownKnown=observer.boolean(downCell,cellDown);pressType=observer.type(press);
+                    }
+                    const auto root=observer.variable("_root"),x=observer.member(root,"_xmouse"),y=observer.member(root,"_ymouse");
+                    mouseKnown=observer.number(x,mouseX) && observer.number(y,mouseY) && std::isfinite(mouseX) && std::isfinite(mouseY);
+                }
+            }
+        }
         auto hash=1469598103934665603ull;
         const auto word=[&](std::uint64_t value) {for(unsigned i=0;i<8;++i) {hash^=value&255;hash*=1099511628211ull;value>>=8;}};
         const auto text=[&](const char* value) {while(*value) {hash^=static_cast<unsigned char>(*value++);hash*=1099511628211ull;}};
@@ -407,12 +445,16 @@ struct Ue3UiSink::State {
         word(state.doingEquip);word(state.setupFinished);
         word(state.movieValid);word(state.movieDelegateObject);word(state.localPlayerOwnerIndex);
         word(state.captureInput);word(state.discardNonOwnerInput);
+        word(panelKnown);word(panelDownKnown);word(panelDown);word(cellDownKnown);word(cellDown);
+        word(hoverType);word(hover.data);word(pressType);
+        word(mouseKnown);word(floatWord(static_cast<float>(mouseX)));word(floatWord(static_cast<float>(mouseY)));
         for(unsigned i=0;i<inventoryInputDiagnostics;++i) if(inventoryInputDiagnosticKeys[i]==hash) return;
         inventoryInputDiagnosticKeys[inventoryInputDiagnostics++]=hash;
         __android_log_print(ANDROID_LOG_INFO,"BL2TouchDiagnostics",
             "inventory-input stage=%s known=%u reason=%s owner=%08X top=%08X epoch=%llu generation=%llu "
             "delegate=(%08X,%s) queued=(%08X,%s) trigger=%s equip=%u setup=%u "
-            "movieInput=(%u,%s) movieDelegate=(%08X,%s,%s) localOwner=%d capture=%u discard=%u",
+            "movieInput=(%u,%s) movieDelegate=(%08X,%s,%s) localOwner=%d capture=%u discard=%u "
+            "sourceIndex=%d panel=(%u,%u,%u) cell=(%u,%u,%u) hover=(%u,%08X) mouse=(%u,%.2f,%.2f)",
             stage,state.valid && state.owner==target.ownerToken?1u:0u,state.reason.c_str(),target.owner,
             static_cast<std::uint32_t>(state.top>>32),static_cast<unsigned long long>(epoch),
             static_cast<unsigned long long>(target.generation),static_cast<std::uint32_t>(state.delegateObject>>32),
@@ -420,7 +462,9 @@ struct Ue3UiSink::State {
             state.triggerName.c_str(),state.doingEquip?1u:0u,state.setupFinished?1u:0u,state.movieValid?1u:0u,
             state.movieReason.c_str(),static_cast<std::uint32_t>(state.movieDelegateObject>>32),
             state.movieDelegateName.c_str(),state.movieDelegateClass.c_str(),state.localPlayerOwnerIndex,
-            state.captureInput?1u:0u,state.discardNonOwnerInput?1u:0u);
+            state.captureInput?1u:0u,state.discardNonOwnerInput?1u:0u,inventoryTarget.index,
+            panelKnown?1u:0u,panelDownKnown?1u:0u,panelDown?1u:0u,cellDownKnown?1u:0u,cellDown?1u:0u,pressType,hoverType,hover.data,
+            mouseKnown?1u:0u,mouseX,mouseY);
 #else
         (void)stage;(void)target;
 #endif
@@ -851,7 +895,54 @@ struct Ue3UiSink::State {
         default:return false;
         }
     }
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+    // QA only: debug.bl2bridge.qa_training_tab=1..5 gives the next tab-0
+    // Training prompt that ECHO tab during its delay, as a tab training does.
+    void qaTrainingTab() {
+        auto& d=frameTarget.direct;
+        if(!d.trainingPrompt || d.screen!=0 || d.screenSize!=1 || qaTrainingOwner==frameTarget.ownerToken || !current()) return;
+        char value[PROP_VALUE_MAX]{};__system_property_get("debug.bl2bridge.qa_training_tab",value);
+        if(value[0]<'1' || value[0]>'5' || value[1]) return;
+        const auto field=frameTarget.owner+d.screenOffset;if(!span(field,1)) return;
+        host.MemoryWrite8(field,static_cast<std::uint8_t>(value[0]-'0'));d.screen=value[0]-'0';
+        qaTrainingOwner=frameTarget.ownerToken;
+        HORN_LOGI("BL2Bridge","native-ui QA training tab=%c owner=%08X",value[0],frameTarget.owner);
+    }
+#endif
+    // A ready WillowGFxTrainingDialogBox with an ECHO tab (StatusMenuTab 1-5)
+    // closes in its original HandleInputKey only for XboxTypeS_Back or the
+    // StatusMenu/tab bindings, and OnClose then opens that tab; Enter and
+    // Escape are ignored, so neither touch button could leave the message.
+    // Select keeps the prompt's own action (XboxTypeS_Back). Back skips it:
+    // StatusMenuTab=0 takes the original tab-0 branch, where Escape closes and
+    // OnClose reopens the HUD. Tab 0 prompts accept Enter/Escape themselves.
+    bool trainingKey(Action action) {
+        if((action!=Action::Confirm && action!=Action::Back) || !current()) return false;
+        auto& direct=frameTarget.direct;
+        if(!direct.trainingPrompt || direct.screen<1 || direct.screen>5) return false;
+        // The original swallows every key until the delayed prompt appears.
+        if(!Bl2TouchTrainingPromptReady({this,copyMemory},base,direct)) return true;
+        const bool skip=action==Action::Back;
+        const auto keyAt=base+(skip?0x03009FB8u:0x0300A320u);
+        const auto owner=frameTarget.owner,field=owner+direct.screenOffset;
+        if(name(keyAt)!=(skip?"Escape":"XboxTypeS_Back") || direct.screenSize!=1 || !span(field,1)) return true;
+        const auto tab=static_cast<std::uint8_t>(direct.screen);
+        if(skip) { host.MemoryWrite8(field,0);direct.screen=0; }
+        const auto edge=[&](std::uint32_t event) {
+            return originalQuery(owner,direct.click,{frameTarget.controllerId,read(keyAt),read(keyAt+4),event,0xFFFFFFFFu},16).has_value();
+        };
+        // The release closes the movie inside the call, so its own answer is not
+        // a success signal: only a release that never ran keeps the ECHO tab.
+        bool released=false;
+        if(edge(0) && current() && Bl2TouchTrainingPromptReady({this,copyMemory},base,frameTarget.direct)) { released=true;edge(1); }
+        if(skip && !released && span(field,1) && token(owner)==frameTarget.ownerToken &&
+            host.MemoryRead8(field)==0) { host.MemoryWrite8(field,tab);frameTarget.direct.screen=tab; }
+        if(logs++<24) HORN_LOGI("BL2Bridge","native-ui training %s tab=%u released=%u owner=%08X",
+            skip?"skip":"echo",static_cast<unsigned>(tab),released?1u:0u,owner);
+        return true;
+    }
     void key(Action action) {
+        if(trainingKey(action)) return;
         // The gamepad face and shoulder keys keep the footer's case-insensitive
         // spelling check; the six navigation keys were matched exactly in prepare.
         switch(action) {
@@ -962,7 +1053,7 @@ struct Ue3UiSink::State {
     }
     void clearInventory() {
         inventoryStart.reset();inventoryFinal.reset();inventoryPressed=false;inventoryPressedAt=0;inventoryFresh={};inventoryCleanup=false;
-        inventoryHoverBoundary=false;
+        inventoryHoverBoundary=inventoryDropQueued=inventorySourcePrimed=inventoryPrimePending=false;
         inventoryStatus={};inventoryStatusPanels={};
         inventoryTarget={};inventoryDragData={};inventorySession.reset();inventoryTransport.reset();inventoryOwner={};
     }
@@ -1038,6 +1129,7 @@ struct Ue3UiSink::State {
         if(started || (inventoryFamily()==InventoryDragFamily::StatusInventory && active)) {
             clearInventory();return false;
         }
+        inventoryDiagnosticGesture();inventoryInputDiagnostic("admitted",inventoryOwner);
         // Original AddMouseButton clears a pending AddMouseMove. Prime the
         // authored currentOverClip in a separate original movie frame before
         // any held press; no native button/action is sent on physical DOWN.
@@ -1197,13 +1289,24 @@ struct Ue3UiSink::State {
 #endif
             inventoryDiagnostic("finish","cancel-release-outside",inventorySession.get(),nullptr,&observed,nullptr,update.x,update.y,(move?1:0)|(up?2:0));
         } else if(started && current()) {
+            if(!inventoryDropQueued) {
+                inventoryFinal=update;inventoryHoverBoundary=false;
+                inventoryDropQueued=mouse(1,std::floor(update.x*(frameTarget.width-1)),std::floor(update.y*(frameTarget.height-1)));
+                inventoryDiagnostic("finish","original-drop-move-queued",inventorySession.get(),nullptr,&observed,nullptr,update.x,update.y,inventoryDropQueued?1:0);
+                if(!inventoryDropQueued) {auto cancel=update;cancel.command=InventoryDragCommand::Cancel;finishInventory(cancel);}
+                return;
+            }
+            // AddMouseButton discards pending motion; let the original movie
+            // consume the final target before releasing the captured press.
+            if(!inventoryHoverBoundary) return;
 #if defined(BL2_NATIVE_ARM32) && HORN_ENABLE_LOGGING && defined(__ANDROID__)
             inventoryDropDiagnostic("pre-up",observed);
 #endif
-            const bool move=mouse(1,std::floor(update.x*(frameTarget.width-1)),std::floor(update.y*(frameTarget.height-1)));
             const bool up=inventoryMouseUpFor(inventoryOwner,std::floor(update.x*(frameTarget.width-1)),std::floor(update.y*(frameTarget.height-1)));
-            inventoryDiagnostic("finish","original-drop-queued",inventorySession.get(),nullptr,&observed,nullptr,update.x,update.y,(move?1:0)|(up?2:0));
+            inventoryDiagnostic("finish","original-drop-queued",inventorySession.get(),nullptr,&observed,nullptr,update.x,update.y,1|(up?2:0));
+            inventoryInputDiagnostic("after-native-release",inventoryOwner);
         } else {
+            inventoryInputDiagnostic("before-no-ack-release",inventoryOwner);
             inventoryCleanup=true;
             const bool move=mouseFor(inventoryOwner,1,-1,-1,true),up=inventoryMouseUpFor(inventoryOwner,-1,-1,true);
             inventoryDiagnostic("finish","no-ack-release-outside",inventorySession.get(),nullptr,&observed,nullptr,update.x,update.y,(move?1:0)|(up?2:0));
@@ -1224,10 +1327,11 @@ struct Ue3UiSink::State {
             const UiTap point{update.x,update.y,0};tap(point);clearInventory();return;
         }
         if(update.command==InventoryDragCommand::StartMove || inventoryStart) {
+            const bool retry=inventoryStart.has_value();
             auto start=inventoryStart.value_or(update);start.x=update.x;start.y=update.y;
             inventoryStart=start;
             const auto forwardMove=[&] {
-                if(!realMove) return;
+                if(!realMove || inventoryPrimePending) return;
                 // The first rollOver installs onMouseMove but does not populate
                 // currentOverClip. Forward real captured motion while waiting;
                 // deferred frame retries must not synthesize another MOVE.
@@ -1241,32 +1345,45 @@ struct Ue3UiSink::State {
                 forwardMove();
                 return;
             }
+            inventoryPrimePending=false;
             inventorySession->beginInputBoundary();
             const auto hovered=inventorySession->member(inventoryTarget.panel,"currentOverClip");GfxIdentity cell{};
             const bool over=inventorySession->identity(hovered,cell) && cell==inventoryTarget.source.cell;
             const auto hoveredType=inventoryDiagnosticEnabled()?inventorySession->type(hovered):0;
             inventorySession->release(hovered);
+            const bool status=inventoryFamily()==InventoryDragFamily::StatusInventory;
+            const auto onPress=over && status?inventorySession->member(inventoryTarget.cell,"onPress"):GfxHandle{};
+            const bool pressReady=over && (!status || inventorySession->type(onPress)==8);
+            inventorySession->release(onPress);
             if(!inventorySession->good()) {clearInventory();return;}
-            if(!over) {
-                inventoryDiagnostic("update","waiting-original-hover",inventorySession.get(),nullptr,nullptr,nullptr,-1,-1,-1,&cell,hoveredType);
+            if(!pressReady) {
+                // DragOver can leave currentOverClip at a drop destination
+                // without restoring its onPress. A genuine outward MOVE must
+                // precede the origin prime so authored RollOver can rearm it.
+                inventoryDiagnostic("update",over?"waiting-original-press-callback":"waiting-original-hover",inventorySession.get(),nullptr,nullptr,nullptr,-1,-1,-1,&cell,hoveredType);
+                if(!over && retry && !inventorySourcePrimed) {
+                    // Normalize the captured touch origin once after motion;
+                    // newer samples wait until its authored hover is consumed.
+                    inventorySourcePrimed=inventoryPrimePending=true;inventoryHoverBoundary=false;
+                    const bool queued=mouse(1,std::floor(start.startX*(frameTarget.width-1)),std::floor(start.startY*(frameTarget.height-1)));
+                    inventoryDiagnostic("update","original-source-prime-queued",inventorySession.get(),nullptr,nullptr,nullptr,start.startX,start.startY,queued?1:0);
+                    if(!queued) clearInventory();
+                    return;
+                }
                 forwardMove();
                 return;
-            }
-            // A consumed hover can precede the latest physical motion. Before
-            // pressing, that accepted point must still hit this original item;
-            // a move onto another cell only updates hover, never selects it.
-            if(!SameBl2InventoryWidget(inventoryTarget,inventoryHit(start.x,start.y))) {
-                inventoryDiagnostic("update","waiting-source-containment",inventorySession.get(),nullptr,nullptr,nullptr,start.x,start.y);forwardMove();return;
             }
             bool active=false;
             const bool started=Bl2InventoryDragStarted(*inventorySession,inventoryTarget,nullptr,&active);
             if(started || (inventoryFamily()==InventoryDragFamily::StatusInventory && active)) {
                 inventoryDiagnostic("update","hover-manager-busy",inventorySession.get());clearInventory();return;
             }
+            inventoryInputDiagnostic("before-native-down",inventoryOwner);
             inventoryStart.reset();
             const auto x=std::floor(start.startX*(frameTarget.width-1)),y=std::floor(start.startY*(frameTarget.height-1));
             inventoryPressed=mouse(2,x,y);inventoryPressedAt=monotonicMilliseconds();
             inventoryDiagnostic("update","original-down-queued",inventorySession.get(),nullptr,nullptr,nullptr,start.startX,start.startY,inventoryPressed?1:0,&cell,hoveredType);
+            inventoryInputDiagnostic("after-native-down",inventoryOwner);
         }
         if(inventoryPressed) {
             const bool queued=mouse(1,std::floor(update.x*(frameTarget.width-1)),std::floor(update.y*(frameTarget.height-1)));
@@ -1443,7 +1560,8 @@ struct Ue3UiSink::State {
         const auto now=monotonicMilliseconds();
         if(chatAttempts>=3 || now<chatAttemptAt) return;
         ++chatAttempts;chatAttemptAt=now+750;
-        const bool shown=ShowBl2TextChatKeyboard(*chatService,base,chatService->scratch(),"CHAT",input.text);
+        const bool shown=ShowBl2TextChatKeyboard(*chatService,base,chatService->scratch(),
+            Bl2RussianLocaleSelected()?"ЧАТ":"CHAT",input.text);
         if(shown && chatKeyboard.opened(identity,now))
             chatAttempts=3;
 #if HORN_ENABLE_LOGGING && defined(__ANDROID__)
@@ -2023,6 +2141,9 @@ void Ue3UiSink::beginTouchFrame(const Frame& frame) {
     s.epoch = frame.epoch; s.frameTarget = s.prepared;
     s.frameValid = s.preparedValid && frame.context.sceneIdentity == s.prepared.scene &&
         (frame.context.capabilities & kUiNavigation) && !(frame.context.capabilities & PhysicalOwnsInput);
+#if HORN_ENABLE_LOGGING && defined(__ANDROID__)
+    if(frame.fresh) s.qaTrainingTab();
+#endif
     if(frame.fresh) s.scaleFooter();
     s.pollChat(frame);
     s.transactions.begin(frame.epoch,frame.context.sceneIdentity,s.current(),frame.resetReasons != 0,
@@ -2084,7 +2205,8 @@ void Ue3UiSink::setFooterActionHandler(std::function<bool(const ActionEdge&)> ha
 }
 bool Ue3UiSink::footerPointer(const PointerEvent& event,bool allowCapture) {
     auto& s=*state_;
-    if(event.sourceEpoch!=s.epoch || !s.current() || !(s.frameTarget.capabilities & kUiTapTest)) return false;
+    if(event.phase==PointerPhase::Hover || event.sourceEpoch!=s.epoch || !s.current() ||
+        !(s.frameTarget.capabilities & kUiTapTest)) return false;
     if(allowCapture && !s.footerTarget && event.phase==PointerPhase::Down) {
         s.scaleFooter(true);s.footerDown(event.surfaceX,event.surfaceY);
     }
@@ -2093,6 +2215,7 @@ bool Ue3UiSink::footerPointer(const PointerEvent& event,bool allowCapture) {
 }
 void Ue3UiSink::pointer(const PointerEvent& event) {
     auto& s = *state_;
+    if (event.phase == PointerPhase::Hover) { hover(event); return; }
     const bool current=s.current();
     if(event.phase!=PointerPhase::Move)
         s.inventoryDiagnostic(event.phase==PointerPhase::Down?"pointer-down":event.phase==PointerPhase::Up?"pointer-up":"pointer-cancel",
@@ -2172,7 +2295,14 @@ void Ue3UiSink::pointer(const PointerEvent& event) {
 }
 void Ue3UiSink::hover(const PointerEvent& event) {
     auto& s = *state_;
-    if (event.sourceEpoch == s.epoch && (event.phase == PointerPhase::Down || event.phase == PointerPhase::Move) &&
+    // A mouse cursor (Hover) highlights like the PC game's own cursor, but
+    // never moves the movie's mouse under a finger, drag, footer or gesture.
+    if (event.phase == PointerPhase::Hover && (!s.current() || !(s.frameTarget.capabilities & kUiTapTest) ||
+        s.transactions.engaged() || s.mapGesture.captured() || s.itemGesture.captured() ||
+        s.inventoryGesture.captured() || s.inventoryPressed || s.inventoryFinal || s.footerTarget ||
+        s.ageGateGesture || s.textScroll.active || s.characterTarget)) return;
+    if (event.sourceEpoch == s.epoch && (event.phase == PointerPhase::Down || event.phase == PointerPhase::Move ||
+        event.phase == PointerPhase::Hover) &&
         std::isfinite(event.surfaceX) && std::isfinite(event.surfaceY) && event.surfaceX >= 0 && event.surfaceX <= 1 &&
         event.surfaceY >= 0 && event.surfaceY <= 1)
         s.mouse(1,std::floor(event.surfaceX*(s.frameTarget.width-1)),std::floor(event.surfaceY*(s.frameTarget.height-1)));

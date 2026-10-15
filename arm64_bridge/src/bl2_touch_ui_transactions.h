@@ -106,6 +106,8 @@ public:
     // Past the slop a swipe-navigation drag scrolls or changes tabs; it no
     // longer points at a widget under the finger.
     bool dragging() const { return axis_ != 0; }
+    // A finger is down here: a mouse cursor hover must not move under it.
+    bool engaged() const { for (const auto id : pointers_) if (id >= 0) return true; return false; }
     void clear();
 private:
     int find(std::int32_t id) const;

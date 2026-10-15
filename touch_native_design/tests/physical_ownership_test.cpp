@@ -69,5 +69,13 @@ int main() {
         assert(state.ownsInput(99999)); // Clock rollback cannot remove ownership.
         assert(!state.ownsInput(100800));
     }
+    {
+        PhysicalOwnership state;
+        state.disconnected(0, 50000);
+        assert(!state.ownsInput(50001)); // A device change with nothing held is not input.
+        state.key(0, 0, 96, 50002);
+        state.disconnected(0, 60000);
+        assert(state.ownsInput(60799) && !state.ownsInput(60800)); // A held key keeps the neutral interval.
+    }
     std::cout << "PASS: physical held-key, controller, axis, mouse, neutral and malformed-input ownership\n";
 }
