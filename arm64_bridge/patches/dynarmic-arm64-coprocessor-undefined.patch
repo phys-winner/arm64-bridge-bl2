@@ -1,0 +1,165 @@
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+index 5115fbbb..9829e556 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+@@ -10,6 +10,8 @@
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+ #include "dynarmic/backend/arm64/emit_context.h"
+ #include "dynarmic/backend/arm64/reg_alloc.h"
++#include "dynarmic/backend/arm64/stack_layout.h"
++#include "dynarmic/interface/A32/config.h"
+ #include "dynarmic/interface/A32/coprocessor.h"
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/microinstruction.h"
+@@ -19,8 +21,33 @@ namespace Dynarmic::Backend::Arm64 {
+ 
+ using namespace oaknut::util;
+ 
+-static void EmitCoprocessorException() {
+-    ASSERT_FALSE("Should raise coproc exception here");
++// No coprocessor is attached for this number: report an undefined instruction
++// at the block start, as an unattached coprocessor is UNDEFINED, instead of
++// terminating the host process while compiling. A guest branch into data
++// decodes LDC/STC often; the user callback can then stop that thread.
++static void EmitCoprocessorException(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    ctx.reg_alloc.PrepareForCall();
++
++    if (ctx.conf.enable_cycle_counting) {
++        code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
++        code.SUB(X1, X1, Xticks);
++        EmitRelocation(code, ctx, LinkTarget::AddTicks);
++    }
++
++    code.MOV(W1, A32::LocationDescriptor{ctx.block.Location()}.PC());
++    code.MOV(W2, static_cast<u32>(A32::Exception::UndefinedInstruction));
++    EmitRelocation(code, ctx, LinkTarget::ExceptionRaised);
++
++    if (ctx.conf.enable_cycle_counting) {
++        EmitRelocation(code, ctx, LinkTarget::GetTicksRemaining);
++        code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
++        code.MOV(Xticks, X0);
++    }
++
++    if (inst->GetType() != IR::Type::Void) {
++        code.MOV(X0, XZR);
++        ctx.reg_alloc.DefineAsRegister(inst, X0);
++    }
+ }
+ 
+ static void CallCoprocCallback(oaknut::CodeGenerator& code, EmitContext& ctx, A32::Coprocessor::Callback callback, IR::Inst* inst = nullptr, std::optional<Argument::copyable_reference> arg0 = {}, std::optional<Argument::copyable_reference> arg1 = {}) {
+@@ -51,13 +78,13 @@ void EmitIR<IR::Opcode::A32CoprocInternalOperation>(oaknut::CodeGenerator& code,
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+     const auto action = coproc->CompileInternalOperation(two, opc1, CRd, CRn, CRm, opc2);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+@@ -77,14 +104,14 @@ void EmitIR<IR::Opcode::A32CoprocSendOneWord>(oaknut::CodeGenerator& code, EmitC
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+     const auto action = coproc->CompileSendOneWord(two, opc1, CRn, CRm, opc2);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+@@ -118,14 +145,14 @@ void EmitIR<IR::Opcode::A32CoprocSendTwoWords>(oaknut::CodeGenerator& code, Emit
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+     const auto action = coproc->CompileSendTwoWords(two, opc, CRm);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+@@ -163,14 +190,14 @@ void EmitIR<IR::Opcode::A32CoprocGetOneWord>(oaknut::CodeGenerator& code, EmitCo
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+     const auto action = coproc->CompileGetOneWord(two, opc1, CRn, CRm, opc2);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+@@ -202,14 +229,14 @@ void EmitIR<IR::Opcode::A32CoprocGetTwoWords>(oaknut::CodeGenerator& code, EmitC
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+     auto action = coproc->CompileGetTwoWords(two, opc, CRm);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+@@ -252,13 +279,13 @@ void EmitIR<IR::Opcode::A32CoprocLoadWords>(oaknut::CodeGenerator& code, EmitCon
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+     const auto action = coproc->CompileLoadWords(two, long_transfer, CRd, option);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+@@ -283,13 +310,13 @@ void EmitIR<IR::Opcode::A32CoprocStoreWords>(oaknut::CodeGenerator& code, EmitCo
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 
+     const auto action = coproc->CompileStoreWords(two, long_transfer, CRd, option);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx, inst);
+         return;
+     }
+ 

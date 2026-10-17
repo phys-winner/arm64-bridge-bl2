@@ -1,0 +1,38 @@
+# Third-party sources fetched for the build (see README.md)
+/arm64_bridge/third_party/
+
+# Build outputs
+/build/
+/out/
+/arm64_bridge/build*/
+/touch_native_design/build/
+/work/build/
+/work/evidence/
+/work/logs/
+/work/tmp/
+**/__pycache__/
+
+# Game files never belong in this repository
+/app/
+/original/
+*.apk
+*.apks
+*.xapk
+*.obb
+*.so
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Signing material
+*.jks
+*.keystore
+*.pk8
+*.pem
+*.p12
+*.pfx
+.env

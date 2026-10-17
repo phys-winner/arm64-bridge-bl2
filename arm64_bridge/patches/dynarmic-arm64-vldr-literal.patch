@@ -1,0 +1,21 @@
+--- a/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+@@ -1268,11 +1268,16 @@
+     const u32 imm32 = imm8.ZeroExtend() << 2;
+     const auto d = ToExtReg(sz, Vd, D);
+     const auto base = n == Reg::PC ? ir.Imm32(ir.AlignPC(4)) : ir.GetRegister(n);
+-    const auto address = U ? ir.Add(base, ir.Imm32(imm32)) : ir.Sub(base, ir.Imm32(imm32));
++    // Expose PC literals to the existing readonly folding pass, which runs
++    // before constant propagation. U32 arithmetic preserves guest wrapping.
++    const u32 literal_address = U ? ir.AlignPC(4) + imm32 : ir.AlignPC(4) - imm32;
++    const IR::U32 address = n == Reg::PC ? ir.Imm32(literal_address)
++                                       : IR::U32(U ? ir.Add(base, ir.Imm32(imm32)) : ir.Sub(base, ir.Imm32(imm32)));
+ 
+     if (sz) {
+         auto lo = ir.ReadMemory32(address, IR::AccType::ATOMIC);
+-        auto hi = ir.ReadMemory32(ir.Add(address, ir.Imm32(4)), IR::AccType::ATOMIC);
++        const IR::U32 next_address = n == Reg::PC ? ir.Imm32(literal_address + 4) : IR::U32(ir.Add(address, ir.Imm32(4)));
++        auto hi = ir.ReadMemory32(next_address, IR::AccType::ATOMIC);
+         if (ir.current_location.EFlag()) {
+             std::swap(lo, hi);
+         }

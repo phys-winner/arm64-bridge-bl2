@@ -1,0 +1,32 @@
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index e79f58f..9a018da 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -133,8 +133,16 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
+             code.B(LE, fail);
+             EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
+         } else {
+-            code.LDAR(Wscratch0, Xhalt);
+-            code.CBNZ(Wscratch0, fail);
++            // Only links to the same or a lower guest PC poll the halt flag:
++            // every guest loop contains such a link, an indirect branch (the
++            // dispatcher) or an SVC (CheckHalt), so halts are still seen. A
++            // relaxed load suffices for a polled flag (ported from the static
++            // recompiler's relaxed-halt patch).
++            const bool forward = A32::LocationDescriptor{terminal.next}.PC() > A32::LocationDescriptor{ctx.block.Location()}.PC();
++            if (!forward) {
++                code.LDR(Wscratch0, Xhalt);
++                code.CBNZ(Wscratch0, fail);
++            }
+             EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
+         }
+     }
+@@ -234,7 +242,7 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Ch
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::CheckHalt terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+     oaknut::Label fail;
+-    code.LDAR(Wscratch0, Xhalt);
++    code.LDR(Wscratch0, Xhalt);
+     code.CBNZ(Wscratch0, fail);
+     EmitA32Terminal(code, ctx, terminal.else_, initial_location, is_single_step);
+     code.l(fail);

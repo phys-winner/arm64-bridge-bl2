@@ -1,0 +1,83 @@
+--- a/src/dynarmic/interface/A32/a32.h
++++ b/src/dynarmic/interface/A32/a32.h
+@@ -85,6 +85,16 @@
+     /// Clears exclusive state for this core.
+     void ClearExclusiveState();
+ 
++    // Compile one descriptor from a host callback of this Jit's own Run, on its
++    // thread (the emitted code is suspended at a call). It never clears or
++    // invalidates the cache, so it refuses when less than min_free_code_bytes
++    // of code space remain. Pending invalidations stay for the Run loop.
++    bool PrecompileInCallback(std::uint64_t raw_descriptor, std::size_t min_free_code_bytes);
++
++    // Process-wide observer of every newly emitted block, called on the
++    // emitting thread with its canonical descriptor (ARM64 backend).
++    static void SetBlockEmittedHook(void (*hook)(std::uint64_t raw_descriptor));
++
+     /**
+      * Returns true if Jit::Run was called but hasn't returned yet.
+      * i.e.: We're in a callback.
+--- a/src/dynarmic/backend/arm64/a32_interface.cpp
++++ b/src/dynarmic/backend/arm64/a32_interface.cpp
+@@ -84,6 +84,15 @@
+         current_state = {};
+     }
+ 
++    bool PrecompileInCallback(std::uint64_t raw_descriptor, std::size_t min_free_code_bytes) {
++        // Emit clears the whole cache below 1 MiB of space: never let that
++        // happen under suspended emitted code.
++        if (!jit_interface->is_executing || min_free_code_bytes < 2 * 1024 * 1024 ||
++            current_address_space.FreeCodeBytes() < min_free_code_bytes) return false;
++        current_address_space.GetOrEmit(IR::LocationDescriptor{raw_descriptor});
++        return true;
++    }
++
+     void HaltExecution(HaltReason hr) {
+         Atomic::Or(&halt_reason, static_cast<u32>(hr));
+         Atomic::Barrier();
+@@ -244,6 +253,14 @@
+     impl->ClearExclusiveState();
+ }
+ 
++bool Jit::PrecompileInCallback(std::uint64_t raw_descriptor, std::size_t min_free_code_bytes) {
++    return impl->PrecompileInCallback(raw_descriptor, min_free_code_bytes);
++}
++
++void Jit::SetBlockEmittedHook(void (*hook)(std::uint64_t raw_descriptor)) {
++    Backend::Arm64::A32AddressSpace::SetBlockEmittedHook(hook);
++}
++
+ void Jit::DumpDisassembly() const {
+     impl->DumpDisassembly();
+ }
+--- a/src/dynarmic/backend/arm64/a32_address_space.h
++++ b/src/dynarmic/backend/arm64/a32_address_space.h
+@@ -21,6 +21,9 @@
+ 
+     void InvalidateCacheRanges(const boost::icl::interval_set<u32>& ranges);
+ 
++    size_t FreeCodeBytes() { return GetRemainingSize(); }
++    static void SetBlockEmittedHook(void (*hook)(std::uint64_t));
++
+ protected:
+     friend class A32Core;
+ 
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -456,7 +456,15 @@
+     };
+ }
+ 
++static void (*block_emitted_hook)(std::uint64_t) = nullptr;
++
++void A32AddressSpace::SetBlockEmittedHook(void (*hook)(std::uint64_t)) {
++    __atomic_store_n(&block_emitted_hook, hook, __ATOMIC_RELEASE);
++}
++
+-void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
++void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) {
++    if (const auto hook = __atomic_load_n(&block_emitted_hook, __ATOMIC_ACQUIRE))
++        hook(block.Location().Value());
+     const A32::LocationDescriptor descriptor{block.Location()};
+     const A32::LocationDescriptor end_location{block.EndLocation()};
+     const auto range = boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1);

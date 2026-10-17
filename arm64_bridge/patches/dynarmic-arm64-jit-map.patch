@@ -1,0 +1,75 @@
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -18,6 +18,16 @@
+ #include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/ir/opt/passes.h"
+ 
++#if defined(__ANDROID__)
++#include <cstdio>
++#include <limits>
++#include <mutex>
++#include <sys/stat.h>
++#include <sys/system_properties.h>
++#include <time.h>
++#include <unistd.h>
++#endif
++
+ namespace Dynarmic::Backend::Arm64 {
+ 
+ template<auto mfp, typename T>
+@@ -459,6 +469,55 @@ void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const Emitte
+     const A32::LocationDescriptor end_location{block.EndLocation()};
+     const auto range = boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1);
+     block_ranges.AddRange(range, descriptor);
++#if defined(__ANDROID__)
++    // Diagnostic only: map simpleperf's anonymous AArch64 sample IPs back to
++    // exact translated guest blocks. No file or clock work in normal builds.
++    static const bool enabled = [] {
++        char property[PROP_VALUE_MAX] = {};
++        return __system_property_get("debug.bl2.jit_map", property) > 0 &&
++               property[0] == '1';
++    }();
++    if (!enabled || block_info.size > std::numeric_limits<u32>::max()) return;
++    struct Record {
++        uint64_t timestamp_ns;
++        uint64_t host_start;
++        uint64_t descriptor;
++        uint32_t host_size;
++        uint32_t guest_start;
++        uint32_t guest_end;
++        uint32_t flags;
++    };
++    static_assert(sizeof(Record) == 40);
++    static std::mutex map_mutex;
++    static FILE* output = nullptr;
++    static uint32_t pending = 0;
++    std::lock_guard lock(map_mutex);
++    if (!output) {
++        char path[192];
++        std::snprintf(path, sizeof(path),
++                      "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/jit-map-%d.bin",
++                      getpid());
++        output = std::fopen(path, "wb");
++        if (!output) return;
++        fchmod(fileno(output), 0660);
++        std::setvbuf(output, nullptr, _IOFBF, 256 * 1024);
++    }
++    timespec now{};
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    const Record record{
++        static_cast<uint64_t>(now.tv_sec) * 1000000000ULL +
++            static_cast<uint64_t>(now.tv_nsec),
++        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(block_info.entry_point)),
++        block.Location().Value(),
++        static_cast<uint32_t>(block_info.size),
++        descriptor.PC(), end_location.PC(), descriptor.TFlag() ? 1u : 0u,
++    };
++    std::fwrite(&record, sizeof(record), 1, output);
++    if (++pending == 32) {
++        std::fflush(output);
++        pending = 0;
++    }
++#endif
+ }
+ 
+ }  // namespace Dynarmic::Backend::Arm64

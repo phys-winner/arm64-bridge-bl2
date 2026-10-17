@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.22)
+project(bl2_touch_source_kit LANGUAGES CXX)
+
+# OBJECT ensures the JNI exports are not discarded as unreferenced archive members.
+add_library(bl2_touch_sources OBJECT bl2_touch_input.cpp bl2_touch_engine_adapter.cpp)
+target_include_directories(bl2_touch_sources PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(bl2_touch_sources PUBLIC cxx_std_17)
+set_target_properties(bl2_touch_sources PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(ANDROID)
+    target_sources(bl2_touch_sources PRIVATE bl2_touch_jni.cpp)
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(bl2_touch_sources PRIVATE -Wall -Wextra -Werror)
+endif()
+
+option(BL2_TOUCH_BUILD_TESTS "Build host-only mailbox contract tests" OFF)
+if(BL2_TOUCH_BUILD_TESTS AND NOT ANDROID)
+    enable_testing()
+    find_package(Threads REQUIRED)
+    add_executable(bl2_touch_contract_tests ../tests/native_input_test.cpp)
+    target_link_libraries(bl2_touch_contract_tests PRIVATE bl2_touch_sources Threads::Threads)
+    add_test(NAME bl2_touch_contract COMMAND bl2_touch_contract_tests)
+endif()

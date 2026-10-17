@@ -1,0 +1,2097 @@
+package com.tt2kgames.Borderlands2.touch;
+
+import android.app.Activity;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.graphics.Rect;
+import android.os.Bundle;
+import android.os.SystemClock;
+import android.util.Log;
+import android.util.SparseArray;
+import android.view.Choreographer;
+import android.view.InputDevice;
+import android.view.MotionEvent;
+import android.view.PointerIcon;
+import android.view.SurfaceHolder;
+import android.view.Surface;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityNodeProvider;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityManager;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Arrays;
+import com.tt2kgames.Borderlands2.LaunchControls;
+import com.tt2kgames.Borderlands2.GameRestart;
+import com.tt2kgames.Borderlands2.GameStorage;
+import static com.tt2kgames.Borderlands2.touch.TouchContract.*;
+
+/**
+ * Compact, context-driven controls. All methods run on the UI thread.
+ */
+public final class NativeTouchControls extends View implements Choreographer.FrameCallback,
+        SurfaceHolder.Callback, SensorEventListener {
+    public interface RouteListener { void nativeRouteChanged(boolean ownsInput); }
+    private static final String TAG = "BL2NativeTouch";
+    private static final int MORE = TouchLayout.MORE_BUTTON, DONE = -3;
+    /** Layout editor toolbar pills (never buttons of the play layout). */
+    private static final int TOOL_BUTTONS = -10, TOOL_LEFT = -11, TOOL_RESET = -12;
+    /** Editor buttons offered outside the cluster, in panel order. */
+    private static final int[] OPTIONAL = {MELEE, CROUCH, SKILL, NEXT_WEAPON, PREV_WEAPON, INVENTORY, MAP, CHAT, SUICIDE};
+    private static final int LEGACY = 1000;
+    // On foot; Give up exists only where InputSet_Injured offers Suicide (FFYL).
+    private static final int[] RADIAL = {NEXT_WEAPON, SKILL, CROUCH, MELEE, INVENTORY, MAP, PREV_WEAPON, RELOAD, SUICIDE, CHAT};
+    // A vehicle seat's radial (review 4.4): Horn and Switch seat. Look back and
+    // Turret are holds: a second finger on the open radial keeps them pressed.
+    private static final int[] RADIAL_VEHICLE = {VEHICLE_HORN, SWITCH_SEATS, LOOK_BACK, DRIVER_FIRE_TURRET,
+            INVENTORY, MAP, NEXT_WEAPON, RELOAD, CHAT};
+    /** Give up acts only after its sector is held this long. */
+    private static final long CONFIRM_HOLD_MS = 1000;
+    private static final long STALE_MS = 1000;
+    /** Upper bound for skipping the startup sequence after a tap (normally well under a second). */
+    private static final long INTRO_SKIP_MS = 6000;
+    /** Upper bound for the "Loading" text after a skipped intro. */
+    private static final long STARTUP_LOADING_MS = 30000;
+    private static final int HINT_MAP = TouchPreferences.HINT_MAP, HINT_WEAPON = TouchPreferences.HINT_WEAPON,
+            HINT_GAME_MORE = TouchPreferences.HINT_GAME_MORE, HINT_MENU_MORE = TouchPreferences.HINT_MENU_MORE,
+            HINT_DEBUG_MORE = TouchPreferences.HINT_DEBUG_MORE, HINT_AUTORUN = TouchPreferences.HINT_AUTORUN,
+            HINT_MAP_NAVIGATION = TouchPreferences.HINT_MAP_NAVIGATION, HINT_LAYOUT = TouchPreferences.HINT_LAYOUT,
+            HINT_SLOTS = TouchPreferences.HINT_SLOTS, HINT_SKILL_TAP = TouchPreferences.HINT_SKILL_TAP,
+            HINT_STATUS_TAPS = TouchPreferences.HINT_STATUS_TAPS, HINT_EDITOR = TouchPreferences.HINT_EDITOR;
+    private static volatile WeakReference<NativeTouchControls> active = new WeakReference<>(null);
+    private static final class Button {
+        final int action;
+        /** The layout place it occupies: Fire's place shows Melee while the weapon is empty. */
+        final int slot;
+        final String label;
+        final RectF rect;
+        final float hitSlop;
+        Button(int action, String label, RectF rect,float hitSlop) { this(action,action,label,rect,hitSlop); }
+        Button(int action, int slot, String label, RectF rect,float hitSlop) {
+            this.action = action; this.slot = slot; this.label = label; this.rect = rect; this.hitSlop=hitSlop;
+        }
+        boolean contains(float x,float y) { return TouchLayout.circleContains(x,y,rect.centerX(),rect.centerY(),rect.width()/2,hitSlop); }
+    }
+    private final Activity activity;
+    private final boolean russian;
+    private final View surface;
+    private final TouchBridge bridge = new TouchBridge();
+    private final TouchInput input = new TouchInput(new TouchInput.Sink() {
+        public void submit(long epoch,float x,float y,float yaw,float pitch,long held) {
+            if(!fallback) { bridge.submit(epoch,x,y,yaw,pitch,held); publishLegacyKeys(0);return; }
+            legacyHeld=held;
+            publishLegacyKeys(held);
+            fallbackYaw+=yaw; fallbackPitch+=pitch;
+            LaunchControls.axes(activity,x,y,Math.max(-1,Math.min(1,fallbackYaw*.12f)),Math.max(-1,Math.min(1,fallbackPitch*.12f)));
+        }
+        public void reset() { bridge.reset(); LaunchControls.cancel(activity);legacyKeys.clear(); legacyHeld=0; fallbackYaw=fallbackPitch=0; }
+    });
+    private final TouchPreferences preferences;
+    private final TouchInput.HudGesture hudGesture = new TouchInput.HudGesture();
+    private final TouchInput.HudTaps hudTaps = new TouchInput.HudTaps();
+    private final SparseArray<RectF> hudPointers = new SparseArray<>();
+    private final RectF mapTarget = new RectF(), ammoTarget = new RectF(), useTarget = new RectF();
+    private final RectF skillTarget = new RectF(), experienceTarget = new RectF(),
+            challengeTarget = new RectF(), objectiveTarget = new RectF();
+    /** Weapon-slot cells while a hold on the ammo strip keeps them open. */
+    private float[][] slotCells;
+    private int slotSelection = -1;
+    private final SensorManager sensorManager;
+    private final Sensor aimSensor;
+    private final TouchGyro gyro = new TouchGyro();
+    private final float[] quaternion = new float[4];
+    private boolean sensorRegistered, loggedSensor;
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final RectF safe = new RectF(), viewport = new RectF();
+    private final ArrayList<Button> buttons = new ArrayList<>();
+    private final ArrayList<Button> radialButtons = new ArrayList<>();
+    private final SparseArray<Button> utilityPointers = new SparseArray<>();
+    private final int[] moveVisualBefore = new int[9], moveVisualAfter = new int[9];
+    private final SparseArray<Integer> legacyPointers = new SparseArray<>();
+    private final SparseArray<Boolean> legacyKeys = new SparseArray<>();
+    private final ArrayList<float[]> occupied = new ArrayList<>();
+    private final ArrayList<float[]> hudReserved = new ArrayList<>();
+    private final SparseArray<float[]> uiPointers = new SparseArray<>();
+    private int menuPointer = -1;
+    private int menuMorePointer = -1;
+    private Button menuMoreButton;
+    private long menuMoreStarted, menuMoreEpoch, menuExpandedUntil;
+    private final int[] screenLocation = new int[2], surfaceLocation = new int[2];
+    private Context context = Context.unknown();
+    private boolean focused, resumed = true, surfaceAlive, disposed, scheduled;
+    private boolean eligible, streamOwned, editing, expanded, linkageFailed;
+    private boolean layoutDirty = true;
+    private float layoutScale = 1;
+    private int insetL, insetT, insetR, insetB, editPointer = -1;
+    private Button editButton;
+    private float editOffsetX, editOffsetY;
+    /** Layout editor: the button panel, the armed reset and the toolbar pills. */
+    private boolean paletteOpen;
+    private long resetArmedUntil;
+    private float[][] toolRects, paletteRects;
+    private int[] toolIds;
+    /** A left-hand toggle in the editor reaches the native settings page at once. */
+    private boolean settingsPollRequested;
+    /** Give up placed on the screen acts after a one-second hold, like its sector. */
+    private int confirmPointer = -1;
+    private long confirmStarted;
+    private Button confirmButton;
+    private long lastFrame = -1, lastFrameTime;
+    private int settingsRevision, renderRestartOffered, videoOptionsAway;
+    private long lastSettingsPoll;
+    private boolean layoutEditPending, layoutChanged, inWorld;
+    private android.app.AlertDialog restartDialog;
+    /** Full-screen movie (MOVIE_*), read every frame from the player itself. */
+    private int movieState;
+    /** Other movies: a tap shows or hides "Skip movie", a tap on it skips. */
+    private boolean movieSkipShown, movieStream;
+    /** A tap on a startup movie skips the whole sequence, until this time at most. */
+    private boolean introSkipping;
+    private long introSkipUntil;
+    /** After a skipped intro the engine still loads what the logos covered: "Loading"
+     *  until the game loop publishes its first frame (mailbox frame differs). */
+    private boolean startupLoading;
+    private long startupLoadingFrame, startupLoadingUntil;
+    /** Background shader formation in the main menu: per mille, -1 hides the line. */
+    private int shaderProgress = -1;
+    private float movieDownX, movieDownY;
+    private long movieDownTime;
+    private final RectF movieSkipRect = new RectF();
+    /** Render resolution this process started with: the engine sizes its targets once. */
+    private static int sessionRenderPercent;
+    private RouteListener routeListener;
+    private boolean nativeRoute, imeVisible;
+    private boolean fallback, radialOpen, radialDragged;
+    /** RADIAL BY TAP: open after a short tap, waiting for a second tap. */
+    private boolean radialTapMode;
+    private long legacyHeld;
+    private float fallbackYaw, fallbackPitch, radialX,radialY,radialRadius,radialItemRadius,radialStartX,radialStartY;
+    private int radialPointer=-1, radialSelection=-1, radialCount=8;
+    private int[] radial=RADIAL;
+    private long radialStarted, radialSelectedAt;
+    private String hintText;
+    private long hintUntil;
+    private int hintKind;
+    private int nextLegacyId=100000, accessibilityFocus=View.NO_ID, hoverTarget=View.NO_ID;
+    /** UI pointer id of a mouse cursor's hover; no touchscreen reports it. */
+    private static final int MOUSE_HOVER_ID = 0x7FFF0000;
+    /** Camera degrees per captured mouse count at the default look sensitivity. */
+    private static final float MOUSE_DEGREES = .08f;
+    private final android.hardware.input.InputManager inputManager;
+    private android.hardware.input.InputManager.InputDeviceListener mouseListener;
+    /** A mouse is connected; without one nothing below changes focus or capture. */
+    private boolean mousePresent, mouseCapture, cursorHidden, mouseStream;
+    /**
+     * Keyboard with a mouse plays like the PC game: once a key is used while the
+     * mouse plays, the on-screen controls hide until the screen is touched. The
+     * mouse and the keys keep working; the first touch only shows the controls.
+     */
+    private boolean keyboardMouse, mouseUsed, touchSwallowed;
+    private int mouseButtons;
+    private long mouseCaptureRetry;
+    private PointerIcon hiddenCursor;
+
+    private NativeTouchControls(Activity owner, View renderSurface) {
+        super(owner);
+        activity = owner; surface = renderSurface;
+        russian = "ru".equals(GameStorage.appLanguage(owner));
+        preferences = new TouchPreferences(owner);
+        sensorManager = (SensorManager)owner.getSystemService(android.content.Context.SENSOR_SERVICE);
+        Sensor vector = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
+        aimSensor = vector != null ? vector : sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+        focused = owner.hasWindowFocus();
+        setFocusable(false);
+        setClickable(false);
+        setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
+        setOnApplyWindowInsetsListener((view, insets) -> {
+            int l = insets.getSystemWindowInsetLeft(), t = insets.getSystemWindowInsetTop();
+            int r = insets.getSystemWindowInsetRight(), b = insets.getSystemWindowInsetBottom();
+            boolean ime = false;
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets reserved = insets.getInsets(WindowInsets.Type.systemBars()
+                        | WindowInsets.Type.displayCutout() | WindowInsets.Type.mandatorySystemGestures());
+                l = reserved.left; t = reserved.top; r = reserved.right; b = reserved.bottom;
+                ime = insets.isVisible(WindowInsets.Type.ime());
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 28 && insets.getDisplayCutout() != null) {
+                l = Math.max(l, insets.getDisplayCutout().getSafeInsetLeft());
+                t = Math.max(t, insets.getDisplayCutout().getSafeInsetTop());
+                r = Math.max(r, insets.getDisplayCutout().getSafeInsetRight());
+                b = Math.max(b, insets.getDisplayCutout().getSafeInsetBottom());
+            }
+            if (l != insetL || t != insetT || r != insetR || b != insetB || ime != imeVisible) cancelInput();
+            insetL = l; insetT = t; insetR = r; insetB = b;
+            imeVisible = ime;
+            return insets;
+        });
+        if (surface instanceof SurfaceView) {
+            SurfaceHolder holder = ((SurfaceView) surface).getHolder();
+            surfaceAlive = holder.getSurface().isValid();
+            holder.addCallback(this);
+        }
+        inputManager = (android.hardware.input.InputManager)owner.getSystemService(android.content.Context.INPUT_SERVICE);
+        if (inputManager != null) {
+            mouseListener = new android.hardware.input.InputManager.InputDeviceListener() {
+                @Override public void onInputDeviceAdded(int id) { mousePresent = scanMice(); updateMouse(); }
+                @Override public void onInputDeviceRemoved(int id) { mousePresent = scanMice(); updateMouse(); }
+                @Override public void onInputDeviceChanged(int id) { mousePresent = scanMice(); updateMouse(); }
+            };
+            inputManager.registerInputDeviceListener(mouseListener, null);
+            mousePresent = scanMice();
+        }
+    }
+    public static void attach(Activity owner, View renderSurface) {
+        if (renderSurface == null) throw new IllegalArgumentException("renderSurface is required");
+        NativeTouchControls old = active.get();
+        if (old != null && old.activity == owner && old.surface == renderSurface && !old.disposed) return;
+        if (old != null) old.dispose();
+        NativeTouchControls view = new NativeTouchControls(owner, renderSurface);
+        View decor = owner.getWindow().getDecorView();
+        if (!(decor instanceof ViewGroup)) throw new IllegalStateException("Decor must be ViewGroup");
+        ((ViewGroup) decor).addView(view, new ViewGroup.LayoutParams(-1, -1));
+        active = new WeakReference<>(view);
+        view.requestApplyInsets();
+        view.schedule();
+    }
+    public static void focus(Activity owner, boolean value) {
+        NativeTouchControls view = active.get();
+        if (view == null || view.activity != owner) return;
+        view.focused = value;
+        if (!value) view.cancelInput();
+        else view.schedule();
+    }
+    /** Temporary rollout seam: hide/release the old overlay while this route owns input. */
+    public static void setRouteListener(Activity owner, RouteListener listener) {
+        NativeTouchControls view = active.get();
+        if (view == null || view.activity != owner) return;
+        view.routeListener = listener;
+        if (listener != null) listener.nativeRouteChanged(view.nativeRoute);
+    }
+    private void publishRoute(boolean owns) {
+        if (owns == nativeRoute) return;
+        nativeRoute = owns;
+        if (routeListener != null) routeListener.nativeRouteChanged(owns);
+    }
+    public static void resumed(Activity owner, boolean value) {
+        NativeTouchControls view = active.get();
+        if (view == null || view.activity != owner) return;
+        view.resumed = value;
+        // A backgrounded process may be killed without another callback.
+        if (!value) { view.cancelInput(); view.unschedule(); view.preferences.flush(); }
+        else view.schedule();
+    }
+    public static void detach(Activity owner) {
+        NativeTouchControls view = active.get();
+        if (view != null && view.activity == owner) view.dispose();
+    }
+    /**
+     * Android Back behaves like the on-screen Back (menus), Pause (play) or Skip
+     * (cinematic) button after closing this overlay's own transient UI. False
+     * leaves Back to the caller: no linked route, or a controller owns input.
+     */
+    public static boolean systemBack(Activity owner) {
+        NativeTouchControls view = active.get();
+        if (view == null || view.activity != owner || view.disposed || view.linkageFailed) return false;
+        return view.back();
+    }
+    private boolean back() {
+        if (editing && paletteOpen) { paletteOpen=false; invalidate(); return true; }
+        if (editing) { stopEditing(); return true; }
+        if (radialOpen) { closeRadial(); invalidate(); return true; }
+        if (expanded && context.menu()) { clearMenuMore(); buildButtons(); invalidate(); return true; }
+        if (context.has(PHYSICAL_OWNS_INPUT)) return false;
+        if (context.mode == CINEMATIC) {
+            int action = cinematicBackAction(context,eligible);
+            if (action < 0) return false;
+            activate(nextLegacyId++, action, 0, 0);
+            return true;
+        }
+        // Loading, text entry and stale frames swallow Back instead of closing the game.
+        if (!eligible) return true;
+        int action = context.gameplay() ? PAUSE : context.menu() ? BACK : -1;
+        if (action >= 0 && context.allows(action)) activate(nextLegacyId++, action, 0, 0);
+        return true;
+    }
+    /**
+     * Back in a cinematic skips it, else opens the pause menu. Without a routed
+     * cinematic action -1 keeps the game's own Android Back instead of eating it.
+     */
+    static int cinematicBackAction(Context c,boolean eligible) {
+        if (c.mode != CINEMATIC || !eligible || !c.usable()) return -1;
+        return c.allows(SKIP) ? SKIP : c.allows(PAUSE) ? PAUSE : -1;
+    }
+    /** Only the legacy fallback still needs virtual key X; native Use is a held action bit. */
+    static boolean legacyUse(Context c,boolean fallback,int action) {
+        return fallback && action == USE && c.gameplay();
+    }
+    private void schedule() {
+        if (!scheduled && !disposed && resumed && !linkageFailed) {
+            scheduled = true; Choreographer.getInstance().postFrameCallback(this);
+        }
+    }
+    private void unschedule() {
+        Choreographer.getInstance().removeFrameCallback(this); scheduled = false;
+    }
+    @Override public void doFrame(long frameTimeNanos) {
+        scheduled = false;
+        if (disposed || !resumed || linkageFailed) return;
+        try {
+            updateGeometry();
+            // Before the mailbox: the startup movies block the game thread that
+            // publishes it, so the overlay is not eligible while they play.
+            int nextMovie = bridge.movieState();
+            // The player stops one startup movie per request: while the sequence
+            // lasts, every following movie is stopped as soon as it opens.
+            if (introSkipping && ((nextMovie & MOVIE_STARTUP) == 0 || SystemClock.uptimeMillis() > introSkipUntil)) {
+                introSkipping = false; invalidate();
+                startupLoading = true; startupLoadingFrame = lastFrame;
+                startupLoadingUntil = SystemClock.uptimeMillis() + STARTUP_LOADING_MS;
+            }
+            if (introSkipping && (nextMovie & MOVIE_PLAYING) != 0) bridge.skipMovie();
+            if (nextMovie != movieState) {
+                boolean starts = (nextMovie & MOVIE_PLAYING) != 0 && (movieState & MOVIE_PLAYING) == 0;
+                if (starts) cancelInput();
+                if ((nextMovie & MOVIE_PLAYING) == 0 || starts) movieSkipShown = false;
+                movieState = nextMovie; invalidate();
+            }
+            Context next = bridge.snapshot();
+            long now = SystemClock.uptimeMillis();
+            if (syncSettings(next, now)) next = bridge.snapshot();
+            if (next.frame != lastFrame) { lastFrame = next.frame; lastFrameTime = now; }
+            if (startupLoading && (lastFrame != startupLoadingFrame || now > startupLoadingUntil
+                    || (movieState & MOVIE_PLAYING) != 0)) { startupLoading = false; invalidate(); }
+            boolean nextFallback=next.legacyFallback();
+            boolean nextEligible = focused && surfaceAlive && !imeVisible
+                    && (next.usable() || (nextFallback && LaunchControls.available(activity)))
+                    && (nextFallback || now - lastFrameTime < STALE_MS) && !viewport.isEmpty() && !safe.isEmpty();
+            if(fallback!=nextFallback) { cancelInput(); next=bridge.snapshot(); }
+            if (eligible && !nextEligible) {
+                cancelInput();
+                // reset advanced the epoch; never re-use the snapshot preceding it.
+                next = bridge.snapshot();
+            }
+            if (next.epoch != context.epoch) {
+                saveLayout();
+                clearMenuMore();
+                uiPointers.clear(); menuPointer = -1; editPointer = -1; editButton = null;
+                if(!next.gameplay()) { editing=false; paletteOpen=false; }
+                clearConfirm();
+                closeRadial(); utilityPointers.clear(); legacyPointers.clear();
+                hudGesture.cancel(); hudTaps.cancel(); closeSlots(); hudPointers.clear(); hintUntil = 0;
+                LaunchControls.cancel(activity);
+            }
+            fallback=nextFallback;
+            if(fallback) {
+                boolean play=next.mode==GAMEPLAY || next.mode==VEHICLE;
+                next=new Context(Math.max(1,next.epoch),play?next.mode:MENU,
+                        (play?GAMEPLAY_INPUT|RELATIVE_LOOK:UI_NAVIGATION)|(next.capabilities&PAUSE_BACKDROP),(1L<<25)-1,next.frame);
+            }
+            if (eligible != nextEligible || context.epoch != next.epoch || context.mode != next.mode
+                    || context.capabilities != next.capabilities || context.actions != next.actions
+                    || context.knownActions != next.knownActions || context.weaponCount != next.weaponCount
+                    || context.grenadeCount != next.grenadeCount || context.hudValidMask != next.hudValidMask
+                    || !Arrays.equals(context.mapRect,next.mapRect) || !Arrays.equals(context.ammoRect,next.ammoRect)
+                    || !Arrays.equals(context.objectiveRect,next.objectiveRect)
+                    || !Arrays.equals(context.useRect,next.useRect) || !Arrays.equals(context.skillRect,next.skillRect)
+                    || !Arrays.equals(context.experienceRect,next.experienceRect)
+                    || !Arrays.equals(context.challengeRect,next.challengeRect)
+                    || context.weaponSlots != next.weaponSlots) layoutDirty = true;
+            context = next; eligible = nextEligible;
+            // Main menu versus a loaded world, for the restart warning.
+            if (context.mode == FRONTEND) inWorld = false;
+            else if (context.mode == GAMEPLAY || context.mode == VEHICLE || context.mode == CINEMATIC
+                    || context.mode == DEAD) inWorld = true;
+            // Redrawn per whole percent; outside the main menu the line is hidden.
+            int nextShader = context.mode == FRONTEND ? bridge.shaderProgress() : -1;
+            boolean shaderChanged = nextShader < 0 ? shaderProgress >= 0
+                    : shaderProgress < 0 || nextShader / 10 != shaderProgress / 10;
+            if (shaderChanged) { shaderProgress = nextShader; invalidate(); }
+            if (!context.menu()) clearMenuMore();
+            if (eligible) updateMenuMore(now);
+            if (layoutEditPending && eligible && context.gameplay()) {
+                layoutEditPending = false; editing = true; paletteOpen = false; layoutDirty = true;
+                showHint("Drag buttons; × removes one, Buttons adds and fills More", "Перетаскивайте кнопки; × убирает, «Кнопки» — добавить и заполнить «Ещё»",HINT_EDITOR);
+            }
+            updateKeyboardMouse((bridge.physicalState() & PHYSICAL_KEYBOARD) != 0);
+            // Focus/IME/settings temporarily suppress gestures while retaining the
+            // native route, so an old overlay cannot appear over a modal keyboard.
+            publishRoute(true);
+            if (eligible) { input.setContext(next); input.heartbeat(); }
+            updateSensor();
+            updateMouse();
+            fallbackYaw=fallbackPitch=0;
+            if (layoutDirty) { buildButtons(); invalidate(); }
+            if ((hintKind == HINT_MAP && (!context.gameplay() || mapTarget.isEmpty() || !context.allows(MAP)))
+                    || (hintKind == HINT_WEAPON && (context.mode != GAMEPLAY || ammoTarget.isEmpty() || context.weaponCount < 2
+                    || !context.allows(NEXT_WEAPON) || !context.allows(PREV_WEAPON)))
+                    || (hintKind == HINT_MAP_NAVIGATION && !context.has(MAP_GESTURES))
+                    || ((hintKind == HINT_SLOTS || hintKind == HINT_SKILL_TAP || hintKind == HINT_STATUS_TAPS)
+                    && context.mode != GAMEPLAY)) {
+                hintKind = 0; hintUntil = 0; invalidate();
+            }
+            if (eligible && !editing) {
+                int hudAction = hudGesture.poll(now,context);
+                if (hudAction >= 0) activate(nextLegacyId++,hudAction,0,0);
+                if (hudGesture.slotHoldDue(now,context,dp(14))) openSlots();
+                if (!hudGesture.slotsOpen() && slotCells != null) { closeSlots(); invalidate(); }
+                confirmRadialHold(now);
+                confirmButtonHold(now);
+                offerHudHint(now);
+            }
+            if (editing && resetArmedUntil != 0 && now >= resetArmedUntil) { resetArmedUntil = 0; layoutDirty = true; invalidate(); }
+        } catch (UnsatisfiedLinkError error) {
+            linkageFailed = true; eligible = false; buttons.clear();
+            invalidate();
+            publishRoute(false);
+            Log.e(TAG, "Touch JNI is not linked; overlay disabled", error);
+        }
+        schedule();
+    }
+    private float dp(float value) { return value * getResources().getDisplayMetrics().density; }
+    private void updateGeometry() {
+        getLocationOnScreen(screenLocation); surface.getLocationOnScreen(surfaceLocation);
+        RectF next = new RectF(surfaceLocation[0] - screenLocation[0],
+                surfaceLocation[1] - screenLocation[1],
+                surfaceLocation[0] - screenLocation[0] + surface.getWidth(),
+                surfaceLocation[1] - screenLocation[1] + surface.getHeight());
+        if (!viewport.equals(next)) { cancelInput(); viewport.set(next); layoutDirty=true; applyRenderScale(); }
+        next.set(viewport);
+        // The whole Surface by default; SCREEN CUTOUT MARGIN restores the inset
+        // layout of earlier builds (cutout, system bars, mandatory gestures).
+        boolean inset = preferences.screenInsets;
+        if (!next.intersect(inset ? insetL : 0, inset ? insetT : 0, getWidth() - (inset ? insetR : 0),
+                getHeight() - (inset ? insetB : 0))) next.setEmpty();
+        if (!safe.equals(next)) { safe.set(next); layoutDirty=true; }
+        layoutScale=Math.min(preferences.scale,Math.max(.75f,(safe.height()/dp(1)-64)/260));
+        input.configure(getResources().getDisplayMetrics().density, 60 * preferences.scale,
+                preferences.look, preferences.ads, preferences.invertY);
+        input.autoSprint(preferences.autoSprint);
+        input.aimToggle(preferences.aimToggle);
+        input.lookAcceleration(preferences.lookAcceleration);
+    }
+    private void add(int action, String label, float fromRightDp, float fromBottomDp, float sizeDp) {
+        if (action >= 0 && action < LEGACY && !context.allows(action)) return;
+        float size = dp(Math.max(48, sizeDp * layoutScale));
+        if (safe.width() < size || safe.height() < size) return;
+        float x = safe.right - dp(fromRightDp * layoutScale);
+        float y = safe.bottom - dp(fromBottomDp * layoutScale);
+        float nx = (x - safe.left) / safe.width(), ny = (y - safe.top) / safe.height();
+        boolean custom=false;
+        // Utility commands have fixed positions and do not share gameplay saved positions.
+        if (action >= 0 && action < LEGACY && action != PAUSE && context.gameplay()) {
+            custom=customPosition(preferences,action);
+            nx = preferences.x(action, nx); ny = preferences.y(action, ny);
+        }
+        if (preferences.leftHanded && context.gameplay()) nx = 1 - nx;
+        x = Math.max(safe.left + size / 2, Math.min(safe.right - size / 2, safe.left + nx * safe.width()));
+        y = Math.max(safe.top + size / 2, Math.min(safe.bottom - size / 2, safe.top + ny * safe.height()));
+        boolean utility=action<0 || action==PAUSE || action>=LEGACY;
+        float left=safe.left, right=safe.right, top=safe.top, bottom=safe.bottom;
+        if(context.gameplay()) {
+            if(utility) bottom=top+dp(56);
+            else {
+                top+=dp(64);
+                if(preferences.leftHanded) right=safe.left+safe.width()*.65f;
+                else left=safe.right-safe.width()*.65f;
+            }
+        }
+        if(utility) size=dp(48);
+        float[] placed=TouchLayout.place(x,y,size,left,top,right,bottom,dp(4),dp(4),occupied,
+                context.gameplay() && !custom ? hudReserved : null);
+        if(placed!=null) {
+            occupied.add(placed);
+            buttons.add(new Button(action,label,new RectF(placed[0],placed[1],placed[2],placed[3]),context.gameplay()?dp(2):0));
+        }
+    }
+    static boolean customPosition(TouchPreferences preferences,int action) {
+        // Distinct fallbacks distinguish absence from an explicit position,
+        // including a saved position identical to the original default.
+        return preferences.x(action,0)==preferences.x(action,1)
+                || preferences.y(action,0)==preferences.y(action,1);
+    }
+    /**
+     * Without a native ammo bar or reload observation the button is the only
+     * route. Otherwise the native route already withholds Reload for a full or
+     * unreloadable magazine and while reloading, so the preference decides.
+     * The caller still requires the action to be allowed outside the editor.
+     */
+    static boolean reloadButtonShown(Context c,boolean ammoBar,boolean editing,boolean preference) {
+        return editing || c.mode != GAMEPLAY || !ammoBar || !c.known(RELOAD) || preference;
+    }
+    static boolean confirmedUnarmed(Context c) {
+        // A special/transient readied-count zero with an equipped weapon must
+        // keep its fallback. Native known Fire=false also proves Pawn.Weapon=null.
+        return c.mode==GAMEPLAY && c.weaponCount==0 && c.known(FIRE) && !c.allows(FIRE);
+    }
+    private void addGameplay(int action,String text) {
+        int shown = shownAction(action);
+        addGameplay(action,shown,shown == action ? text : buttonLabel(shown));
+    }
+    /** slot: the place (anchor, saved position, size); shown: what the button does there. */
+    private void addGameplay(int slot,int shown,String text) {
+        if (slot >= 0 && !editing && !context.allows(shown)) return;
+        float[] anchor = TouchLayout.gameplayAnchor(slot);
+        boolean custom = (slot >= 0 || slot == MORE) && customPosition(preferences,slot);
+        float nx = custom ? preferences.x(slot,anchor[0]) : anchor[0];
+        float ny = custom ? preferences.y(slot,anchor[1]) : anchor[1];
+        float size = TouchLayout.gameplaySize(slot,safe.height(),dp(1),layoutScale);
+        float[] placed = TouchLayout.placeGameplay(slot,nx,ny,size,safe.left,safe.top,safe.right,safe.bottom,
+                dp(1),preferences.leftHanded,custom,occupied,hudReserved);
+        if (placed != null) {
+            occupied.add(placed);
+            buttons.add(new Button(shown,slot,text,new RectF(placed[0],placed[1],placed[2],placed[3]),
+                    TouchLayout.gameplayHitSlop(shown,dp(1))));
+        }
+    }
+    /**
+     * Fire's place melees while the equipped weapon has neither a loaded round
+     * nor spare ammo (native weapon word); never in a seat, in FFYL or the editor.
+     */
+    static boolean fireShowsMelee(Context c,boolean editing) {
+        return !editing && c.mode == GAMEPLAY && c.equippedEmpty() && c.allows(MELEE);
+    }
+    private int shownAction(int slot) { return slot == FIRE && fireShowsMelee(context,editing) ? MELEE : slot; }
+    /** On foot the editor decides; a seat keeps its own fixed layout. */
+    private boolean placedOnScreen(int action) {
+        return context.mode != GAMEPLAY || preferences.placement(action) == TouchLayout.PLACE_SCREEN;
+    }
+    private static float[] hudBox(RectF target) {
+        return target.isEmpty() ? null : new float[]{target.left,target.top,target.right,target.bottom};
+    }
+    private void hudTarget(RectF target,float[] rect,boolean valid) {
+        target.setEmpty();
+        if (!valid) return;
+        float cx=viewport.left+(rect[0]+rect[2])*viewport.width()/2;
+        float cy=viewport.top+(rect[1]+rect[3])*viewport.height()/2;
+        float hw=Math.max(dp(22),(rect[2]-rect[0])*viewport.width()/2);
+        float hh=Math.max(dp(22),(rect[3]-rect[1])*viewport.height()/2);
+        target.set(cx-hw,cy-hh,cx+hw,cy+hh);
+        if (!target.intersect(safe)) target.setEmpty();
+    }
+    private void addGameplayCluster() {
+        long mask = editing ? (1L<<26)-1 : context.actions;
+        // A cluster member the editor removed leaves its place empty; the others keep theirs.
+        for (int action : new int[]{FIRE,AIM,GRENADE,JUMP}) if (!placedOnScreen(action)) mask &= ~bit(action);
+        addCluster(new int[]{FIRE,AIM,GRENADE,JUMP},new String[]{label("Fire", "Огонь"),label("Aim", "Прицел"),
+                label("Grenade", "Граната"),label("Jump", "Прыжок")},mask);
+    }
+    private String buttonLabel(int action) {
+        switch (action) {
+            case FIRE: return label("Fire", "Огонь");
+            case AIM: return label("Aim", "Прицел");
+            case GRENADE: return label("Grenade", "Граната");
+            case JUMP: return label("Jump", "Прыжок");
+            case RELOAD: return label("Reload", "Зарядить");
+            case USE: return label("Use", "Действие");
+            case PAUSE: return label("Pause", "Пауза");
+            case MORE: return label("More", "Ещё");
+            default: return radialLabel(action,russian);
+        }
+    }
+    /**
+     * A vehicle seat replaces the on-foot cluster (review 4.4): the driver keeps
+     * Fire and gets Boost and Brake in the Grenade and Jump places; a turret seat
+     * shows its Aim (held alternate fire), an attached rider its Grenade. Exit
+     * moves with the group in the Action place, away from Fire, Boost and Brake.
+     */
+    private void addSeatCluster() {
+        boolean rider=!editing && !context.allows(VEHICLE_BOOST) && context.allows(GRENADE);
+        addCluster(new int[]{FIRE,AIM,rider ? GRENADE : VEHICLE_BOOST,VEHICLE_BRAKE,EXIT_VEHICLE},
+                new String[]{label("Fire", "Огонь"),label("Aim", "Прицел"),
+                        rider ? label("Grenade", "Граната") : label("Boost", "Ускорить"),label("Brake", "Тормоз"),
+                        label("Exit", "Выйти")},
+                editing ? bit(FIRE)|bit(VEHICLE_BOOST)|bit(VEHICLE_BRAKE)|bit(EXIT_VEHICLE) : context.actions);
+    }
+    private void addCluster(int[] actions,String[] labels,long mask) {
+        boolean custom=false;for(int action:actions) custom |= customPosition(preferences,action);
+        float[][] group=custom ? null : TouchLayout.gameplayCluster(safe.left,safe.top,safe.right,safe.bottom,
+                dp(1),layoutScale,preferences.leftHanded,actions,mask,occupied,hudReserved);
+        if (group == null) {
+            for(int i=0;i<actions.length;++i) if ((mask & bit(actions[i])) != 0) addGameplay(actions[i],labels[i]);
+            return;
+        }
+        for(int i=0;i<actions.length;++i) if(group[i]!=null) {
+            occupied.add(group[i]);
+            int shown=shownAction(actions[i]);
+            buttons.add(new Button(shown,actions[i],shown==actions[i] ? labels[i] : buttonLabel(shown),
+                    new RectF(group[i][0],group[i][1],group[i][2],group[i][3]),dp(2)));
+        }
+    }
+    private void buildButtons() {
+        layoutDirty=false; buttons.clear(); occupied.clear(); hudReserved.clear();
+        hudTarget(mapTarget,context.mapRect,context.hudMap());
+        hudTarget(ammoTarget,context.ammoRect,context.hudAmmo());
+        hudTarget(useTarget,context.useRect,context.hudUse() && context.known(USE) && context.allows(USE));
+        hudTarget(skillTarget,context.skillRect,context.hudSkill());
+        hudTarget(experienceTarget,context.experienceRect,context.hudExperience());
+        hudTarget(challengeTarget,context.challengeRect,context.hudChallenge());
+        hudTarget(objectiveTarget,context.objectiveRect,context.hudObjectives());
+        if (!eligible || keyboardMouse) return;
+        if (context.gameplay()) {
+            // HUD follows the full Surface; insets and left-hand mode affect
+            // controls only. Never rewrite a player's deliberately saved layout.
+            TouchLayout.reserveGameplayHud(viewport.left,viewport.top,viewport.right,viewport.bottom,hudReserved,
+                    !ammoTarget.isEmpty() || confirmedUnarmed(context),context.hudObjectivesKnown() && context.hudMap());
+            if (context.hudObjectives()) TouchLayout.reserveSurfaceRect(context.objectiveRect,
+                    viewport.left,viewport.top,viewport.right,viewport.bottom,hudReserved);
+            // The Action caption comes and goes with the aimed object, as does a
+            // challenge notice. They stay tappable but never displace controls.
+            for (RectF rect : new RectF[]{mapTarget,ammoTarget,skillTarget,experienceTarget}) if (!rect.isEmpty())
+                hudReserved.add(new float[]{rect.left,rect.top,rect.right,rect.bottom});
+            boolean seat=context.mode == VEHICLE;
+            // The layout editor places every on-foot control: on the screen, in
+            // More or nowhere. Pause may go (system Back pauses); a seat keeps More
+            // because its radial holds Horn, Switch seat, Look back and Turret.
+            if (preferences.placement(PAUSE) == TouchLayout.PLACE_SCREEN) addGameplay(PAUSE,label("Pause", "Пауза"));
+            if (seat || preferences.placement(MORE) == TouchLayout.PLACE_SCREEN) addGameplay(MORE,label("More", "Ещё"));
+            if (seat) addSeatCluster();
+            else addGameplayCluster();
+            // A seat shows Reload only where the engine offers it (an attached
+            // rider's own weapon); its layout editor never adds on-foot buttons.
+            if ((!seat || !editing) && placedOnScreen(RELOAD)
+                    && reloadButtonShown(context,!ammoTarget.isEmpty(),editing,preferences.reloadButton))
+                addGameplay(RELOAD,label("Reload", "Зарядить"));
+            // A seat's Exit is in its cluster; Horn and Switch seat are in the radial.
+            if (!seat) {
+                if (placedOnScreen(USE)) addGameplay(USE,label("Use", "Действие"));
+                for (int action : OPTIONAL) if (placedOnScreen(action)) addGameplay(action,buttonLabel(action));
+            }
+            if (editing) buildEditor();
+        } else if (context.mode == CINEMATIC && context.has(CAN_SKIP)) {
+            // The cinematic replaces the cluster: Pause where it always is,
+            // Skip only while the original SkipCinematic is available.
+            if (preferences.placement(PAUSE) == TouchLayout.PLACE_SCREEN) addGameplay(PAUSE,label("Pause", "Пауза"));
+            add(SKIP, label("Skip", "Пропуск"), 48, 40, 64);
+        } else if (context.menu()) {
+            add(BACK, label("Back", "Назад"), 36, 36, 56);
+            float size=dp(44), x=context.has(DEBUG_CANVAS) ? safe.left+safe.width()*.28f : safe.left+dp(26);
+            // Keep the Debug footer caption below the full button plus a 4dp gap.
+            float y=context.has(DEBUG_CANVAS) ? safe.bottom-dp(36+44+4) : safe.top+size/2;
+            float[] placed=TouchLayout.place(x,y,size,safe.left,safe.top,safe.right,safe.bottom,dp(4),dp(4),occupied);
+            if (placed!=null) {
+                occupied.add(placed);
+                buttons.add(new Button(MORE,label("More", "Ещё"),new RectF(placed[0],placed[1],placed[2],placed[3]),0));
+            }
+            add(CONFIRM,label("Select", "Выбрать"),110,36,56);
+            if (expanded && context.has(UI_NAVIGATION)) {
+                int[] commands=menuCommands(context,fallback,touchExploration());
+                for (int i=0;i<commands.length;i++) {
+                    float[] at=menuCommandPlace(commands,i);
+                    add(commands[i],menuCommandLabel(commands[i]),at[0],at[1],48);
+                }
+            }
+        }
+        if(radialOpen) buildRadial();
+    }
+    /**
+     * More-panel keys in a menu: only what no gesture expresses. A drag scrolls
+     * lists and a sideways swipe changes tabs (native; the fallback swipes the
+     * D-pad), so X/Y stay (Debug: X/Y/R/L) plus the fallback's shoulder keys.
+     * TalkBack consumes swipes, so with touch exploration every key stays.
+     */
+    static int[] menuCommands(Context c,boolean fallback,boolean touchExploration) {
+        if (c.has(DEBUG_CANVAS)) return touchExploration
+                ? new int[]{UI_UP,UI_DOWN,UI_LEFT,UI_RIGHT,RELOAD,NEXT_WEAPON,SKILL,SPRINT,PREV_WEAPON,INVENTORY}
+                : new int[]{RELOAD,NEXT_WEAPON,SKILL,SPRINT};
+        if (fallback) return touchExploration
+                ? new int[]{UI_UP,UI_DOWN,UI_LEFT,UI_RIGHT,LEGACY+99,LEGACY+100,LEGACY+102,LEGACY+103}
+                : new int[]{LEGACY+99,LEGACY+100,LEGACY+102,LEGACY+103};
+        return touchExploration
+                ? new int[]{UI_UP,UI_DOWN,UI_LEFT,UI_RIGHT,UI_ACTION,UI_OTHER,UI_PREVIOUS_TAB,UI_NEXT_TAB}
+                : new int[]{UI_ACTION,UI_OTHER};
+    }
+    /** dp from the right and bottom edges: two columns beside Select, or the full TalkBack panel. */
+    static float[] menuCommandPlace(int[] commands,int index) {
+        if (commands.length == 0 || commands[0] != UI_UP) return new float[]{176+60*(index/2),36+60*(index%2)};
+        switch (commands[index]) {
+            case UI_UP: return new float[]{176,96};
+            case UI_DOWN: return new float[]{176,36};
+            case UI_LEFT: return new float[]{236,36};
+            case UI_RIGHT: return new float[]{116,36};
+            case PREV_WEAPON: return new float[]{236,156};
+            case INVENTORY: return new float[]{176,156};
+            default: return new float[]{300+60*((index-4)/2),36+60*((index-4)%2)};
+        }
+    }
+    private String menuCommandLabel(int action) {
+        switch (action) {
+            case UI_UP: return label("Up", "Вверх");
+            case UI_DOWN: return label("Down", "Вниз");
+            case UI_LEFT: return label("Left", "Влево");
+            case UI_RIGHT: return label("Right", "Вправо");
+            case RELOAD: return label("Action X", "Действие X");
+            case NEXT_WEAPON: return label("Action Y", "Действие Y");
+            case SKILL: return label("Action R", "Действие R");
+            case SPRINT: return label("Action L", "Действие L");
+            case UI_ACTION: case LEGACY+99: return label("Action", "Действие");
+            case UI_OTHER: case LEGACY+100: return label("Other", "Другое");
+            case PREV_WEAPON: case UI_PREVIOUS_TAB: case LEGACY+102: return label("Tab −", "Вкладка −");
+            default: return label("Tab +", "Вкладка +");
+        }
+    }
+    private boolean touchExploration() {
+        AccessibilityManager manager=(AccessibilityManager)activity.getSystemService(android.content.Context.ACCESSIBILITY_SERVICE);
+        return manager != null && manager.isTouchExplorationEnabled();
+    }
+    private void buildRadial() {
+        radialButtons.clear();
+        for(int i=0;i<radialCount;i++) {
+            int a=radial[i];
+            if (!radialAvailable(a)) continue;
+            double angle=i*Math.PI*2/radialCount-Math.PI/2;
+            float x=radialX+(float)Math.cos(angle)*radialRadius,y=radialY+(float)Math.sin(angle)*radialRadius,s=radialItemRadius;
+            radialButtons.add(new Button(a,radialLabel(a,russian),new RectF(x-s,y-s,x+s,y+s),dp(2)));
+        }
+    }
+    private boolean radialAvailable(int action) { return radialAvailable(context,fallback,action); }
+    static boolean radialAvailable(Context context,boolean fallback,int action) {
+        return context.allows(action) && !(fallback && action == PREV_WEAPON)
+                && !(action == CHAT && (fallback || !context.gameplay()))
+                && !(context.weaponCount >= 0 && context.weaponCount < 2 && (action == NEXT_WEAPON || action == PREV_WEAPON));
+    }
+    static int[] radialActions(Context context) { return context.mode == VEHICLE ? RADIAL_VEHICLE : RADIAL; }
+    /** More on foot: the editor's items, plus Reload kept on the screen as the radial's fallback. */
+    static int[] footRadial(TouchPreferences preferences) {
+        int[] items=new int[TouchLayout.RADIAL_ORDER.length];
+        int count=0;
+        for (int action:TouchLayout.RADIAL_ORDER) {
+            int place=preferences.placement(action);
+            if (place == TouchLayout.PLACE_MORE || (action == RELOAD && place == TouchLayout.PLACE_SCREEN)) items[count++]=action;
+        }
+        return Arrays.copyOf(items,count);
+    }
+    /**
+     * The radial adapts to the ways that already work (review section 5): no
+     * unavailable item, no Map while the minimap tap opens it, no Reload while
+     * its button or the ammo strip reloads; seat items exist only in a seat and
+     * Give up only where FFYL offers it. Fewer sectors make larger targets.
+     */
+    static int[] radialItems(Context context,boolean fallback,boolean mapTap,boolean reloadElsewhere) {
+        return radialItems(context,fallback,mapTap,reloadElsewhere,RADIAL);
+    }
+    /** footItems: More's content on foot from the layout editor; a seat keeps its own items. */
+    static int[] radialItems(Context context,boolean fallback,boolean mapTap,boolean reloadElsewhere,int[] footItems) {
+        int[] base=context.mode == VEHICLE ? RADIAL_VEHICLE : footItems,items=new int[base.length];
+        int count=0;
+        if (!context.usable()) return new int[0];
+        for (int action:base) {
+            if (!radialAvailable(context,fallback,action) || (action == MAP && mapTap)
+                    || (action == RELOAD && reloadElsewhere)) continue;
+            items[count++]=action;
+        }
+        return Arrays.copyOf(items,count);
+    }
+    static String radialLabel(int action,boolean ru) {
+        switch (action) {
+            case NEXT_WEAPON: return ru ? "Оружие" : "Weapon";
+            case SKILL: return ru ? "Навык" : "Skill";
+            case CROUCH: return ru ? "Присесть" : "Crouch";
+            case MELEE: return ru ? "Удар" : "Melee";
+            case INVENTORY: return ru ? "Рюкзак" : "Inventory";
+            case MAP: return ru ? "Карта" : "Map";
+            case PREV_WEAPON: return ru ? "Предыдущее" : "Previous";
+            case RELOAD: return ru ? "Зарядить" : "Reload";
+            case SUICIDE: return ru ? "Сдаться" : "Give up";
+            case CHAT: return ru ? "Чат" : "Chat";
+            case VEHICLE_HORN: return ru ? "Сигнал" : "Horn";
+            case SWITCH_SEATS: return ru ? "Пересесть" : "Switch seat";
+            case LOOK_BACK: return ru ? "Оглянуться" : "Look back";
+            case DRIVER_FIRE_TURRET: return ru ? "Турель" : "Turret";
+            default: return "";
+        }
+    }
+    /** Radial items a second finger holds like a button (Turret fire, Look back). */
+    static boolean radialHold(int action) { return action == LOOK_BACK || action == DRIVER_FIRE_TURRET; }
+    /** Radial items that act only after their sector is held (Give up). */
+    static boolean radialConfirm(int action) { return action == SUICIDE; }
+    /** Item radius: 25dp at nine sectors, growing as fewer share the ring, up to 32dp. */
+    static float radialItemRadius(float ringRadius,int count,float density) {
+        float spacing=(float)(Math.PI*ringRadius/Math.max(1,count))-4*density;
+        return Math.max(25*density,Math.min(32*density,spacing));
+    }
+    private void openRadial(int id,float x,float y) {
+        // Capture the items once: a live availability change must not rotate
+        // the other sectors underneath an already held finger.
+        boolean mapTap=!fallback && !mapTarget.isEmpty() && context.allows(MAP);
+        boolean ammoBar=!ammoTarget.isEmpty();
+        // Reload put into More stays there; on the screen it is the radial's
+        // fallback only while neither its button nor the ammo strip reloads.
+        boolean reloadElsewhere=preferences.placement(RELOAD) == TouchLayout.PLACE_SCREEN
+                && (reloadButtonShown(context,ammoBar,false,preferences.reloadButton)
+                || (!fallback && context.mode == GAMEPLAY && ammoBar && context.known(RELOAD)));
+        int[] foot=footRadial(preferences);
+        int[] items=radialItems(context,fallback,mapTap,reloadElsewhere,foot);
+        if (items.length == 0) {
+            if (context.mode == GAMEPLAY && preferences.moreItemCount() == 0)
+                showHint("More is empty: add buttons in the layout editor", "«Ещё» пусто: добавьте кнопки в редакторе раскладки",0);
+            return;
+        }
+        radialOpen=true; radialPointer=id; radialSelection=-1; radialDragged=false; radialSelectedAt=0;
+        radialStartX=x; radialStartY=y; radialStarted=SystemClock.uptimeMillis();
+        radial=items; radialCount=items.length;
+        radialRadius=Math.min(dp(94),Math.min(safe.width(),safe.height())/2-dp(30));
+        radialItemRadius=radialItemRadius(radialRadius,radialCount,dp(1));
+        float margin=radialRadius+radialItemRadius+dp(2);
+        radialX=Math.max(safe.left+margin,Math.min(safe.right-margin,x));
+        radialY=Math.max(safe.top+margin,Math.min(safe.bottom-margin,y));
+        buildRadial(); haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+    }
+    private void closeRadial() { radialOpen=false;radialTapMode=false;radialPointer=-1;radialSelection=-1;radialSelectedAt=0;radialButtons.clear(); }
+    /** Menu buttons the editor can put on the screen act on a tap, never as a hold. */
+    static boolean tapButton(int action) { return action == INVENTORY || action == MAP || action == CHAT; }
+    private void clearConfirm() { confirmPointer=-1; confirmButton=null; confirmStarted=0; }
+    /** Give up on its own button acts once its finger has stayed for a second. */
+    private void confirmButtonHold(long now) {
+        if (confirmPointer < 0 || confirmButton == null) return;
+        if (utilityPointers.get(confirmPointer) != confirmButton) { clearConfirm(); invalidate(); return; }
+        if (now-confirmStarted < CONFIRM_HOLD_MS) { invalidate(); return; }
+        clearConfirm();
+        if (context.allows(SUICIDE)) activate(nextLegacyId++,SUICIDE,0,0);
+        haptic(HapticFeedbackConstants.LONG_PRESS);
+        invalidate();
+    }
+    /** Give up acts once the finger has stayed on its sector for a second. */
+    private void confirmRadialHold(long now) {
+        if (!radialOpen || radialPointer<0 || radialSelection<0 || radialSelectedAt==0
+                || !radialConfirm(radial[radialSelection])) return;
+        if (now-radialSelectedAt < CONFIRM_HOLD_MS) { invalidate(); return; }
+        int action=radial[radialSelection];
+        closeRadial();
+        if (radialAvailable(action)) activate(nextLegacyId++,action,0,0);
+        haptic(HapticFeedbackConstants.LONG_PRESS);
+        invalidate();
+    }
+    private void openSlots() {
+        slotCells=TouchLayout.slotCells(new float[]{ammoTarget.left,ammoTarget.top,ammoTarget.right,ammoTarget.bottom},
+                safe.left,safe.top,safe.right,safe.bottom,dp(1));
+        slotSelection=-1;
+        if (slotCells == null) { hudGesture.cancel(); return; }
+        haptic(HapticFeedbackConstants.LONG_PRESS);
+        invalidate();
+    }
+    private void closeSlots() { slotCells=null; slotSelection=-1; }
+    static String slotTypeLabel(int type,boolean ru) {
+        switch (type) {
+            case 1: return ru ? "Пистолет" : "Pistol";
+            case 2: return ru ? "Дробовик" : "Shotgun";
+            case 3: return ru ? "ПП" : "SMG";
+            case 4: return ru ? "Снайперская" : "Sniper";
+            case 5: return ru ? "Штурмовая" : "Rifle";
+            case 6: return ru ? "РПГ" : "Launcher";
+            default: return "";
+        }
+    }
+    private void clearMenuMoreHold() { menuMorePointer=-1;menuMoreButton=null;menuMoreStarted=menuMoreEpoch=0; }
+    private void clearMenuMore() { clearMenuMoreHold();expanded=false;menuExpandedUntil=0; }
+    private void openMenuCommands(long now) {
+        expanded=true;menuExpandedUntil=now+6000;menuMoreStarted=0;
+        buildButtons();invalidate();
+    }
+    private void updateMenuMore(long now) {
+        // No delayed callback: the exact captured Button and epoch bind the hold
+        // to its pointer sequence, even when Android later reuses that pointer ID.
+        if (menuMorePointer>=0 && menuMoreStarted>0 && menuMoreEpoch==context.epoch
+                && menuPointer==menuMorePointer && utilityPointers.get(menuMorePointer)==menuMoreButton
+                && now-menuMoreStarted>=300) {
+            openMenuCommands(now);haptic(HapticFeedbackConstants.LONG_PRESS);
+        }
+        if (expanded && now>=menuExpandedUntil && menuPointer<0) {
+            expanded=false;menuExpandedUntil=0;layoutDirty=true;invalidate();
+        }
+    }
+    private void menuMoreHint() {
+        if (context.has(MAP_GESTURES)) showHint("Drag the map, pinch to zoom. Waypoint marks the centre; hold a place to mark it",
+                "Двигайте карту, щипок — масштаб. «Маршрутная точка» — метка в центре, удержание — под пальцем",HINT_MAP_NAVIGATION);
+        else if (context.has(DEBUG_CANVAS)) showHint("Tap rows; swipe lists and tabs. Hold More for actions", "Тапы — выбор; свайпы — списки и вкладки. Удерживайте «Ещё» для действий",HINT_DEBUG_MORE);
+        else showHint("Tap to select, tap again to change. Drag lists, swipe sideways for tabs; hold More for actions",
+                "Тап — выбор, повторный — изменение. Ведите по списку, свайп вбок — вкладки; удерживайте «Ещё» для действий",HINT_MENU_MORE);
+    }
+    private Button hit(float x, float y) {
+        if(radialOpen) for(Button b:radialButtons) if(b.contains(x,y)) return b;
+        // Visible neighbours win before the enlarged Action target's outer ring.
+        for (int i = buttons.size()-1; i >= 0; --i) {
+            Button b=buttons.get(i);
+            if(TouchLayout.circleContains(x,y,b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,
+                    b.action==USE?dp(2):b.hitSlop)) return b;
+        }
+        if(safe.contains(x,y)) for(Button b:buttons) if(b.action==USE && b.contains(x,y)) return b;
+        return null;
+    }
+    private void showHint(String english,String ru,int kind) {
+        if (preferences.hintSeen(kind)) return;
+        hintText=label(english,ru); hintKind=kind; hintUntil=SystemClock.uptimeMillis()+4500;
+        invalidate(); postInvalidateDelayed(4500);
+    }
+    private void moreHint() { showHint("Crouch, melee, inventory: hold More and drag", "Присесть, удар, рюкзак: удерживайте «Ещё» и сдвиньте палец",HINT_GAME_MORE); }
+    private void offerHudHint(long now) {
+        if (!context.gameplay() || fallback || radialOpen || keyboardMouse || now < hintUntil) return;
+        if (!preferences.mapTapHintSeen && !mapTarget.isEmpty() && context.allows(MAP))
+            showHint("Tap the minimap to open the map", "Тап по мини-карте открывает карту",HINT_MAP);
+        else if (!preferences.weaponGestureHintSeen && context.mode == GAMEPLAY && context.weaponCount >= 2 && !ammoTarget.isEmpty()
+                && context.allows(NEXT_WEAPON) && context.allows(PREV_WEAPON))
+            showHint("Ammo: swipe to switch; double-tap returns after a switch", "Патроны: свайп — смена; двойной тап — возврат после смены",HINT_WEAPON);
+        else if (!preferences.weaponSlotsHintSeen && preferences.weaponGestureHintSeen && context.mode == GAMEPLAY
+                && context.weaponCount >= 2 && !ammoTarget.isEmpty() && context.slotsKnown())
+            showHint("Hold the ammo strip to pick a weapon slot", "Удерживайте полосу патронов, чтобы выбрать слот оружия",HINT_SLOTS);
+        else if (!preferences.skillTapHintSeen && context.mode == GAMEPLAY && !skillTarget.isEmpty() && context.allows(SKILL))
+            showHint("Tap the skill icon to use your action skill", "Тап по значку навыка применяет навык",HINT_SKILL_TAP);
+        else if (!preferences.statusTapsHintSeen && context.mode == GAMEPLAY && !objectiveTarget.isEmpty()
+                && !experienceTarget.isEmpty() && context.allows(LOGS) && context.allows(SKILLS))
+            showHint("Tap the missions for the log, the XP bar for skills", "Тап по заданиям — журнал, по полосе опыта — навыки",HINT_STATUS_TAPS);
+    }
+    private void drawSlots(Canvas canvas) {
+        if (slotCells == null || !hudGesture.slotsOpen()) return;
+        paint.setTextAlign(Paint.Align.CENTER);
+        for (int i=0;i<slotCells.length;++i) {
+            float[] c=slotCells[i];
+            boolean selectable=TouchInput.HudGesture.slotSelectable(context,i);
+            boolean equipped=context.equippedSlot()==i+1, chosen=i==slotSelection && selectable;
+            boolean empty=context.slotsKnown() && !context.slotOccupied(i);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(chosen ? 0xFFFFD569 : Color.BLACK);
+            paint.setAlpha(chosen ? 255 : empty ? 120 : 210);
+            canvas.drawRoundRect(c[0],c[1],c[2],c[3],dp(10),dp(10),paint);
+            if (equipped) {
+                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(dp(2)); paint.setColor(0xFFFFD569); paint.setAlpha(255);
+                canvas.drawRoundRect(c[0],c[1],c[2],c[3],dp(10),dp(10),paint);
+                paint.setStyle(Paint.Style.FILL);
+            }
+            int ink=chosen ? Color.BLACK : Color.WHITE, alpha=selectable || equipped ? 255 : 110;
+            paint.setColor(ink); paint.setAlpha(alpha); paint.setTextSize(dp(18));
+            float cx=(c[0]+c[2])/2;
+            canvas.drawText(Integer.toString(i+1),cx,c[1]+dp(24),paint);
+            String type=empty ? "—" : slotTypeLabel(context.slotType(i),russian);
+            if (!type.isEmpty()) {
+                paint.setTextSize(dp(10));
+                float measured=paint.measureText(type),available=c[2]-c[0]-dp(6);
+                if (measured > available) paint.setTextSize(dp(10)*available/measured);
+                canvas.drawText(type,cx,c[3]-dp(10),paint);
+            }
+        }
+    }
+    private void drawHint(Canvas canvas) {
+        if (hintText == null || SystemClock.uptimeMillis() >= hintUntil) return;
+        paint.setTextSize(dp(14)); paint.setTextAlign(Paint.Align.CENTER); paint.setStyle(Paint.Style.FILL);
+        // In the layout editor the pill goes below its toolbar.
+        float cy=editing && toolRects != null && toolRects.length > 0 ? toolRects[0][3]+dp(30) : safe.top+dp(74);
+        // The pill shifts or narrows to stay off the minimap, objectives and challenge notice.
+        float[] span=TouchLayout.hintSpan(safe.centerX(),paint.measureText(hintText)+dp(24),safe.left+dp(16),safe.right-dp(16),
+                cy-dp(18),cy+dp(18),dp(8),hudBox(mapTarget),hudBox(objectiveTarget),hudBox(challengeTarget));
+        if (span == null || span[1]-span[0] <= dp(48)) return; // Unseen: offered again later.
+        float measured=paint.measureText(hintText);
+        if (measured > span[1]-span[0]-dp(24)) paint.setTextSize(dp(14)*(span[1]-span[0]-dp(24))/measured);
+        float cx=(span[0]+span[1])/2;
+        paint.setColor(Color.BLACK); paint.setAlpha(210);
+        canvas.drawRoundRect(span[0],cy-dp(18),span[1],cy+dp(18),dp(10),dp(10),paint);
+        paint.setColor(Color.WHITE); paint.setAlpha(255);
+        canvas.drawText(hintText,cx,cy-(paint.ascent()+paint.descent())/2,paint);
+        if (hintKind > 0 && !preferences.hintSeen(hintKind)) preferences.markHintSeen(hintKind);
+    }
+    @Override protected void onDraw(Canvas canvas) {
+        if (introSkipping) { canvas.drawColor(Color.BLACK); return; } // no flash of the skipped logos
+        if ((movieState & MOVIE_PLAYING) != 0) { drawMovieSkip(canvas); return; }
+        if (startupLoading) {
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setAlpha(200);
+            paint.setTextSize(dp(16)); paint.setTextAlign(Paint.Align.CENTER);
+            canvas.drawText(label("Loading…", "Загрузка…"), getWidth() / 2f, getHeight() / 2f + dp(6), paint);
+            return;
+        }
+        if (!eligible || keyboardMouse) return;
+        canvas.save(); canvas.clipRect(safe);
+        if (input.moving()) {
+            boolean running=(input.held()&bit(SPRINT))!=0;
+            paint.setColor(running ? 0xFFFFD569 : Color.WHITE); paint.setAlpha(90); paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(2));
+            canvas.drawCircle(input.stickX(), input.stickY(), dp(60*preferences.scale), paint);
+            paint.setStyle(Paint.Style.FILL); paint.setAlpha(110);
+            canvas.drawCircle(input.stickX()+input.moveX()*dp(48*preferences.scale),
+                    input.stickY()-input.moveY()*dp(48*preferences.scale), dp(18), paint);
+            if (running) {
+                paint.setAlpha(255); paint.setTextSize(dp(12)); paint.setTextAlign(Paint.Align.CENTER);
+                canvas.drawText(label("RUN", "БЕГ"),input.stickX(),input.stickY()+dp(5),paint);
+            }
+        }
+        for (Button b : buttons) {
+            boolean held = b.action >= 0 && b.action<LEGACY && ((input.held() & bit(b.action)) != 0
+                    || (b.slot >= 0 && b.slot != b.action && (input.held() & bit(b.slot)) != 0)
+                    || (b.action==USE && legacyKeys.get(99)!=null) || b == confirmButton);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.BLACK);
+            paint.setAlpha((int)(255*(held || editing ? .72f : preferences.opacity)));
+            canvas.drawCircle(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,paint);
+            drawLabel(canvas,b,held ? 0xFFFFD569 : Color.WHITE,held || editing ? 255 : 180);
+            if (b == confirmButton && confirmStarted > 0) {
+                // Give up fills a ring while it is held; lifting early cancels.
+                float progress=Math.min(1f,(SystemClock.uptimeMillis()-confirmStarted)/(float)CONFIRM_HOLD_MS);
+                paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(dp(3));paint.setColor(0xFFE0483A);paint.setAlpha(255);
+                RectF ring=new RectF(b.rect);ring.inset(-dp(3),-dp(3));
+                canvas.drawArc(ring,-90,360*progress,false,paint);
+                paint.setStyle(Paint.Style.FILL);
+            }
+        }
+        if (editing) drawEditorBadges(canvas);
+        if(radialOpen) {
+            paint.setStyle(Paint.Style.FILL);paint.setColor(0xE6222830);paint.setAlpha(235);
+            canvas.drawCircle(radialX,radialY,radialRadius+radialItemRadius+dp(4),paint);
+            String chosen=null;
+            for(Button b:radialButtons) {
+                boolean selected=radialSelection>=0 && radial[radialSelection]==b.action;
+                if (selected) chosen=b.label;
+                paint.setColor(selected?0xFFFFD569:0xFF454F5D);canvas.drawCircle(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,paint);
+                if (selected && radialConfirm(b.action) && radialSelectedAt>0) {
+                    // Give up fills a ring while it is held; lifting early cancels.
+                    float progress=Math.min(1f,(SystemClock.uptimeMillis()-radialSelectedAt)/(float)CONFIRM_HOLD_MS);
+                    paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(dp(3));paint.setColor(0xFFE0483A);
+                    RectF ring=new RectF(b.rect);ring.inset(-dp(3),-dp(3));
+                    canvas.drawArc(ring,-90,360*progress,false,paint);
+                    paint.setStyle(Paint.Style.FILL);
+                }
+                drawLabel(canvas,b,selected?Color.BLACK:Color.WHITE,255);
+            }
+            paint.setStyle(Paint.Style.FILL);paint.setColor(Color.WHITE);paint.setAlpha(255);
+            paint.setTextAlign(Paint.Align.CENTER);
+            if (chosen != null && preferences.buttonIcons) {
+                // Icons name nothing by themselves: the centre names the chosen sector.
+                paint.setTextSize(dp(12));
+                float measured=paint.measureText(chosen),available=radialRadius*2-radialItemRadius*2-dp(8);
+                if (available > 0 && measured > available) paint.setTextSize(dp(12)*available/measured);
+                canvas.drawText(chosen,radialX,radialY+dp(4),paint);
+            } else {
+                paint.setTextSize(dp(10));
+                canvas.drawText(label("Choose", "Выберите"),radialX,radialY-dp(3),paint);
+                canvas.drawText(label("action", "действие"),radialX,radialY+dp(12),paint);
+            }
+        }
+        drawSlots(canvas);
+        if (editing) drawEditorPanels(canvas);
+        drawHint(canvas);
+        drawShaderProgress(canvas);
+        canvas.restore();
+    }
+    /** A button's vector icon (BUTTON ICONS), or its caption fitted inside the circle. */
+    private void drawLabel(Canvas canvas,Button b,int color,int alpha) {
+        if (preferences.buttonIcons && TouchIcons.draw(canvas,paint,b.action,b.rect.centerX(),b.rect.centerY(),
+                Math.min(dp(30),b.rect.width()*.5f),color,alpha)) return;
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(color); paint.setAlpha(alpha);
+        paint.setTextSize(dp(10)); paint.setTextAlign(Paint.Align.CENTER);
+        float measured=paint.measureText(b.label),available=b.rect.width()-dp(8);
+        if (measured > available) paint.setTextSize(dp(10)*available/measured);
+        canvas.drawText(b.label, b.rect.centerX(), b.rect.centerY()+dp(4), paint);
+    }
+    /** Remove badges on the buttons, and More's item count while it cannot go. */
+    private void drawEditorBadges(Canvas canvas) {
+        if (paletteOpen || context.mode != GAMEPLAY) return;
+        for (Button b : buttons) {
+            boolean removable=editorRemovable(b);
+            boolean count=b.slot == MORE && !removable;
+            if (!removable && !count) continue;
+            float[] badge=TouchLayout.removeBadge(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,dp(1));
+            paint.setStyle(Paint.Style.FILL); paint.setColor(removable ? 0xFFE0483A : 0xFF454F5D); paint.setAlpha(255);
+            canvas.drawCircle(badge[0],badge[1],badge[2],paint);
+            paint.setColor(Color.WHITE);
+            if (removable) {
+                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(dp(2)); paint.setStrokeCap(Paint.Cap.ROUND);
+                float d=badge[2]*.42f;
+                canvas.drawLine(badge[0]-d,badge[1]-d,badge[0]+d,badge[1]+d,paint);
+                canvas.drawLine(badge[0]-d,badge[1]+d,badge[0]+d,badge[1]-d,paint);
+                paint.setStyle(Paint.Style.FILL);
+            } else {
+                paint.setTextSize(dp(11)); paint.setTextAlign(Paint.Align.CENTER);
+                canvas.drawText(Integer.toString(preferences.moreItemCount()),badge[0],badge[1]+dp(4),paint);
+            }
+        }
+    }
+    private void drawPill(Canvas canvas,float[] r,String text,boolean active,boolean enabled) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(active ? 0xFFFFD569 : Color.BLACK); paint.setAlpha(active ? 255 : enabled ? 200 : 110);
+        canvas.drawRoundRect(r[0],r[1],r[2],r[3],(r[3]-r[1])/2,(r[3]-r[1])/2,paint);
+        paint.setColor(active ? Color.BLACK : Color.WHITE); paint.setAlpha(enabled ? 255 : 110);
+        paint.setTextAlign(Paint.Align.CENTER);
+        float size=Math.min(dp(13),(r[3]-r[1])*.42f);
+        paint.setTextSize(size);
+        float measured=paint.measureText(text),available=r[2]-r[0]-dp(8);
+        if (measured > available) paint.setTextSize(size*available/measured);
+        canvas.drawText(text,(r[0]+r[2])/2,(r[1]+r[3])/2-(paint.ascent()+paint.descent())/2,paint);
+    }
+    /** The toolbar and, while open, the button panel over the dimmed layout. */
+    private void drawEditorPanels(Canvas canvas) {
+        if (toolRects != null && toolIds != null && !paletteOpen)
+            for (int i=0;i<toolRects.length;++i) {
+                int tool=toolIds[i];
+                boolean active=tool == DONE || (tool == TOOL_LEFT && preferences.leftHanded)
+                        || (tool == TOOL_RESET && SystemClock.uptimeMillis() < resetArmedUntil);
+                drawPill(canvas,toolRects[i],toolLabel(tool),active,true);
+            }
+        float[][] r=paletteRects;
+        if (!paletteOpen || r == null) return;
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Color.BLACK); paint.setAlpha(140);
+        canvas.drawRect(safe,paint);
+        paint.setColor(0xF0222830); paint.setAlpha(245);
+        canvas.drawRoundRect(r[0][0],r[0][1],r[0][2],r[0][3],dp(14),dp(14),paint);
+        paint.setColor(Color.WHITE); paint.setAlpha(255); paint.setTextAlign(Paint.Align.LEFT); paint.setTextSize(dp(15));
+        canvas.drawText(label("Buttons", "Кнопки"),r[0][0]+dp(16),r[0][1]+dp(34),paint);
+        float titleWidth=paint.measureText(label("Buttons", "Кнопки"));
+        paint.setTextSize(dp(11)); paint.setAlpha(170);
+        String legend=label("Screen: a button · More: a More sector · None: hidden",
+                "Экран — кнопка · Ещё — пункт «Ещё» · Нет — скрыта");
+        float legendLeft=r[0][0]+dp(16)+titleWidth+dp(14),legendRight=r[1][0]-dp(10);
+        float measuredLegend=paint.measureText(legend);
+        if (legendRight-legendLeft > dp(60)) {
+            if (measuredLegend > legendRight-legendLeft) paint.setTextSize(dp(11)*(legendRight-legendLeft)/measuredLegend);
+            canvas.drawText(legend,legendLeft,r[0][1]+dp(33),paint);
+        }
+        drawPill(canvas,r[1],label("Done", "Готово"),true,true);
+        String[] places={label("Screen", "Экран"),label("More", "Ещё"),label("None", "Нет")};
+        int moreItems=preferences.moreItemCount();
+        for (int i=0;i<TouchLayout.EDITABLE.length;++i) {
+            int action=TouchLayout.EDITABLE[i];
+            float[] cell=r[i+2];
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setAlpha(18);
+            canvas.drawRoundRect(cell[0],cell[1],cell[2],cell[3],dp(8),dp(8),paint);
+            float iconSize=Math.min(dp(22),(cell[3]-cell[1])*.6f),textLeft=cell[0]+dp(10);
+            if (TouchIcons.draw(canvas,paint,action,cell[0]+dp(8)+iconSize/2,(cell[1]+cell[3])/2,iconSize,Color.WHITE,230))
+                textLeft=cell[0]+dp(14)+iconSize;
+            String name=buttonLabel(action);
+            float segmentsLeft=TouchLayout.segment(cell,TouchLayout.PLACE_SCREEN,dp(1))[0];
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setAlpha(255);
+            paint.setTextAlign(Paint.Align.LEFT); paint.setTextSize(dp(12));
+            float measured=paint.measureText(name),available=segmentsLeft-textLeft-dp(4);
+            if (available > 0 && measured > available) paint.setTextSize(dp(12)*available/measured);
+            canvas.drawText(name,textLeft,(cell[1]+cell[3])/2-(paint.ascent()+paint.descent())/2,paint);
+            int current=preferences.placement(action);
+            for (int place=TouchLayout.PLACE_SCREEN;place<=TouchLayout.PLACE_HIDDEN;++place) {
+                boolean allowed=TouchLayout.placementAllowed(action,place)
+                        && !(action == MORE && place != TouchLayout.PLACE_SCREEN && moreItems > 0);
+                drawPill(canvas,TouchLayout.segment(cell,place,dp(1)),places[place],current == place,allowed);
+            }
+        }
+    }
+    /** Main menu, bottom left (clear of the menu list and the right-hand buttons):
+     *  the cache the first launch used to build before the menu now forms meanwhile. */
+    private void drawShaderProgress(Canvas canvas) {
+        if (shaderProgress < 0 || context.mode != FRONTEND || editing) return;
+        int percent = shaderProgress / 10;
+        String text = label("Preparing graphics in the background: " + percent + "%",
+                "Подготовка графики в фоне: " + percent + "%");
+        paint.setTextSize(dp(12)); paint.setTextAlign(Paint.Align.LEFT); paint.setStyle(Paint.Style.FILL);
+        float width = paint.measureText(text), left = safe.left + dp(16), base = safe.bottom - dp(22);
+        paint.setColor(Color.BLACK); paint.setAlpha(150);
+        canvas.drawRoundRect(left - dp(10), base - dp(17), left + width + dp(10), base + dp(13), dp(8), dp(8), paint);
+        paint.setColor(Color.WHITE); paint.setAlpha(220);
+        canvas.drawText(text, left, base, paint);
+        float barTop = base + dp(5), barBottom = barTop + dp(3);
+        paint.setAlpha(60);
+        canvas.drawRect(left, barTop, left + width, barBottom, paint);
+        paint.setColor(0xFFFFD569); paint.setAlpha(230);
+        canvas.drawRect(left, barTop, left + width * shaderProgress / 1000f, barBottom, paint);
+    }
+    @Override public boolean onTouchEvent(MotionEvent event) {
+        if ((movieState & MOVIE_PLAYING) != 0 || movieStream) return movieTouch(event);
+        int action = event.getActionMasked(), index = event.getActionIndex();
+        boolean mouse = event.isFromSource(InputDevice.SOURCE_MOUSE);
+        if (mouse) mouseUsed = true;
+        else if (action == MotionEvent.ACTION_DOWN) {
+            // A new stream. After keyboard-and-mouse play the first touch only
+            // brings the controls back; a stream never left without its UP.
+            mouseUsed = false;
+            touchSwallowed = keyboardMouse;
+            if (keyboardMouse) { keyboardMouse = false; layoutDirty = true; invalidate(); }
+        }
+        if (touchSwallowed && !mouse) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) touchSwallowed = false;
+            return true;
+        }
+        if (action == MotionEvent.ACTION_DOWN) {
+            // A mouse clicks like a finger only where its arrow is shown (menus
+            // and the layout editor) and with the primary button; play captures it.
+            mouseStream = mouse;
+            // A touchpad tap or an injected click may carry no button state.
+            int buttons = event.getButtonState();
+            boolean source = mouse ? (buttons == 0 || (buttons & MotionEvent.BUTTON_PRIMARY) != 0)
+                    && (context.menu() || editing) : event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN);
+            streamOwned = source
+                    && eligible && (editing || context.gameplay()
+                    || hit(event.getX(), event.getY()) != null
+                    || (context.menu() && (fallback || context.has(DIRECT_UI | UI_TAP_TEST | UI_WIDGETS)) && viewport.contains(event.getX(), event.getY())));
+        }
+        // A mouse never reaches the original touch path: it maps the cursor's
+        // display pixels onto the smaller render surface (render resolution).
+        if (!streamOwned) return mouse || mouseStream;
+        if (action == MotionEvent.ACTION_CANCEL) {
+            cancelInput(); streamOwned = false; return true;
+        }
+        if (!eligible) {
+            if (action == MotionEvent.ACTION_UP) streamOwned = false;
+            return true; // Never hand half a captured gesture to the underlying game.
+        }
+        if (editing) {
+            editEvent(event);
+        } else if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+            down(event.getPointerId(index), event.getX(index), event.getY(index), event.getEventTime());
+        } else if (action == MotionEvent.ACTION_MOVE) {
+            moveVisual(moveVisualBefore);
+            // Sample times pace LOOK ACCELERATION.
+            for (int h = 0; h < event.getHistorySize(); h++) for (int i = 0; i < event.getPointerCount(); i++)
+                move(event.getPointerId(i), event.getHistoricalX(i,h), event.getHistoricalY(i,h), event.getHistoricalEventTime(h));
+            for (int i = 0; i < event.getPointerCount(); i++)
+                move(event.getPointerId(i), event.getX(i), event.getY(i), event.getEventTime());
+            moveVisual(moveVisualAfter);
+            // Look drags draw nothing here. Redrawing this full-screen layer per
+            // touch sample costs GPU time beside the game, and the compositor then
+            // waits for the game's GPU work before it takes the game's frame.
+            if (Arrays.equals(moveVisualBefore, moveVisualAfter)) return true;
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {
+            int id = event.getPointerId(index);
+            float x=event.getX(index),y=event.getY(index);
+            if(id==radialPointer) {
+                int selected=radialDragged?TouchLayout.radialSector(x,y,radialX,radialY,radialRadius,radialCount):-1;
+                boolean tap=!radialDragged && SystemClock.uptimeMillis()-radialStarted<300;
+                if (tap && preferences.radialTap && !fallback) {
+                    // Stay open; the next tap picks an item, More or elsewhere closes.
+                    radialPointer=-1; radialTapMode=true; radialSelection=-1;
+                } else {
+                    closeRadial();
+                    // Give up acts only from confirmRadialHold; an early release explains why.
+                    if (selected >= 0 && radialConfirm(radial[selected]))
+                        showHint("Hold Give up for a second", "Удерживайте «Сдаться» секунду",0);
+                    else if (selected >= 0 && radialAvailable(radial[selected])) activate(id,radial[selected],x,y);
+                    else if (tap) moreHint();
+                }
+            } else if (hudGesture.owns(id)) {
+                RectF rect=hudPointers.get(id); hudPointers.remove(id);
+                boolean inside=rect != null && (hudGesture.zone(id) == TouchInput.HudGesture.AMMO_ZONE ? safe.contains(x,y) : rect.contains(x,y));
+                int slot=hudGesture.slotsOpen() ? TouchLayout.slotAt(x,y,slotCells,dp(1)) : -1;
+                int command=hudGesture.up(id,x,y,SystemClock.uptimeMillis(),context,inside,dp(14),slot);
+                if (!hudGesture.slotsOpen()) closeSlots();
+                if (command >= 0) activate(id,command,x,y);
+            } else if (hudTaps.owns(id)) {
+                int command=hudTaps.up(id,x,y,SystemClock.uptimeMillis(),context,dp(14));
+                if (command >= 0) activate(id,command,x,y);
+            } else if(utilityPointers.get(id)!=null) {
+                Button b=utilityPointers.get(id);
+                utilityPointers.remove(id);
+                if (id==menuMorePointer) {
+                    long now=SystemClock.uptimeMillis();
+                    boolean held=menuMoreStarted==0 || now-menuMoreStarted>=300;
+                    clearMenuMoreHold();
+                    if (b.contains(x,y)) {
+                        if (held) openMenuCommands(now);
+                        else { clearMenuMore();buildButtons();menuMoreHint(); }
+                    }
+                } else if (b.action==SUICIDE) {
+                    // Acted already from confirmButtonHold, or lifted early.
+                    if (id==confirmPointer) { clearConfirm(); showHint("Hold Give up for a second", "Удерживайте «Сдаться» секунду",0); }
+                } else if(b.contains(x,y)) activate(id,b.action,x,y);
+            } else if(legacyPointers.get(id)!=null) {
+                int key=legacyPointers.get(id);legacyPointers.remove(id);
+                boolean owned=false;for(int i=0;i<legacyPointers.size();i++) if(legacyPointers.valueAt(i)==key) owned=true;
+                if(!owned) publishLegacyKeys(fallback?legacyHeld:0);
+            } else if (uiPointers.get(id) != null) {
+                float[] start=uiPointers.get(id);
+                if(fallback) {
+                    float dx=x-start[0],dy=y-start[1];
+                    if(Math.hypot(dx,dy)>dp(18)) activate(id,Math.abs(dx)>Math.abs(dy)?(dx>0?UI_RIGHT:UI_LEFT):(dy>0?UI_DOWN:UI_UP),x,y);
+                } else
+                sendUi(id, viewport.contains(event.getX(index),event.getY(index)) ? UP : CANCEL,
+                        event.getX(index), event.getY(index));
+                uiPointers.remove(id);
+            } else {
+                input.up(id, event.getX(index), event.getY(index), event.getEventTime());
+            }
+            if (id == menuPointer) menuPointer = uiPointers.size()>0 ? uiPointers.keyAt(0) : -1;
+            if (expanded) menuExpandedUntil=SystemClock.uptimeMillis()+6000;
+        }
+        if (action == MotionEvent.ACTION_UP) streamOwned = false;
+        invalidate(); return true;
+    }
+    private void down(int id, float x, float y, long time) {
+        Button b = hit(x, y);
+        if (context.menu()) {
+            if (!menuPointerAllowed(context,menuPointer,uiPointers.size(),b!=null)) { cancelInput(); return; }
+            if (menuPointer < 0) menuPointer = id;
+        }
+        if(radialOpen && id!=radialPointer) {
+            if(b!=null && radialButtons.contains(b)) {
+                // A held item stays pressed under this finger past the radial,
+                // through the same native held bit as a button; others act on release.
+                if (!fallback && radialHold(b.action)) {
+                    input.down(id, TouchInput.BUTTON, b.action, x, y, time);
+                    haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
+                }
+                if (radialTapMode && radialPointer<0 && radialConfirm(b.action)) {
+                    // Give up still needs its one-second hold: this finger now
+                    // owns the radial with that sector selected.
+                    radialPointer=id; radialDragged=true; radialSelectedAt=SystemClock.uptimeMillis();
+                    for (int i=0;i<radialCount;i++) if (radial[i]==b.action) radialSelection=i;
+                    haptic(HapticFeedbackConstants.CLOCK_TICK); return;
+                }
+                utilityPointers.put(id,b);
+                return;
+            } else if(b!=null && b.action==MORE) {closeRadial();return;}
+            else if(radialPointer<0) {
+                // A tap-mode radial is dismissed by the next touch, which does nothing else.
+                boolean consume=radialTapMode;
+                closeRadial();
+                if (consume) return;
+            }
+        }
+        if (b != null) {
+            if (b.action == MORE) {
+                if(context.gameplay()) openRadial(id,x,y);
+                else {
+                    utilityPointers.put(id,b);menuMorePointer=id;menuMoreButton=b;
+                    menuMoreStarted=SystemClock.uptimeMillis();menuMoreEpoch=context.epoch;
+                }
+                return;
+            }
+            if (context.menu()) {
+                utilityPointers.put(id,b);
+                if (expanded) menuExpandedUntil=SystemClock.uptimeMillis()+6000;
+                return;
+            }
+            if(b.action>=LEGACY) {legacyPointers.put(id,b.action-LEGACY);publishLegacyKeys(fallback?legacyHeld:0);return;}
+            if(b.action<0 || b.action==PAUSE || tapButton(b.action)) {
+                // Menu buttons act on release over the button, like Pause.
+                utilityPointers.put(id,b);
+                if (b.action >= 0) haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+                return;
+            }
+            if(b.action==SUICIDE) {
+                // Give up on the screen waits for the same one-second hold as its sector.
+                utilityPointers.put(id,b); confirmPointer=id; confirmButton=b; confirmStarted=SystemClock.uptimeMillis();
+                haptic(HapticFeedbackConstants.VIRTUAL_KEY); return;
+            }
+            // The native held Use bit presses the game's own X button: tap picks
+            // up, hold equips, with no virtual controller. Fallback keeps key X.
+            if(legacyUse(context,fallback,b.action)) { legacyPointers.put(id,99);publishLegacyKeys(legacyHeld);return; }
+            input.down(id, TouchInput.BUTTON, b.action, x, y, time);
+            haptic(HapticFeedbackConstants.VIRTUAL_KEY); return;
+        }
+        if (context.menu() && (fallback || context.has(DIRECT_UI | UI_TAP_TEST | UI_WIDGETS)) && viewport.contains(x, y)) {
+            uiPointers.put(id, new float[]{x, y}); if(!fallback) sendUi(id, DOWN, x, y); return;
+        }
+        if (context.gameplay() && safe.contains(x, y)) {
+            if (!fallback && context.known(USE) && context.allows(USE) && useTarget.contains(x,y)) {
+                // The transparent native hint shares the Action button's real
+                // press/hold/up path, including pickup and hold-to-equip.
+                input.down(id, TouchInput.BUTTON, USE, x, y, time);
+                haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
+            }
+            if (!fallback && (mapTarget.contains(x,y) || (context.mode == GAMEPLAY && ammoTarget.contains(x,y)))) {
+                long now=SystemClock.uptimeMillis();
+                int pending=hudGesture.poll(now,context); if (pending >= 0) activate(nextLegacyId++,pending,0,0);
+                boolean map=mapTarget.contains(x,y);
+                hudPointers.put(id,new RectF(map ? mapTarget : ammoTarget));
+                hudGesture.down(id,map ? TouchInput.HudGesture.MAP_ZONE : TouchInput.HudGesture.AMMO_ZONE,x,y,now,context.epoch,dp(14));
+                return;
+            }
+            float nx = (x-safe.left)/safe.width();
+            if (preferences.leftHanded) nx = 1-nx;
+            boolean stopTarget = input.sprintLatched() && TouchLayout.circleContains(x,y,
+                    input.stickX(),input.stickY(),dp(60*preferences.scale),dp(8));
+            if (stopTarget) input.stopRunning();
+            boolean movement = stopTarget || (nx < .40f && y > safe.top + safe.height()*.35f);
+            int zone = stopTarget || fallback ? 0 : tapZone(x,y);
+            if (zone > 0) {
+                // Still tap: skill or a status tab. Dragged: the same stick or
+                // camera this touch would have started, from where it went down.
+                hudTaps.down(id,zone,movement ? TouchInput.MOVEMENT : TouchInput.LOOK,x,y,
+                        SystemClock.uptimeMillis(),context.epoch);
+                return;
+            }
+            input.down(id, movement ? TouchInput.MOVEMENT : TouchInput.LOOK, -1, x, y, time);
+        }
+    }
+    /** Tap-only HUD target under a new touch, while its action is available. */
+    private int tapZone(float x,float y) {
+        if (context.mode != GAMEPLAY) return 0;
+        if (challengeTarget.contains(x,y) && context.allows(CHALLENGES)) return TouchInput.HudTaps.CHALLENGE_ZONE;
+        if (skillTarget.contains(x,y) && context.allows(SKILL)) return TouchInput.HudTaps.SKILL_ZONE;
+        if (objectiveTarget.contains(x,y) && context.allows(LOGS)) return TouchInput.HudTaps.OBJECTIVES_ZONE;
+        if (experienceTarget.contains(x,y) && context.allows(SKILLS)) return TouchInput.HudTaps.EXPERIENCE_ZONE;
+        return 0;
+    }
+    // What onDraw shows that a touch move can change: held buttons, the radial
+    // selection, utility holds, and the stick with its knob in whole pixels.
+    private void moveVisual(int[] out) {
+        long held = input.held();
+        boolean moving = input.moving();
+        float reach = dp(48 * preferences.scale);
+        out[0] = (int) held; out[1] = (int) (held >>> 32);
+        out[2] = radialOpen ? radialSelection : -2;
+        out[3] = utilityPointers.size();
+        out[4] = moving ? Math.round(input.stickX()) : Integer.MIN_VALUE;
+        out[5] = moving ? Math.round(input.stickY()) : 0;
+        out[6] = moving ? Math.round(input.moveX() * reach) : 0;
+        out[7] = moving ? Math.round(input.moveY() * reach) : 0;
+        out[8] = slotCells != null ? slotSelection : -2;
+    }
+    private void move(int id, float x, float y, long time) {
+        if (hudGesture.owns(id)) {
+            hudGesture.move(id,x,y);
+            if (hudGesture.slotsOpen() && slotCells != null) {
+                int slot=TouchLayout.slotAt(x,y,slotCells,dp(1));
+                if (!TouchInput.HudGesture.slotSelectable(context,slot)) slot=-1;
+                if (slot != slotSelection && slot >= 0) haptic(HapticFeedbackConstants.CLOCK_TICK);
+                slotSelection=slot;
+            }
+            return;
+        }
+        if (hudTaps.owns(id)) {
+            float[] drag=hudTaps.move(id,x,y,dp(14));
+            if (drag != null) { input.down(id,(int)drag[0],-1,drag[1],drag[2]); input.move(id,x,y,time); }
+            return;
+        }
+        if (id==menuMorePointer) {
+            if (menuMoreButton==null || !menuMoreButton.contains(x,y)) {utilityPointers.remove(id);clearMenuMoreHold();}
+            return;
+        }
+        if(id==radialPointer) {
+            if(Math.hypot(x-radialStartX,y-radialStartY)>dp(12)) radialDragged=true;
+            int selected=radialDragged?TouchLayout.radialSector(x,y,radialX,radialY,radialRadius,radialCount):-1;
+            if(selected>=0 && !radialAvailable(radial[selected])) selected=-1;
+            if(selected!=radialSelection) {
+                if (selected>=0) haptic(HapticFeedbackConstants.CLOCK_TICK);
+                radialSelectedAt=selected>=0 && radialConfirm(radial[selected]) ? SystemClock.uptimeMillis() : 0;
+            }
+            radialSelection=selected;return;
+        }
+        if(utilityPointers.get(id)!=null || legacyPointers.get(id)!=null) return;
+        float[] p = uiPointers.get(id);
+        if (p != null) {
+            if(fallback) return;
+            p[0]=x; p[1]=y;
+            if(!viewport.contains(x,y)) { sendUi(id,CANCEL,x,y); uiPointers.remove(id); }
+            else sendUi(id,MOVE,x,y);
+        }
+        else {
+            boolean running=input.sprintLatched(); input.move(id,x,y,time);
+            if (!running && input.sprintLatched()) {
+                haptic(HapticFeedbackConstants.LONG_PRESS);
+                showHint("Auto-run: pull back or tap the stick to stop", "Автобег: верните стик или коснитесь его, чтобы остановиться",HINT_AUTORUN);
+            }
+        }
+    }
+    private void activate(int id,int action,float x,float y) {
+        if(action==MORE) {
+            if(context.gameplay()) {
+                if (touchExploration()) openRadial(-1,x,y); else moreHint();
+            } else {clearMenuMore();buildButtons();menuMoreHint();}
+            return;
+        }
+        if(action>=LEGACY || legacyUse(context,fallback,action) || (fallback && action==MAP)) {
+            final int key=action>=LEGACY?action-LEGACY:action==USE?99:4;
+            final int owner=nextLegacyId++;
+            legacyPointers.put(owner,key);publishLegacyKeys(fallback?legacyHeld:0);
+            postDelayed(()->{if(legacyPointers.get(owner)!=null) {legacyPointers.remove(owner);publishLegacyKeys(fallback?legacyHeld:0);}},action==MAP?500:150);
+            closeRadial();return;
+        }
+        if(action<0 || !context.allows(action)) return;
+        if (action == PAUSE) input.stopRunning();
+        closeRadial();
+        if (action == AIM) { input.down(id,TouchInput.BUTTON,action,x,y);input.up(id,x,y); }
+        else input.pulse(action);
+        haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+    }
+    private void publishLegacyKeys(long held) {
+        SparseArray<Boolean> desired=new SparseArray<>();
+        for(int a=0;a<=UI_RIGHT;a++) if((held&bit(a))!=0) desired.put(legacyKey(a),true);
+        for(int i=0;i<legacyPointers.size();i++) desired.put(legacyPointers.valueAt(i),true);
+        for(int i=0;i<legacyKeys.size();i++) if(desired.get(legacyKeys.keyAt(i))==null) LaunchControls.key(activity,legacyKeys.keyAt(i),false);
+        for(int i=0;i<desired.size();i++) if(legacyKeys.get(desired.keyAt(i))==null) LaunchControls.key(activity,desired.keyAt(i),true);
+        legacyKeys.clear();for(int i=0;i<desired.size();i++) legacyKeys.put(desired.keyAt(i),true);
+    }
+    private static int legacyKey(int action) {
+        switch(action) {
+            case FIRE:return -2;case AIM:return -1;case JUMP:case CONFIRM:return 96;
+            case CROUCH:case BACK:return 97;case RELOAD:case USE:return 99;case MELEE:return 107;
+            case GRENADE:case VEHICLE_BRAKE:return 103;case SKILL:case VEHICLE_BOOST:return 102;
+            case SPRINT:case VEHICLE_HORN:return 106;case NEXT_WEAPON:case PREV_WEAPON:return 100;
+            case INVENTORY:case MAP:return 4;case PAUSE:case SKIP:return 108;
+            case UI_UP:return 19;case UI_DOWN:return 20;
+            case UI_LEFT:return 21;case UI_RIGHT:return 22;default:return 97;
+        }
+    }
+    private void sendUi(int id, int phase, float x, float y) {
+        // Coordinates refer to the complete render Surface, not the safe layout rectangle.
+        bridge.uiPointer(context.epoch, id, phase,
+                Math.max(0,Math.min(1,(x-viewport.left)/viewport.width())),
+                Math.max(0,Math.min(1,(y-viewport.top)/viewport.height())));
+    }
+    static boolean menuPointerAllowed(Context context,int activePointer,int uiCount,boolean overlayTarget) {
+        if (activePointer < 0 && uiCount == 0) return true;
+        // Only the authenticated original Map advertises two-finger gestures.
+        // A button owner or a third contact still cancels the entire sequence.
+        return context.has(MAP_GESTURES) && uiCount == 1 && !overlayTarget;
+    }
+    private void editEvent(MotionEvent event) {
+        int action = event.getActionMasked(), index = event.getActionIndex();
+        if (action == MotionEvent.ACTION_DOWN) {
+            float x=event.getX(), y=event.getY();
+            if (paletteOpen) { paletteTap(x,y); return; }
+            int tool=toolAt(x,y);
+            if (tool != 0) { toolTap(tool); return; }
+            Button removed=badgeAt(x,y);
+            if (removed != null) {
+                if (preferences.placement(removed.slot,TouchLayout.PLACE_HIDDEN)) {
+                    layoutChanged=true; saveLayout(); layoutDirty=true; haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+                }
+                return;
+            }
+            Button b = hit(x,y);
+            if (b != null && (b.slot >= 0 || b.slot == MORE)) {
+                editButton=b; editPointer=event.getPointerId(0);
+                editOffsetX=b.rect.centerX()-x; editOffsetY=b.rect.centerY()-y;
+            }
+        } else if (action == MotionEvent.ACTION_MOVE && editButton != null) {
+            int i=event.findPointerIndex(editPointer);
+            if (i<0) return;
+            float cx=Math.max(safe.left+editButton.rect.width()/2,Math.min(safe.right-editButton.rect.width()/2,event.getX(i)+editOffsetX));
+            float cy=Math.max(safe.top+editButton.rect.height()/2,Math.min(safe.bottom-editButton.rect.height()/2,event.getY(i)+editOffsetY));
+            float nx=(cx-safe.left)/safe.width(), ny=(cy-safe.top)/safe.height();
+            if (preferences.leftHanded && !TouchLayout.utility(editButton.slot)) nx=1-nx;
+            preferences.position(editButton.slot,nx,ny);
+            layoutChanged = true;
+            buildButtons();
+        } else if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)
+                && event.getPointerId(index)==editPointer) { saveLayout(); editButton=null; editPointer=-1; }
+    }
+    private void stopEditing() {
+        editing=false; expanded=false; paletteOpen=false; resetArmedUntil=0; cancelInput();
+    }
+    private boolean editorRemovable(Button b) {
+        if (!editing || paletteOpen || context.mode != GAMEPLAY) return false;
+        if (b.slot == MORE) return preferences.moreItemCount() == 0;
+        return TouchLayout.placementAllowed(b.slot,TouchLayout.PLACE_HIDDEN);
+    }
+    private Button badgeAt(float x,float y) {
+        for (int i=buttons.size()-1;i>=0;--i) {
+            Button b=buttons.get(i);
+            if (!editorRemovable(b)) continue;
+            float[] badge=TouchLayout.removeBadge(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,dp(1));
+            if (Math.hypot(x-badge[0],y-badge[1]) <= badge[2]+dp(5)) return b;
+        }
+        return null;
+    }
+    private String toolLabel(int tool) {
+        switch (tool) {
+            case TOOL_BUTTONS: return label("Buttons", "Кнопки");
+            case TOOL_LEFT: return preferences.leftHanded ? label("Left-handed: on", "Для левшей: вкл.") : label("Left-handed: off", "Для левшей: выкл.");
+            case TOOL_RESET: return SystemClock.uptimeMillis() < resetArmedUntil ? label("Reset layout?", "Точно сбросить?") : label("Reset", "Сбросить");
+            default: return label("Done", "Готово");
+        }
+    }
+    /** Toolbar pills and, while open, the button panel, from the current safe area. */
+    private void buildEditor() {
+        int[] ids = context.mode == GAMEPLAY ? new int[]{TOOL_BUTTONS,TOOL_LEFT,TOOL_RESET,DONE} : new int[]{TOOL_LEFT,DONE};
+        paint.setTextSize(dp(13));
+        float[] widths=new float[ids.length];
+        // Each pill keeps the width of its longest caption, so an armed Reset or
+        // a toggled left-hand mode never slides the pills under the finger.
+        for (int i=0;i<ids.length;++i) {
+            float text=paint.measureText(toolLabel(ids[i]));
+            if (ids[i] == TOOL_RESET) text=Math.max(paint.measureText(label("Reset", "Сбросить")),
+                    paint.measureText(label("Reset layout?", "Точно сбросить?")));
+            else if (ids[i] == TOOL_LEFT) text=Math.max(paint.measureText(label("Left-handed: on", "Для левшей: вкл.")),
+                    paint.measureText(label("Left-handed: off", "Для левшей: выкл.")));
+            widths[i]=text+dp(28);
+        }
+        // Below the top row (Pause, menu buttons): its pills never cover a button there.
+        toolRects=TouchLayout.toolbar(safe.left,safe.top+dp(48),safe.right,widths,dp(1));
+        toolIds=toolRects == null ? null : ids;
+        paletteRects=paletteOpen && context.mode == GAMEPLAY
+                ? TouchLayout.palette(safe.left,safe.top,safe.right,safe.bottom,TouchLayout.EDITABLE.length,dp(1)) : null;
+        if (paletteOpen && paletteRects == null) paletteOpen=false;
+    }
+    private int toolAt(float x,float y) {
+        if (toolRects == null || toolIds == null) return 0;
+        for (int i=0;i<toolRects.length;++i) {
+            float[] r=toolRects[i];
+            if (x >= r[0]-dp(4) && x <= r[2]+dp(4) && y >= r[1]-dp(6) && y <= r[3]+dp(6)) return toolIds[i];
+        }
+        return 0;
+    }
+    private void toolTap(int tool) {
+        haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+        long now=SystemClock.uptimeMillis();
+        if (tool == DONE) { stopEditing(); return; }
+        if (tool == TOOL_BUTTONS) { paletteOpen=true; resetArmedUntil=0; }
+        else if (tool == TOOL_LEFT) {
+            // The same preference as the LEFT HANDED settings row; the native
+            // page learns it at the next exchange, requested right away.
+            preferences.leftHanded=!preferences.leftHanded;
+            layoutChanged=true; saveLayout(); settingsPollRequested=true;
+        } else if (tool == TOOL_RESET) {
+            if (now < resetArmedUntil) {
+                resetArmedUntil=0; preferences.resetLayout();
+                showHint("Layout reset", "Раскладка сброшена",0);
+            } else resetArmedUntil=now+3000;
+        }
+        layoutDirty=true; invalidate();
+    }
+    /** The button panel: a placement segment, the close pill, or outside the card. */
+    private void paletteTap(float x,float y) {
+        float[][] r=paletteRects;
+        if (r == null) { paletteOpen=false; layoutDirty=true; return; }
+        boolean inCard=x >= r[0][0] && x <= r[0][2] && y >= r[0][1] && y <= r[0][3];
+        boolean close=x >= r[1][0]-dp(6) && x <= r[1][2]+dp(6) && y >= r[1][1]-dp(6) && y <= r[1][3]+dp(6);
+        if (!inCard || close) { paletteOpen=false; layoutDirty=true; invalidate(); haptic(HapticFeedbackConstants.VIRTUAL_KEY); return; }
+        for (int i=0;i<TouchLayout.EDITABLE.length;++i) {
+            float[] cell=r[i+2];
+            if (y < cell[1] || y > cell[3] || x < cell[0] || x > cell[2]) continue;
+            int action=TouchLayout.EDITABLE[i];
+            for (int place=TouchLayout.PLACE_SCREEN;place<=TouchLayout.PLACE_HIDDEN;++place) {
+                float[] s=TouchLayout.segment(cell,place,dp(1));
+                if (x < s[0] || x > s[2]) continue;
+                if (preferences.placement(action) == place) return;
+                if (preferences.placement(action,place)) {
+                    layoutChanged=true; saveLayout(); layoutDirty=true; haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+                } else if (action == MORE && preferences.moreItemCount() > 0)
+                    showHint("Move the buttons out of More first", "Сначала уберите кнопки из «Ещё»",0);
+                invalidate();
+                return;
+            }
+            return;
+        }
+    }
+    private void saveLayout() {
+        if (layoutChanged) { layoutChanged = false; preferences.save(); }
+    }
+    public static float renderScale(Activity owner) {
+        return sessionRenderPercent(owner)/100f;
+    }
+    /** A changed resolution takes effect in the next process, after a restart. */
+    private static synchronized int sessionRenderPercent(Activity owner) {
+        if (sessionRenderPercent == 0) {
+            NativeTouchControls controls=active.get();
+            sessionRenderPercent=(controls!=null && controls.activity==owner ? controls.preferences : new TouchPreferences(owner)).renderPercent;
+        }
+        return sessionRenderPercent;
+    }
+    /**
+     * UE3JavaApp's text entry (chat, character names) asks for the keyboard
+     * right after AlertDialog.show(), before the dialog window has focus, and
+     * current Android ignores that request. Keep the keyboard up for the dialog
+     * and ask again once its window really owns focus.
+     */
+    public static void keyboardDialog(android.app.AlertDialog dialog, final android.widget.EditText edit) {
+        if (dialog == null || edit == null) return;
+        android.view.Window window = dialog.getWindow();
+        if (window != null) window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+        edit.requestFocus();
+        edit.setSelection(edit.getText().length());
+        final android.view.ViewTreeObserver observer = edit.getViewTreeObserver();
+        observer.addOnWindowFocusChangeListener(new android.view.ViewTreeObserver.OnWindowFocusChangeListener() {
+            @Override public void onWindowFocusChanged(boolean hasFocus) {
+                if (!hasFocus) return;
+                if (edit.getViewTreeObserver().isAlive()) edit.getViewTreeObserver().removeOnWindowFocusChangeListener(this);
+                edit.requestFocus();
+                android.view.inputmethod.InputMethodManager manager = (android.view.inputmethod.InputMethodManager)
+                        edit.getContext().getSystemService(android.content.Context.INPUT_METHOD_SERVICE);
+                if (manager != null) manager.showSoftInput(edit, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+            }
+        });
+    }
+    public static boolean microphoneEnabled(Activity owner) {
+        NativeTouchControls controls=active.get();
+        return (controls!=null && controls.activity==owner ? controls.preferences : new TouchPreferences(owner)).microphoneEnabled;
+    }
+    public static void microphonePermissionResult(Activity owner, int result) {
+        if (result == android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+        NativeTouchControls controls = active.get();
+        TouchPreferences prefs = controls != null && controls.activity == owner
+                ? controls.preferences : new TouchPreferences(owner);
+        prefs.microphoneEnabled = false;
+        prefs.save();
+        if (controls != null && controls.activity == owner) controls.applyMicrophone();
+    }
+    private void applyMicrophone() {
+        try {
+            if(preferences.microphoneEnabled) {
+                activity.getClass().getMethod("JavaCallback_StartVoiceRecording").invoke(activity);
+                if(activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)!=android.content.pm.PackageManager.PERMISSION_GRANTED)
+                    activity.requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO},1);
+            } else {
+                activity.getClass().getMethod("JavaCallback_StopVoiceRecording").invoke(activity);
+                activity.getClass().getMethod("releaseAudioInput").invoke(activity);
+            }
+        } catch(ReflectiveOperationException error) {
+            Log.e(TAG,"Cannot apply microphone setting",error);
+            android.widget.Toast.makeText(activity,label("Could not change microphone state", "Не удалось изменить состояние микрофона"),android.widget.Toast.LENGTH_LONG).show();
+        }
+    }
+    private String label(String english, String ru) { return russian ? ru : english; }
+    private void applyRenderScale() {
+        // Same size as UE3JavaApp's launch callback, which truncates.
+        float scale=renderScale(activity);
+        if(surface instanceof SurfaceView && surface.getWidth()>0 && surface.getHeight()>0)
+            ((SurfaceView)surface).getHolder().setFixedSize((int)(surface.getWidth()*scale),(int)(surface.getHeight()*scale));
+    }
+    private void offerRenderRestart() {
+        renderRestartOffered=preferences.renderPercent;
+        if (activity.isFinishing() || activity.isDestroyed() || (restartDialog!=null && restartDialog.isShowing())) return;
+        String message=label("Render resolution "+renderRestartOffered+"% applies after the game restarts. Restart now?",
+                "Разрешение рендера "+renderRestartOffered+"% применится после перезапуска игры. Перезапустить сейчас?");
+        if (inWorld) message+=label("\n\nProgress since the last save will be lost.",
+                "\n\nПрогресс после последнего сохранения будет потерян.");
+        restartDialog=new android.app.AlertDialog.Builder(activity)
+                .setMessage(message)
+                .setPositiveButton(label("Restart","Перезапустить"),(dialog,which)->{ preferences.flush(); GameRestart.restart(activity); })
+                .setNegativeButton(label("Later","Позже"),null)
+                .show();
+    }
+    private void haptic(int feedback) {
+        if (preferences.haptics) performHapticFeedback(feedback);
+    }
+    private boolean syncSettings(Context next, long now) {
+        boolean finalPoll = context.menu() && !next.menu();
+        // The editor's left-hand toggle is pushed once, also outside menus.
+        boolean requested = settingsPollRequested;
+        settingsPollRequested = false;
+        if (settingsRevision != 0 && !next.menu() && !finalPoll && !requested) return false;
+        if (!finalPoll && !requested && settingsRevision != 0 && now-lastSettingsPoll < 100) return false;
+        lastSettingsPoll = now;
+        int[] host = preferences.settingsWire(settingsRevision);
+        int[] guest = bridge.settingsExchange(host);
+        if (!TouchPreferences.validSettingsWire(guest)) return false;
+        boolean update = settingsRevision == 0 || (guest[2]&(2|8))!=0;
+        for (int i = 2; i < host.length; ++i) {
+            int expected = i==18 && host[i]==-1 ? (preferences.debugMenuVisible?1:0) : host[i];
+            if (expected != guest[i+1]) update = true;
+        }
+        boolean microphoneBefore = preferences.microphoneEnabled;
+        if (update) preferences.applySettingsWire(guest);
+        boolean changed = settingsRevision == 0 || (guest[2]&2)!=0;
+        int[] applied = preferences.settingsWire(settingsRevision);
+        for (int i = 2; i < host.length; ++i) if (host[i] != applied[i]) changed = true;
+        boolean microphoneChanged = microphoneBefore != preferences.microphoneEnabled;
+        settingsRevision = guest[1];
+        if ((guest[2]&1) != 0) layoutEditPending = true;
+        if ((guest[2]&4) != 0) gyro.reset();
+        if (microphoneChanged) applyMicrophone();
+        // The engine sizes its render targets at launch: a new resolution is
+        // offered as a restart once the video options page has closed. Two
+        // polls ride out the page's own list rebuilds.
+        videoOptionsAway = (guest[2]&16) != 0 ? 0 : Math.min(videoOptionsAway+1, 2);
+        if ((finalPoll || videoOptionsAway >= 2) && preferences.renderPercent != renderRestartOffered
+                && preferences.renderPercent != sessionRenderPercent(activity)) offerRenderRestart();
+        if (changed) {
+            layoutDirty = true; gyro.reset();
+            if (!next.menu()) { cancelInput(); return true; }
+        }
+        return false;
+    }
+    private void updateSensor() {
+        // Keyboard-and-mouse play leaves the phone on a stand: no tilt aiming.
+        boolean wanted = !disposed && resumed && focused && eligible && !editing && !keyboardMouse
+                && context.gameplay() && context.has(RELATIVE_LOOK) && preferences.gyroEnabled;
+        if (wanted && !sensorRegistered && sensorManager != null && aimSensor != null) {
+            sensorRegistered = sensorManager.registerListener(this, aimSensor, SensorManager.SENSOR_DELAY_GAME);
+            if (sensorRegistered && !loggedSensor) {
+                loggedSensor = true;
+                Log.i(TAG, "Tilt sensor registered type="+aimSensor.getType()+" name="+aimSensor.getName()
+                        +" mode="+context.mode+" epoch="+context.epoch+" caps="+context.capabilities);
+            }
+        } else if (!wanted) stopSensor();
+    }
+    private void stopSensor() {
+        if (sensorRegistered && sensorManager != null) sensorManager.unregisterListener(this);
+        sensorRegistered = false; gyro.reset();
+    }
+    @Override public void onSensorChanged(SensorEvent event) {
+        if (!sensorRegistered || !eligible || !focused || !resumed || editing || keyboardMouse || !context.gameplay()
+                || !preferences.gyroEnabled || (preferences.gyroAdsOnly && (input.held() & bit(AIM)) == 0)) {
+            gyro.reset(); return;
+        }
+        android.view.Display display = getDisplay();
+        int rotation = display == null ? Surface.ROTATION_0 : display.getRotation();
+        if (event.sensor.getType() == Sensor.TYPE_GAME_ROTATION_VECTOR) {
+            SensorManager.getQuaternionFromVector(quaternion, event.values);
+            gyro.orientation(quaternion[0], quaternion[1], quaternion[2], quaternion[3], event.timestamp,
+                    rotation, preferences.gyroSensitivity, preferences.gyroDeadzone, preferences.gyroInvertY);
+        } else if (event.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+            gyro.velocity(event.values[0], event.values[1], event.timestamp, rotation,
+                    preferences.gyroSensitivity, preferences.gyroDeadzone, preferences.gyroInvertY);
+        }
+        if (gyro.delta[0] != 0 || gyro.delta[1] != 0) input.relativeLook(gyro.delta[0], gyro.delta[1]);
+    }
+    @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+    /** The "Skip movie" pill, bottom right of the game area. */
+    private RectF movieSkipBounds() {
+        RectF area = !safe.isEmpty() ? safe : !viewport.isEmpty() ? viewport
+                : new RectF(0, 0, getWidth(), getHeight());
+        paint.setTextSize(dp(15));
+        float width = paint.measureText(label("Skip movie", "Пропустить ролик")) + dp(36), height = dp(44);
+        movieSkipRect.set(area.right - dp(20) - width, area.bottom - dp(20) - height,
+                area.right - dp(20), area.bottom - dp(20));
+        return movieSkipRect;
+    }
+    private void drawMovieSkip(Canvas canvas) {
+        if (!movieSkipShown) return;
+        RectF pill = movieSkipBounds();
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Color.BLACK); paint.setAlpha(170);
+        canvas.drawRoundRect(pill, pill.height() / 2, pill.height() / 2, paint);
+        paint.setColor(Color.WHITE); paint.setAlpha(235);
+        paint.setTextSize(dp(15)); paint.setTextAlign(Paint.Align.CENTER);
+        canvas.drawText(label("Skip movie", "Пропустить ролик"), pill.centerX(), pill.centerY() + dp(5), paint);
+    }
+    /** Touches over a full-screen movie never reach the game: a startup movie
+     *  ends on any tap, any other one toggles the "Skip movie" pill. */
+    private boolean movieTouch(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            movieStream = true; movieDownX = event.getX(); movieDownY = event.getY();
+            movieDownTime = event.getEventTime();
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            boolean tap = movieStream && action == MotionEvent.ACTION_UP
+                    && Math.hypot(event.getX() - movieDownX, event.getY() - movieDownY) < dp(24)
+                    && event.getEventTime() - movieDownTime < 600;
+            movieStream = false;
+            if (tap && (movieState & MOVIE_PLAYING) != 0) movieTap(event.getX(), event.getY());
+        }
+        return true;
+    }
+    private void movieTap(float x, float y) {
+        if ((movieState & MOVIE_STARTUP) != 0) {
+            introSkipping = bridge.skipMovie();
+            introSkipUntil = SystemClock.uptimeMillis() + INTRO_SKIP_MS;
+            invalidate();
+            return;
+        }
+        RectF target = new RectF(movieSkipBounds());
+        target.inset(-dp(8), -dp(8));
+        if (movieSkipShown && target.contains(x, y)) {
+            movieSkipShown = false;
+            bridge.skipMovie();
+        } else {
+            movieSkipShown = !movieSkipShown;
+        }
+        invalidate();
+    }
+    private void cancelInput() {
+        saveLayout();
+        stopSensor();
+        accessibilityFocus=hoverTarget=View.NO_ID;
+        closeRadial();clearMenuMore();clearConfirm();utilityPointers.clear();legacyPointers.clear();
+        hudGesture.cancel(); hudTaps.cancel(); closeSlots(); hudPointers.clear(); hintUntil = 0;
+        uiPointers.clear(); menuPointer = -1; editPointer=-1; editButton=null; eligible=false; layoutDirty=true;
+        mouseButtons = 0; // input.cancel() below releases the actions they held
+        if (!linkageFailed) {
+            try { input.cancel(); } catch (UnsatisfiedLinkError error) {
+                linkageFailed=true; Log.e(TAG,"Touch JNI is not linked",error);
+            }
+        }
+        invalidate();
+    }
+    private void accessibilityEvent(int id,int type) {
+        AccessibilityEvent event=AccessibilityEvent.obtain(type);event.setSource(this,id);
+        event.setPackageName(activity.getPackageName());event.setClassName("android.widget.Button");
+        if(getParent()!=null) getParent().requestSendAccessibilityEvent(this,event);
+    }
+    private boolean scanMice() {
+        if (inputManager == null) return false;
+        for (int id : inputManager.getInputDeviceIds()) {
+            InputDevice device = inputManager.getInputDevice(id);
+            // A captured mouse reports SOURCE_MOUSE_RELATIVE until it is released.
+            if (device != null && !device.isVirtual() && (device.supportsSource(InputDevice.SOURCE_MOUSE)
+                    || device.supportsSource(InputDevice.SOURCE_MOUSE_RELATIVE))) return true;
+        }
+        return false;
+    }
+    /**
+     * A mouse plays like the PC game. In play the pointer is captured (no arrow):
+     * it turns the camera, the buttons fire and aim, the wheel changes weapons.
+     * Menus and the layout editor keep the arrow; elsewhere it is hidden.
+     */
+    private void updateMouse() {
+        // Everywhere but menus and the editor: a flicker of the overlay itself
+        // (a context change, a device change) never brings the arrow back.
+        boolean play = mousePresent && focused && resumed && !editing && !disposed && !linkageFailed
+                && !context.menu() && android.os.Build.VERSION.SDK_INT >= 26;
+        if (play) {
+            long now = SystemClock.uptimeMillis();
+            if (!hasPointerCapture() && now >= mouseCaptureRetry) {
+                // Captured events reach the focused view; a refusal is retried calmly.
+                mouseCaptureRetry = now + 1000;
+                setFocusable(true); setFocusableInTouchMode(true);
+                if (!isFocused()) requestFocus();
+                requestPointerCapture();
+            }
+            mouseCapture = true;
+        } else if (mouseCapture) {
+            mouseCapture = false; releaseMouseButtons();
+            if (android.os.Build.VERSION.SDK_INT >= 26 && hasPointerCapture()) releasePointerCapture();
+        }
+        boolean hide = !(eligible && (context.menu() || editing));
+        if (hide != cursorHidden) {
+            cursorHidden = hide;
+            if (hiddenCursor == null) hiddenCursor = PointerIcon.getSystemIcon(getContext(), PointerIcon.TYPE_NULL);
+            setPointerIcon(hide ? hiddenCursor : null);
+        }
+    }
+    /**
+     * keyboard: a key is held or was released moments ago (native physical
+     * state, outside the mailbox). With the mouse in play since the last touch
+     * the controls hide; touch input waits for no stream, the editor shows them.
+     */
+    private void updateKeyboardMouse(boolean keyboard) {
+        boolean next = keyboardMouse;
+        if (!mousePresent || editing) next = false;
+        else if (keyboard && mouseUsed && !streamOwned && !touchSwallowed) next = true;
+        if (next == keyboardMouse) return;
+        keyboardMouse = next;
+        if (next) { closeRadial(); clearMenuMore(); clearConfirm(); hintUntil = 0; }
+        layoutDirty = true; invalidate();
+    }
+    private void releaseMouseButtons() {
+        if (mouseButtons != 0) { input.mouseButton(FIRE, false); input.mouseButton(AIM, false); }
+        mouseButtons = 0;
+    }
+    @Override public void onPointerCaptureChange(boolean hasCapture) {
+        if (!hasCapture) releaseMouseButtons();
+    }
+    @Override public boolean onCapturedPointerEvent(MotionEvent event) {
+        mouseUsed = true;
+        if ((movieState & MOVIE_PLAYING) != 0) {
+            // A click works like a tap: the intro ends, another movie shows its
+            // Skip pill and the next click takes it.
+            if (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS) {
+                if ((movieState & MOVIE_STARTUP) != 0 || !movieSkipShown) movieTap(-1, -1);
+                else { movieSkipShown = false; bridge.skipMovie(); invalidate(); }
+            }
+            return true;
+        }
+        if (!mouseCapture || !eligible || !context.gameplay()) { releaseMouseButtons(); return true; }
+        if (event.getActionMasked() == MotionEvent.ACTION_SCROLL) {
+            float wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+            int weapon = wheel < 0 ? NEXT_WEAPON : PREV_WEAPON;
+            if (wheel != 0 && context.allows(weapon)) input.pulse(weapon);
+            return true;
+        }
+        int buttons = event.getButtonState();
+        input.mouseButton(FIRE, (buttons & MotionEvent.BUTTON_PRIMARY) != 0);
+        input.mouseButton(AIM, (buttons & MotionEvent.BUTTON_SECONDARY) != 0);
+        if ((buttons & ~mouseButtons & MotionEvent.BUTTON_TERTIARY) != 0 && context.allows(MELEE)) input.pulse(MELEE);
+        mouseButtons = buttons;
+        // Relative counts: each batched sample carries its own movement.
+        float dx = event.getX(), dy = event.getY();
+        for (int h = 0; h < event.getHistorySize(); ++h) { dx += event.getHistoricalX(h); dy += event.getHistoricalY(h); }
+        float gain = MOUSE_DEGREES * preferences.look / .22f;
+        if (dx != 0 || dy != 0) input.relativeLook(dx * gain, -dy * gain * (preferences.invertY ? -1 : 1));
+        return true;
+    }
+    /** The menu arrow highlights like the PC game's own cursor (native MouseMove only). */
+    private void mouseHover(MotionEvent event) {
+        int action = event.getActionMasked();
+        float x = event.getX(), y = event.getY();
+        if ((action != MotionEvent.ACTION_HOVER_MOVE && action != MotionEvent.ACTION_HOVER_ENTER) || !eligible || fallback
+                || streamOwned || uiPointers.size() > 0 || !context.menu() || !context.has(DIRECT_UI | UI_TAP_TEST | UI_WIDGETS)
+                || !viewport.contains(x, y) || hit(x, y) != null) return;
+        sendUi(MOUSE_HOVER_ID, HOVER, x, y);
+    }
+    @Override public boolean onGenericMotionEvent(MotionEvent event) {
+        if (!event.isFromSource(InputDevice.SOURCE_MOUSE) || linkageFailed) return super.onGenericMotionEvent(event);
+        mouseUsed = true;
+        // UE3JavaApp's NVIDIA mouse path is live on every device (AXIS_RELATIVE_X
+        // exists): its button events would click again at unscaled display pixels.
+        if (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS
+                && event.getActionButton() == MotionEvent.BUTTON_SECONDARY && (context.menu() || editing || radialOpen)) {
+            // The right button steps back in menus, like the PC game's Escape.
+            back(); invalidate();
+            return true;
+        }
+        if (event.getActionMasked() != MotionEvent.ACTION_SCROLL) return true;
+        // One list row per wheel notch in menus; weapons in play without capture.
+        float wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+        int command = context.menu() ? (wheel > 0 ? UI_UP : UI_DOWN) : context.gameplay() ? (wheel < 0 ? NEXT_WEAPON : PREV_WEAPON) : -1;
+        if (wheel != 0 && command >= 0 && eligible && !editing) {
+            if (fallback && context.menu()) activate(nextLegacyId++, command, 0, 0);
+            else if (context.allows(command)) input.pulse(command);
+        }
+        return true;
+    }
+    @Override public boolean dispatchHoverEvent(MotionEvent event) {
+        AccessibilityManager manager=(AccessibilityManager)activity.getSystemService(android.content.Context.ACCESSIBILITY_SERVICE);
+        boolean exploring=manager!=null && manager.isTouchExplorationEnabled();
+        if(!exploring && event.isFromSource(InputDevice.SOURCE_MOUSE)) { mouseUsed = true; mouseHover(event); return true; }
+        if(!eligible || !exploring) return super.dispatchHoverEvent(event);
+        Button b=event.getActionMasked()==MotionEvent.ACTION_HOVER_EXIT?null:hit(event.getX(),event.getY());
+        int id=b==null?View.NO_ID:b.action+4;
+        if(id!=hoverTarget) {
+            if(hoverTarget!=View.NO_ID) accessibilityEvent(hoverTarget,AccessibilityEvent.TYPE_VIEW_HOVER_EXIT);
+            hoverTarget=id;
+            if(id!=View.NO_ID) accessibilityEvent(id,AccessibilityEvent.TYPE_VIEW_HOVER_ENTER);
+        }
+        return id!=View.NO_ID;
+    }
+    @Override public AccessibilityNodeProvider getAccessibilityNodeProvider() {
+        return new AccessibilityNodeProvider() {
+            public AccessibilityNodeInfo createAccessibilityNodeInfo(int id) {
+                AccessibilityNodeInfo node=AccessibilityNodeInfo.obtain();
+                if(id==View.NO_ID) {
+                    onInitializeAccessibilityNodeInfo(node);
+                    if(eligible && !keyboardMouse) for(Button b:radialOpen?radialButtons:buttons) node.addChild(NativeTouchControls.this,b.action+4);
+                    return node;
+                }
+                if(!eligible) return null;
+                for(Button b:radialOpen?radialButtons:buttons) if(b.action+4==id) {
+                    node.setSource(NativeTouchControls.this,id);node.setParent(NativeTouchControls.this);
+                    node.setPackageName(activity.getPackageName());node.setClassName("android.widget.Button");
+                    node.setText(b.label);node.setContentDescription(b.label);
+                    node.setEnabled(true);node.setClickable(true);node.setFocusable(true);node.setVisibleToUser(true);
+                    node.setAccessibilityFocused(accessibilityFocus==id);
+                    Rect bounds=new Rect();b.rect.roundOut(bounds);node.setBoundsInParent(bounds);bounds.offset(screenLocation[0],screenLocation[1]);node.setBoundsInScreen(bounds);
+                    node.addAction(AccessibilityNodeInfo.ACTION_CLICK);
+                    if (b.action==MORE && context.menu()) {node.setLongClickable(true);node.addAction(AccessibilityNodeInfo.ACTION_LONG_CLICK);}
+                    node.addAction(accessibilityFocus==id?AccessibilityNodeInfo.ACTION_CLEAR_ACCESSIBILITY_FOCUS:AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS);
+                    return node;
+                }
+                return null;
+            }
+            public boolean performAction(int id,int action,Bundle args) {
+                if(!eligible) return false;
+                for(Button b:radialOpen?radialButtons:buttons) if(b.action+4==id) {
+                    if(action==AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS) {
+                        if(accessibilityFocus!=View.NO_ID) accessibilityEvent(accessibilityFocus,AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED);
+                        accessibilityFocus=id;accessibilityEvent(id,AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED);return true;
+                    }
+                    if(action==AccessibilityNodeInfo.ACTION_CLEAR_ACCESSIBILITY_FOCUS && accessibilityFocus==id) {
+                        accessibilityFocus=View.NO_ID;accessibilityEvent(id,AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED);return true;
+                    }
+                    if(action==AccessibilityNodeInfo.ACTION_CLICK) {activate(10000+id,b.action,b.rect.centerX(),b.rect.centerY());return true;}
+                    if(action==AccessibilityNodeInfo.ACTION_LONG_CLICK && b.action==MORE && context.menu()) {openMenuCommands(SystemClock.uptimeMillis());return true;}
+                }
+                return false;
+            }
+            public AccessibilityNodeInfo findFocus(int focus) {
+                return focus==AccessibilityNodeInfo.FOCUS_ACCESSIBILITY && accessibilityFocus!=View.NO_ID?createAccessibilityNodeInfo(accessibilityFocus):null;
+            }
+        };
+    }
+    @Override public void surfaceCreated(SurfaceHolder holder) { surfaceAlive=true; schedule(); }
+    @Override public void surfaceChanged(SurfaceHolder holder,int format,int width,int height) { cancelInput(); }
+    @Override public void surfaceDestroyed(SurfaceHolder holder) { surfaceAlive=false; cancelInput(); }
+    @Override protected void onDetachedFromWindow() { dispose(); super.onDetachedFromWindow(); }
+    private void dispose() {
+        if (disposed) return;
+        disposed=true; cancelInput(); unschedule();
+        if (inputManager != null && mouseListener != null) inputManager.unregisterInputDeviceListener(mouseListener);
+        if (android.os.Build.VERSION.SDK_INT >= 26 && hasPointerCapture()) releasePointerCapture();
+        saveLayout(); preferences.flush();
+        publishRoute(false);
+        if (surface instanceof SurfaceView) ((SurfaceView)surface).getHolder().removeCallback(this);
+        if (getParent() instanceof ViewGroup) ((ViewGroup)getParent()).removeView(this);
+        if (active.get()==this) active=new WeakReference<>(null);
+    }
+}

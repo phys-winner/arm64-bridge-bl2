@@ -1,0 +1,121 @@
+--- a/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/interface/A32/config.h
+@@ -240,6 +240,16 @@
+ 
+     /// Internal use only
+     bool very_verbose_debugging_output = false;
++
++    /// Optional ARM64-host software write watch. One atomic byte per full A32
++    /// page, owned by the caller and stable for every Jit/code-cache lifetime.
++    /// Requires page_table == nullptr and 4 <= write_watch_page_bits <= 31.
++    /// Direct fastmem stores publish 1 with a release byte store after success.
++    /// MemoryWrite* callbacks must publish after actual successful writes;
++    /// MemoryWriteExclusive* callbacks publish only after successful CAS.
++    /// The null default preserves existing memory behavior and generated code.
++    std::uint8_t* write_watch = nullptr;
++    unsigned write_watch_page_bits = 14;
+ };
+ 
+ }  // namespace A32
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -161,6 +161,10 @@
+ 
+     // Debugging
+     bool very_verbose_debugging_output;
++
++    // A32 only; borrows the otherwise unused Xpagetable when page_table is null.
++    std::uint8_t* write_watch = nullptr;
++    unsigned write_watch_page_bits = 14;
+ };
+ 
+ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const EmitConfig& emit_conf, FastmemManager& fastmem_manager);
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -168,6 +168,7 @@
+ A32AddressSpace::A32AddressSpace(const A32::UserConfig& conf)
+         : AddressSpace(conf.code_cache_size)
+         , conf(conf) {
++    ASSERT(!conf.write_watch || (conf.page_table == nullptr && conf.write_watch_page_bits >= 4 && conf.write_watch_page_bits <= 31));
+     EmitPrelude();
+ }
+ 
+@@ -241,6 +242,8 @@
+         code.MOV(Xhalt, X2);
+         if (conf.page_table) {
+             code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.page_table));
++        } else if (conf.write_watch) {
++            code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.write_watch));
+         }
+         if (conf.fastmem_pointer) {
+             code.MOV(Xfastmem, *conf.fastmem_pointer);
+@@ -280,6 +283,8 @@
+         code.MOV(Xhalt, X2);
+         if (conf.page_table) {
+             code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.page_table));
++        } else if (conf.write_watch) {
++            code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.write_watch));
+         }
+         if (conf.fastmem_pointer) {
+             code.MOV(Xfastmem, *conf.fastmem_pointer);
+@@ -446,6 +451,8 @@
+         .coprocessors = conf.coprocessors,
+ 
+         .very_verbose_debugging_output = conf.very_verbose_debugging_output,
++        .write_watch = conf.write_watch,
++        .write_watch_page_bits = conf.write_watch_page_bits,
+     };
+ }
+ 
+--- a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+@@ -575,6 +575,41 @@
+     code.l(*end);
+ }
+ 
++// Publish only after the data store completed. Fallback callbacks own their
++// successful-write publication and still branch around this inline path.
++// Xscratch0/1 and the optional reserved Xpagetable are the only registers used.
++// All instructions preserve NZCV/FPSR. Metadata is never a fastmem patch point.
++template<size_t bitsize>
++void EmitFastmemWriteWatch(oaknut::CodeGenerator& code, EmitContext& ctx, oaknut::XReg Xaddr) {
++    if (!ctx.conf.write_watch) {
++        return;
++    }
++    ASSERT(ctx.conf.page_table_pointer == 0 && ctx.conf.fastmem_address_space_bits == 32 && ctx.conf.silently_mirror_fastmem);
++    const unsigned shift = ctx.conf.write_watch_page_bits;
++    ASSERT(shift >= 4 && shift <= 31);
++    const auto Waddr = Xaddr.toW();
++    code.LSR(Wscratch0, Waddr, shift);
++    code.ADD(Xscratch1, Xpagetable, Xscratch0);
++    code.MOV(Wscratch0, 1);
++    code.STLRB(Wscratch0, Xscratch1);
++    if constexpr (bitsize > 8) {
++        oaknut::Label done;
++        // Detect a page crossing without modifying the guest's native flags.
++        code.AND(Wscratch0, Waddr, (u64{1} << shift) - 1);
++        code.ADD(Wscratch0, Wscratch0, bitsize / 8 - 1);
++        code.TBZ(Wscratch0, shift, done);
++        // Use a 64-bit last-byte address to prevent a 4GiB-end wrap into table0.
++        code.MOV(Wscratch0, Waddr);
++        code.ADD(Xscratch0, Xscratch0, bitsize / 8 - 1);
++        code.TBNZ(Xscratch0, 32, done);
++        code.LSR(Wscratch0, Wscratch0, shift);
++        code.ADD(Xscratch1, Xpagetable, Xscratch0);
++        code.MOV(Wscratch0, 1);
++        code.STLRB(Wscratch0, Xscratch1);
++        code.l(done);
++    }
++}
++
+ template<size_t bitsize>
+ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+@@ -594,6 +629,7 @@
+ 
+     const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+     const auto fastmem_location = EmitMemoryStr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered, ShouldExt32(ctx));
++    EmitFastmemWriteWatch<bitsize>(code, ctx, *Xaddr);
+ 
+     // Stores need the same isolated callback state as loads.
+     ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end, fastmem_location, fpsr = ctx.fpsr]() mutable {
