@@ -12,6 +12,7 @@ public final class TouchBridge implements TouchInput.Sink {
     private static native int nativeMovieState();
     private static native boolean nativeSkipMovie();
     private static native int nativeShaderProgress();
+    private static native int nativePhysicalState();
 
     public TouchContract.Context snapshot() {
         return TouchContract.Context.decode(nativeSnapshot());
@@ -32,4 +33,7 @@ public final class TouchBridge implements TouchInput.Sink {
     /** Background shader formation: per mille of the stage catalogue ready on
      *  this device, or -1 while none runs (always -1 in the native ARM32 build). */
     public int shaderProgress() { return nativeShaderProgress(); }
+    /** TouchContract.PHYSICAL_* bits. A keyboard never takes input from the
+     *  mouse or touch, so it is reported here and not in the context. */
+    public int physicalState() { return nativePhysicalState(); }
 }

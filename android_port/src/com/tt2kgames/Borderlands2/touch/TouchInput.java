@@ -12,9 +12,20 @@ public final class TouchInput {
         void reset();
     }
     public static final int IGNORE = 0, MOVEMENT = 1, LOOK = 2, BUTTON = 3;
+    /**
+     * LOOK ACCELERATION: a camera drag below ACCEL_SLOW dp/ms turns linearly;
+     * from there the gain rises evenly to ACCEL_MAX at ACCEL_FAST, so a quick
+     * swipe across about half the screen turns the camera around.
+     */
+    static final float ACCEL_SLOW = .5f, ACCEL_FAST = 2.5f, ACCEL_MAX = 2.5f;
+    /** Speed smoothing time constant: touch samples arrive every 4-8 ms. */
+    static final float ACCEL_SMOOTH_MS = 30;
     private static final class Pointer {
         int role, action;
         float startX, startY, x, y;
+        /** Smoothed finger speed (dp/ms), the last timed sample and the distance since it. */
+        float speed, untimedDp;
+        long time = -1;
         Pointer(int role, int action, float x, float y) {
             this.role = role; this.action = action;
             startX = this.x = x; startY = this.y = y;
@@ -27,6 +38,7 @@ public final class TouchInput {
     private float moveX, moveY;
     private float density = 1, radiusDp = 60, degreesPerDp = .22f, adsMultiplier = .55f;
     private boolean invertY, autoSprint, aimToggle, aimLatched, sprintLatched, sprintHeld, stopBlockedUntilNeutral;
+    private boolean lookAcceleration = true;
     private float lastStickX, lastStickY;
     private long held, mouseHeld;
     public TouchInput(Sink sink) { this.sink = sink; }
@@ -43,9 +55,15 @@ public final class TouchInput {
             float adsMultiplier, boolean invertY) {
         this.density = finiteClamp(density, .5f, 8);
         this.radiusDp = finiteClamp(radiusDp, 32, 120);
-        this.degreesPerDp = finiteClamp(degreesPerDp, .04f, 1);
-        this.adsMultiplier = finiteClamp(adsMultiplier, .1f, 1);
+        this.degreesPerDp = finiteClamp(degreesPerDp, .04f, TouchPreferences.MAX_LOOK);
+        this.adsMultiplier = finiteClamp(adsMultiplier, .1f, TouchPreferences.MAX_ADS);
         this.invertY = invertY;
+    }
+    public void lookAcceleration(boolean enabled) { lookAcceleration = enabled; }
+    /** Camera gain at a smoothed finger speed in dp/ms (1 when slow). */
+    public static float accelerationGain(float dpPerMs) {
+        float t = (dpPerMs - ACCEL_SLOW) / (ACCEL_FAST - ACCEL_SLOW);
+        return 1 + (ACCEL_MAX - 1) * (Float.isFinite(t) ? Math.max(0, Math.min(1, t)) : 0);
     }
     public void setContext(Context next) {
         if (next.epoch != context.epoch || next.mode != context.mode
@@ -71,7 +89,9 @@ public final class TouchInput {
             } else context = next;
         }
     }
-    public void down(int id, int role, int action, float x, float y) {
+    public void down(int id, int role, int action, float x, float y) { down(id, role, action, x, y, -1); }
+    /** time: the MotionEvent time in ms, the base of LOOK ACCELERATION; -1 when unknown. */
+    public void down(int id, int role, int action, float x, float y, long time) {
         if (!context.usable() || pointers.containsKey(id) || pointers.size() >= 10
                 || !Float.isFinite(x) || !Float.isFinite(y)) return;
         if (role == MOVEMENT && !context.gameplay()) role = IGNORE;
@@ -86,6 +106,7 @@ public final class TouchInput {
             else aimLatched = !aimLatched;
         }
         Pointer p = new Pointer(role, action, x, y);
+        p.time = time;
         pointers.put(id, p);
         if (role == MOVEMENT) {
             // A fresh stick touch stops the latch without releasing another finger's fire/aim.
@@ -97,8 +118,9 @@ public final class TouchInput {
         recomputeHeld();
         emit(0, 0);
     }
+    public void move(int id, float x, float y) { move(id, x, y, -1); }
     /** Call for every historical sample, then the current MotionEvent sample. */
-    public void move(int id, float x, float y) {
+    public void move(int id, float x, float y, long time) {
         Pointer p = pointers.get(id);
         if (p == null || !Float.isFinite(x) || !Float.isFinite(y)) return;
         float dx = x - p.x, dy = y - p.y;
@@ -119,12 +141,27 @@ public final class TouchInput {
             if (sprintLatched) { moveX = 0; moveY = 1; }
             else if (stopBlockedUntilNeutral) moveX = moveY = 0;
         }
-        float gain = degreesPerDp / density * ((held & bit(AIM)) != 0 ? adsMultiplier : 1);
+        float gain = degreesPerDp / density * ((held & bit(AIM)) != 0 ? adsMultiplier : 1)
+                * (id == lookId ? lookGain(p, dx, dy, time) : 1);
         emit(id == lookId ? dx * gain : 0,
                 id == lookId ? -dy * gain * (invertY ? -1 : 1) : 0);
     }
-    public void up(int id, float x, float y) {
-        move(id, x, y);
+    /** LOOK ACCELERATION from the smoothed finger speed; untimed samples stay linear. */
+    private float lookGain(Pointer p, float dx, float dy, long time) {
+        if (!lookAcceleration || time < 0) return 1;
+        if (p.time < 0 || time < p.time) { p.time = time; p.untimedDp = 0; p.speed = 0; return 1; }
+        // Samples sharing a millisecond are timed together with the next one.
+        p.untimedDp += (float) Math.hypot(dx, dy) / density;
+        long dt = time - p.time;
+        if (dt > 0) {
+            p.speed += (p.untimedDp / dt - p.speed) * (float) (1 - Math.exp(-dt / ACCEL_SMOOTH_MS));
+            p.time = time; p.untimedDp = 0;
+        }
+        return accelerationGain(p.speed);
+    }
+    public void up(int id, float x, float y) { up(id, x, y, -1); }
+    public void up(int id, float x, float y, long time) {
+        move(id, x, y, time);
         pointers.remove(id);
         if (id == moveId) {
             moveId = -1; moveX = 0; moveY = sprintLatched ? 1 : 0; sprintHeld = false;

@@ -731,8 +731,10 @@ int main(int argc, char** argv) {
         assert(TouchSettingValueText(3,.223999798) == "0.22" && TouchSettingValueText(4,.55000001192) == "0.55");
         assert(TouchSettingValueText(11,1) == "1.00" && TouchSettingValueText(12,.400000059) == "0.40");
         assert(touchSettingsState.values == saved); // Display rounding cannot quantize saved preferences.
-        // v7 appended the Reload button toggle after frame pacing, v8 the tap radial; ids 0-35 keep their slots.
-        assert(kTouchSettingsVersion == 8 && kTouchSettingCount == 37 && kTouchReloadButtonSetting == 35);
+        // v7 appended the Reload button toggle after frame pacing, v8 the tap radial, v9 the
+        // inset margin, button icons and hidden gamepad images, v10 look acceleration;
+        // ids 0-36 keep their slots.
+        assert(kTouchSettingsVersion == 10 && kTouchSettingCount == 41 && kTouchReloadButtonSetting == 35);
         assert(touchSettingSpecs[kTouchReloadButtonSetting].toggle &&
             std::string(TouchSettingCaption(kTouchReloadButtonSetting,false)) == "RELOAD BUTTON" &&
             std::string(TouchSettingCaption(kTouchReloadButtonSetting,true)) == "КНОПКА ПЕРЕЗАРЯДКИ" &&
@@ -756,6 +758,38 @@ int main(int argc, char** argv) {
         const auto radialOn = ExchangeBl2TouchSettings(host);
         assert(radialOn.size() == kTouchSettingCount+3 && radialOn[3+kTouchRadialTapSetting] == 1 &&
             radialOn[3+kTouchReloadButtonSetting] == 1);
+        assert(kTouchScreenInsetsSetting == 37 && kTouchButtonIconsSetting == 38 && kTouchHideGamepadGlyphsSetting == 39);
+        for (const auto id : {kTouchScreenInsetsSetting,kTouchButtonIconsSetting,kTouchHideGamepadGlyphsSetting})
+            assert(touchSettingSpecs[id].toggle && TouchSettingHint(id,true) && TouchSettingHint(id,false) &&
+                !SetBl2TouchSetting(id,2) && !SetBl2TouchSetting(id,.5));
+        assert(std::string(TouchSettingCaption(kTouchScreenInsetsSetting,true)) == "ОТСТУП ОТ ВЫРЕЗА ЭКРАНА" &&
+            std::string(TouchSettingCaption(kTouchButtonIconsSetting,true)) == "ЗНАЧКИ НА КНОПКАХ" &&
+            std::string(TouchSettingCaption(kTouchHideGamepadGlyphsSetting,true)) == "СКРЫТЬ КНОПКИ ГЕЙМПАДА" &&
+            std::string(TouchSettingCaption(kTouchHideGamepadGlyphsSetting,false)) == "HIDE GAMEPAD BUTTONS");
+        assert(!Bl2HideGamepadGlyphs() && SetBl2TouchSetting(kTouchHideGamepadGlyphsSetting,1) && Bl2HideGamepadGlyphs());
+        const auto v9 = ExchangeBl2TouchSettings(host);
+        assert(v9[3+kTouchHideGamepadGlyphsSetting] == 1 && v9[3+kTouchScreenInsetsSetting] == 0);
+        assert(SetBl2TouchSetting(kTouchHideGamepadGlyphsSetting,0) && !Bl2HideGamepadGlyphs());
+        // v10: look acceleration follows the v9 fields; look and aim sensitivity reach 3.00.
+        assert(kTouchLookAccelerationSetting == 40 && touchSettingSpecs[kTouchLookAccelerationSetting].toggle &&
+            std::string(TouchSettingCaption(kTouchLookAccelerationSetting,true)) == "УСКОРЕНИЕ ОБЗОРА" &&
+            std::string(TouchSettingCaption(kTouchLookAccelerationSetting,false)) == "LOOK ACCELERATION" &&
+            TouchSettingHint(kTouchLookAccelerationSetting,true) && TouchSettingHint(kTouchLookAccelerationSetting,false));
+        assert(!SetBl2TouchSetting(kTouchLookAccelerationSetting,2) && !SetBl2TouchSetting(kTouchLookAccelerationSetting,.5) &&
+            SetBl2TouchSetting(kTouchLookAccelerationSetting,1));
+        assert(SetBl2TouchSetting(3,3) && SetBl2TouchSetting(4,2.5) && !SetBl2TouchSetting(3,3.01) && !SetBl2TouchSetting(4,3.01));
+        assert(TouchSettingValueText(3,3) == "3.00" && TouchSettingValueText(4,2.5) == "2.50");
+        const auto v10 = ExchangeBl2TouchSettings(host);
+        assert(v10.size() == kTouchSettingCount+3 && v10[3+kTouchLookAccelerationSetting] == 1 &&
+            TouchSettingNumber(3,v10[3+3]) == 3 && TouchSettingNumber(4,v10[3+4]) == 2.5);
+        auto v9Host = host; v9Host[0] = 9; v9Host.pop_back(); v9Host[1] = v10[1];
+        assert(ExchangeBl2TouchSettings(v9Host)[3+kTouchLookAccelerationSetting] == 1); // A v9 host cannot clear it.
+        // GfxSession::stringValue refuses 256 bytes or more: a longer UTF-8 hint never shows.
+        for (std::size_t id = 0; id < kTouchSettingCount; ++id)
+            for (const bool russian : {false, true}) {
+                const char* hint = TouchSettingHint(id,russian);
+                assert((!hint || std::strlen(hint) < 256) && std::strlen(TouchSettingCaption(id,russian)) < 256);
+            }
     }
     {
         // Overflowing original descriptions scroll by whole lines under a vertical drag.
@@ -795,7 +829,7 @@ int main(int argc, char** argv) {
         assert(Bl2TextScrollLine(3,9,-9,20) == 3 && Bl2TextScrollLine(3,9,-11,20) == 4); // Rounded whole lines.
         assert(Bl2TextScrollLine(3,9,std::numeric_limits<double>::quiet_NaN(),20) == 3);
         assert(Bl2TextScrollLine(3,9,-50,0) == 3 && Bl2TextScrollLine(0,9,-50,20) == 0 && Bl2TextScrollLine(10,9,-50,20) == 10);
-        std::cout << "PASS: settings v8 Reload and tap radial toggles; mission/challenge/quest description targets, authored boxes and line mapping\n";
+        std::cout << "PASS: settings v10 Reload, tap radial, inset margin, icon, gamepad image and look acceleration toggles, 3x look/aim sensitivity; mission/challenge/quest description targets, authored boxes and line mapping\n";
     }
     {
         Vm vm(argv[1]);

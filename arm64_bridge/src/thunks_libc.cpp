@@ -460,7 +460,7 @@ extern "C" int IndexObbSplitApks(const char* const* paths, size_t count) {
     std::vector<ScannedSplit> verified;
     verified.reserve(count);
     // The two signed cache splits contain 4.1 GiB of STORED OBB data.
-    // On abb24fae the main SHA-256/CRC pass alone took 40.2 seconds; the
+    // On the Adreno 650 test device the main SHA-256/CRC pass alone took 40.2 seconds; the
     // former shared 40-second deadline rejected the patch after 3 MiB.
     const auto verification_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(120);

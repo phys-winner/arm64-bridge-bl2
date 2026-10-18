@@ -63,8 +63,11 @@ struct SurfaceRect { float left = 0, top = 0, right = 0, bottom = 0; };
 // Context::weaponSlots: bits 0-3 mark slots 1-4 holding a readied weapon,
 // bits 8-10 the equipped weapon's slot (0 none), bit 15 a known word, and
 // bits 16-31 one 4-bit code per slot: EWeaponType + 1 (WT_Pistol 1 ..
-// WT_RocketLauncher 6), 0 when unknown. Anything else publishes as 0.
+// WT_RocketLauncher 6), 0 when unknown. Bit 11 marks an equipped weapon with
+// neither a loaded round nor spare ammo (Fire's place then melees). Anything
+// else publishes as 0.
 constexpr std::uint32_t kWeaponSlotsKnown = 1u << 15;
+constexpr std::uint32_t kWeaponEquippedEmpty = 1u << 11;
 
 struct Context {
     Mode mode = Mode::Unknown;

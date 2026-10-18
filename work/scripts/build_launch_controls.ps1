@@ -2,15 +2,15 @@ $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $buildRoot = [IO.Path]::GetFullPath((Join-Path $root 'work\build'))
 $temporary = Join-Path $buildRoot ('launch-controls-' + [guid]::NewGuid().ToString('N'))
-$jdk = 'C:\Portable\jdk-24.0.1\bin'
-$androidJar = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\platforms\android-36\android.jar'
-$d8Jar = 'D:\ai_test\old_game_restoration\tools\android\sdk\build-tools\37.0.0\lib\d8.jar'
-$toolsRoot = 'D:\ai_test\old_game_restoration\tools\android'
+$jdk = "$env:JAVA_HOME\bin"
+$androidJar = "$env:ANDROID_HOME\platforms\android-36\android.jar"
+$d8Jar = "$env:ANDROID_HOME\build-tools\37.0.0\lib\d8.jar"
+$baksmaliJar = $env:BAKSMALI_JAR
 $relativePackage = 'com\tt2kgames\Borderlands2'
 $portNames = @('LaunchControls','GameStorage','DisplayModePolicy','Downloader','GameRestart',
     'LocalPlatform','LocalIdentity','LocalSaveGame','LocalAchievements')
 $source = @($portNames | ForEach-Object { Join-Path $root "android_port\src\$relativePackage\$_.java" })
-$touchNames = @('NativeTouchControls','TouchBridge','TouchContract','TouchInput','TouchLayout','TouchPreferences','TouchSources','TouchGyro')
+$touchNames = @('NativeTouchControls','TouchBridge','TouchContract','TouchInput','TouchLayout','TouchPreferences','TouchSources','TouchGyro','TouchIcons')
 foreach ($name in $touchNames) {
     $source += Join-Path $root "android_port\src\$relativePackage\touch\$name.java"
 }
@@ -22,7 +22,7 @@ try {
     if ($LASTEXITCODE) { throw 'Launch controls jar failed' }
     & "$jdk\java.exe" -cp $d8Jar com.android.tools.r8.D8 --min-api 24 --lib $androidJar --output (Join-Path $temporary 'dex') (Join-Path $temporary 'classes.jar')
     if ($LASTEXITCODE) { throw 'Launch controls d8 failed' }
-    & "$jdk\java.exe" -jar "$toolsRoot\baksmali.jar" d (Join-Path $temporary 'dex\classes.dex') -o (Join-Path $temporary 'smali')
+    & "$jdk\java.exe" -jar $baksmaliJar d (Join-Path $temporary 'dex\classes.dex') -o (Join-Path $temporary 'smali')
     if ($LASTEXITCODE) { throw 'Launch controls baksmali failed' }
     # D8's synthetic lambda marker is not a runtime dependency of the game.
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $temporary 'smali') -Recurse -Filter '*.smali') {
@@ -41,13 +41,13 @@ try {
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $root "app\smali\$relativePackage\$($file.Name)") -Force
     }
     $touchGenerated = @(Get-ChildItem -LiteralPath (Join-Path $temporary "smali\$relativePackage\touch") -File)
-    if (!$touchGenerated -or ($touchGenerated | Where-Object { $_.Name -notmatch '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources|TouchGyro)(?:\$[^\\]+)?\.smali$' })) {
+    if (!$touchGenerated -or ($touchGenerated | Where-Object { $_.Name -notmatch '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources|TouchGyro|TouchIcons)(?:\$[^\\]+)?\.smali$' })) {
         throw 'Unexpected generated touch class ownership'
     }
     $touchDestination = Join-Path $root "app\smali\$relativePackage\touch"
     [IO.Directory]::CreateDirectory($touchDestination) | Out-Null
     foreach ($old in Get-ChildItem -LiteralPath $touchDestination -File) {
-        if ($old.Name -match '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources|TouchGyro)(?:\$[^\\]+)?\.smali$' -and
+        if ($old.Name -match '^(?:NativeTouchControls|TouchBridge|TouchContract|TouchInput|TouchLayout|TouchPreferences|TouchSources|TouchGyro|TouchIcons)(?:\$[^\\]+)?\.smali$' -and
             $old.Name -notin $touchGenerated.Name) { Remove-Item -LiteralPath $old.FullName }
     }
     foreach ($file in $touchGenerated) {

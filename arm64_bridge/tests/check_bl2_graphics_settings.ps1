@@ -1,9 +1,9 @@
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path
 $out = Join-Path $root 'work/evidence/touch-arm64-20261007'
-$msvc = 'C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231'
-$sdk = 'C:/Program Files (x86)/Windows Kits/10'
-$version = '10.0.26100.0'
+$msvc = "$env:VCToolsInstallDir".TrimEnd('\')
+$sdk = "$env:WindowsSdkDir".TrimEnd('\')
+$version = "$env:WindowsSDKVersion".TrimEnd('\')
 $previousPath = $env:PATH; $previousInclude = $env:INCLUDE; $previousLib = $env:LIB
 try {
     $env:PATH = "$msvc/bin/Hostx64/x64;$env:PATH"

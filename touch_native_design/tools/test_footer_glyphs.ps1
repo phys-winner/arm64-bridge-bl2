@@ -1,8 +1,8 @@
 param(
-    [string]$NdkRoot = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018',
-    [string]$MsvcRoot = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231',
-    [string]$WindowsSdkRoot = 'C:\Program Files (x86)\Windows Kits\10',
-    [string]$WindowsSdkVersion = '10.0.26100.0',
+    [string]$NdkRoot = "$env:ANDROID_HOME\ndk\27.2.12479018",
+    [string]$MsvcRoot = $env:VCToolsInstallDir,
+    [string]$WindowsSdkRoot = $env:WindowsSdkDir,
+    [string]$WindowsSdkVersion = "$env:WindowsSDKVersion".TrimEnd('\'),
     [string]$OutputDirectory = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -14,14 +14,9 @@ if (-not $OutputDirectory) {
 }
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $compiler = Join-Path $NdkRoot 'toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe'
-foreach ($abi in @('aarch64','armv7a')) {
+foreach ($abi in @('aarch64')) {
     $androidArgs = @("--target=${abi}-linux-android24", '-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror', '-fPIC',
         '-DHORN_ENABLE_LOGGING=0', '-I', $sourceRoot)
-    if ($abi -eq 'armv7a') {
-        $androidArgs += @('-DBL2_NATIVE_ARM32=1', '-mfpu=neon', '-fno-delete-null-pointer-checks',
-            '-I', (Join-Path $projectRoot 'arm32_compat\include'), '-I', (Join-Path $projectRoot 'arm32_compat\src'))
-        $androidArgs[0] = '--target=armv7a-linux-androideabi24'
-    }
     & $compiler @androidArgs '-c' (Join-Path $sourceRoot 'bl2_touch_widget_commands.cpp') `
         '-o' (Join-Path $OutputDirectory ('widget_commands.' + $abi + '.o'))
     if ($LASTEXITCODE -ne 0) { throw "Footer Android compile failed: $abi" }

@@ -2,7 +2,7 @@
 //
 // BL2's UWorld::Tick runs a full reachability analysis (FArchiveRealtimeGC)
 // whenever TimeSinceLastPendingKillPurge exceeds
-// GEngine->TimeBetweenPurgingPendingKillObjects (60 s). Measured on abb24fae
+// GEngine->TimeBetweenPurgingPendingKillObjects (60 s). Measured on Adreno 650
 // (Outwash): ~35 ms of game-thread work, one 54-62 ms frame every minute of play.
 //
 // The scheduler runs on the game thread at the touch input boundary, the thread

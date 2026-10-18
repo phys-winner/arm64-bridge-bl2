@@ -679,10 +679,138 @@ public final class TouchInputTest {
         input.cancel();count=sink.packets.size();input.pulse(CHAT);
         check(sink.resets==1 && sink.packets.size()==count,"lifecycle cancellation requires a fresh native context before Chat");
     }
+    /** Layout editor: placements, More's content, the toolbar, the button panel and Fire's melee. */
+    private static void checkLayoutEditor() {
+        // The shipped layout: six permanent buttons, contextual Reload and Action, the rest in More.
+        for (int a:new int[]{FIRE,AIM,GRENADE,JUMP,RELOAD,USE,PAUSE,TouchLayout.MORE_BUTTON})
+            check(TouchLayout.defaultPlacement(a)==TouchLayout.PLACE_SCREEN,"on the screen by default: "+a);
+        for (int a:new int[]{MELEE,CROUCH,SKILL,NEXT_WEAPON,PREV_WEAPON,INVENTORY,MAP,CHAT,SUICIDE})
+            check(TouchLayout.defaultPlacement(a)==TouchLayout.PLACE_MORE,"inside More by default: "+a);
+        for (int a:new int[]{FIRE,AIM,JUMP,USE,PAUSE,TouchLayout.MORE_BUTTON})
+            check(!TouchLayout.placementAllowed(a,TouchLayout.PLACE_MORE) && TouchLayout.placementAllowed(a,TouchLayout.PLACE_HIDDEN),
+                    "held controls and utilities never become a sector but can be removed: "+a);
+        check(TouchLayout.placementAllowed(GRENADE,TouchLayout.PLACE_MORE) && TouchLayout.placementAllowed(RELOAD,TouchLayout.PLACE_MORE),
+                "Grenade and Reload may go into More");
+        check(!TouchLayout.placementAllowed(VEHICLE_HORN,TouchLayout.PLACE_SCREEN) && !TouchLayout.placementAllowed(FIRE,3),
+                "seat actions and unknown places are not editable");
+        TouchPreferences p=new TouchPreferences();
+        int[] defaultMore={NEXT_WEAPON,SKILL,CROUCH,MELEE,INVENTORY,MAP,PREV_WEAPON,SUICIDE,CHAT};
+        check(java.util.Arrays.equals(p.moreItems(),defaultMore),"More keeps its shipped items and order");
+        check(java.util.Arrays.equals(NativeTouchControls.footRadial(p),
+                new int[]{NEXT_WEAPON,SKILL,CROUCH,MELEE,INVENTORY,MAP,PREV_WEAPON,RELOAD,SUICIDE,CHAT}),
+                "the default foot radial equals the earlier fixed radial, Reload as its fallback");
+        check(!p.placement(TouchLayout.MORE_BUTTON,TouchLayout.PLACE_HIDDEN)
+                && p.placement(TouchLayout.MORE_BUTTON)==TouchLayout.PLACE_SCREEN,"More cannot go while buttons are inside it");
+        check(!p.placement(FIRE,TouchLayout.PLACE_MORE) && p.placement(FIRE)==TouchLayout.PLACE_SCREEN,"Fire never moves into More");
+        check(p.placement(MELEE,TouchLayout.PLACE_SCREEN) && p.placement(MELEE)==TouchLayout.PLACE_SCREEN
+                && !contains(p.moreItems(),MELEE),"Melee becomes a button and leaves More");
+        check(p.placement(FIRE,TouchLayout.PLACE_HIDDEN) && p.placement(FIRE)==TouchLayout.PLACE_HIDDEN,"Fire can be removed");
+        for (int a:defaultMore) if (a!=MELEE) check(p.placement(a,TouchLayout.PLACE_HIDDEN),"emptying More: "+a);
+        check(p.moreItemCount()==0 && p.placement(TouchLayout.MORE_BUTTON,TouchLayout.PLACE_HIDDEN)
+                && p.placement(TouchLayout.MORE_BUTTON)==TouchLayout.PLACE_HIDDEN,"an empty More can be removed");
+        check(p.placement(GRENADE,TouchLayout.PLACE_MORE) && p.placement(TouchLayout.MORE_BUTTON)==TouchLayout.PLACE_SCREEN
+                && java.util.Arrays.equals(p.moreItems(),new int[]{GRENADE}),"a button put into a removed More brings More back");
+        check(java.util.Arrays.equals(NativeTouchControls.footRadial(p),new int[]{GRENADE,RELOAD}),
+                "the foot radial follows the editor; Reload on the screen stays its fallback");
+        p.placement(RELOAD,TouchLayout.PLACE_HIDDEN);
+        check(java.util.Arrays.equals(NativeTouchControls.footRadial(p),new int[]{GRENADE}),"a removed Reload is no fallback either");
+        java.util.Properties store;
+        try {
+            java.lang.reflect.Field storeField=TouchPreferences.class.getDeclaredField("store");
+            storeField.setAccessible(true);
+            store=(java.util.Properties)storeField.get(p);
+        } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
+        store.setProperty("place_"+AIM,"more");store.setProperty("place_"+JUMP,"sideways");
+        check(p.placement(AIM)==TouchLayout.PLACE_SCREEN && p.placement(JUMP)==TouchLayout.PLACE_SCREEN,
+                "a forbidden or unknown stored place falls back to the default");
+        p.position(MELEE,.5f,.5f);p.position(TouchLayout.MORE_BUTTON,.2f,.4f);
+        check(NativeTouchControls.customPosition(p,TouchLayout.MORE_BUTTON),"More keeps a dragged position");
+        p.resetLayout();
+        check(java.util.Arrays.equals(p.moreItems(),defaultMore) && p.placement(FIRE)==TouchLayout.PLACE_SCREEN
+                && !NativeTouchControls.customPosition(p,MELEE) && !NativeTouchControls.customPosition(p,TouchLayout.MORE_BUTTON),
+                "the editor's reset restores places and positions");
+        // More's radial follows the foot list on foot; a seat keeps its own items.
+        long foot=(1L<<27)-1;
+        Context walk=new Context(5,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,foot,1,foot,3,2,0,new float[4],new float[4]);
+        check(java.util.Arrays.equals(NativeTouchControls.radialItems(walk,false,false,false,new int[]{MELEE,GRENADE}),
+                new int[]{MELEE,GRENADE}),"an edited More shows exactly its items");
+        Context seat=new Context(7,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,bit(VEHICLE_HORN)|bit(SWITCH_SEATS),1);
+        check(java.util.Arrays.equals(NativeTouchControls.radialItems(seat,false,false,false,new int[0]),
+                new int[]{VEHICLE_HORN,SWITCH_SEATS}),"a seat ignores the on-foot More");
+        // An empty equipped weapon: Fire's place melees on foot only.
+        int slots=WEAPON_SLOTS_KNOWN|0b0011|(2<<8)|(3<<16)|(1<<20);
+        long known=bit(RELOAD);
+        Context loaded=new Context(9,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,foot,1,known,2,1,0,null,null,null,null,null,null,null,slots);
+        Context empty=new Context(9,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,foot,1,known,2,1,0,null,null,null,null,null,null,null,
+                slots|WEAPON_EQUIPPED_EMPTY);
+        check(!loaded.equippedEmpty() && empty.equippedEmpty() && empty.equippedSlot()==2,"the empty bit belongs to the equipped weapon");
+        check(!NativeTouchControls.fireShowsMelee(loaded,false) && NativeTouchControls.fireShowsMelee(empty,false),
+                "Fire's place melees only while the weapon is empty");
+        check(!NativeTouchControls.fireShowsMelee(empty,true),"the editor always shows Fire");
+        Context noMelee=new Context(9,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,foot&~bit(MELEE),1,known,2,1,0,null,null,null,null,null,null,null,
+                slots|WEAPON_EQUIPPED_EMPTY);
+        check(!NativeTouchControls.fireShowsMelee(noMelee,false),"without Melee (FFYL) Fire stays");
+        Context riding=new Context(9,VEHICLE,GAMEPLAY_INPUT|RELATIVE_LOOK,foot,1,known,2,1,0,null,null,null,null,null,null,null,
+                slots|WEAPON_EQUIPPED_EMPTY);
+        check(!NativeTouchControls.fireShowsMelee(riding,false),"a seat's Fire is the vehicle weapon");
+        Context unequipped=new Context(9,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,foot,1,known,2,1,0,null,null,null,null,null,null,null,
+                (slots&~(7<<8))|WEAPON_EQUIPPED_EMPTY);
+        check(!unequipped.equippedEmpty(),"no equipped slot, no empty weapon");
+        long[] words=new long[25];
+        long[] head={VERSION,80,GAMEPLAY,GAMEPLAY_INPUT|RELATIVE_LOOK,foot,3,known,2,1,0};
+        System.arraycopy(head,0,words,0,head.length);
+        words[24]=(slots|WEAPON_EQUIPPED_EMPTY)&0xFFFFFFFFL;
+        check(Context.decode(words).equippedEmpty(),"the empty bit decodes from the snapshot's slot word");
+        // Utilities and the menu buttons keep a fixed size, the top row and no mirroring.
+        for (int a:new int[]{PAUSE,INVENTORY,MAP,CHAT}) check(TouchLayout.topRow(a) && TouchLayout.utility(a),"top row: "+a);
+        check(TouchLayout.utility(TouchLayout.MORE_BUTTON) && !TouchLayout.topRow(TouchLayout.MORE_BUTTON)
+                && !TouchLayout.utility(MELEE) && !TouchLayout.utility(FIRE),"More is a utility; Melee and Fire are not");
+        check(TouchLayout.gameplaySize(INVENTORY,1080,3,1.4f)==44*3,"menu buttons keep 44dp like Pause");
+        java.util.ArrayList<float[]> occupied=new java.util.ArrayList<>();
+        float[] anchor=TouchLayout.gameplayAnchor(MAP);
+        float[] map=TouchLayout.placeGameplay(MAP,anchor[0],anchor[1],44*2,0,0,1560,720,2,true,false,occupied,null);
+        check(map!=null && map[3]<=56*2+.01f && Math.abs((map[0]+map[2])/2-anchor[0]*1560)<1,
+                "a Map button sits in the top row, unmirrored in left-hand mode");
+        for (int a:new int[]{SKILL,CROUCH,MELEE,NEXT_WEAPON,PREV_WEAPON,SUICIDE}) {
+            float[] at=TouchLayout.gameplayAnchor(a);
+            check(at[0]>=.6f && at[1]>=.6f,"an added combat button starts beside the cluster: "+a);
+        }
+        // Remove badge on the rim, toolbar pills centred and spaced, the panel fits phones.
+        float[] badge=TouchLayout.removeBadge(100,100,40,2);
+        check(Math.abs(Math.hypot(badge[0]-100,badge[1]-100)-40*Math.sqrt(2)*.72f)<.01f && badge[0]>100 && badge[1]<100 && badge[2]==20,
+                "the remove badge sits on the button's upper right rim");
+        float[][] pills=TouchLayout.toolbar(0,96,1560,new float[]{200,300,180,160},2);
+        check(pills!=null && pills.length==4 && Math.abs((pills[0][0]+pills[3][2])/2-780)<.01f && pills[0][1]==96+16
+                && Math.abs(pills[1][0]-pills[0][2]-16)<.01f,"toolbar pills are centred with 8dp gaps");
+        check(TouchLayout.toolbar(0,0,300,new float[]{200,300},2)==null,"a toolbar that does not fit is not drawn");
+        for (float[] screen:new float[][]{{1560,720,2},{2424,1080,2.625f},{2340,1080,2.75f}}) {
+            float[][] r=TouchLayout.palette(0,0,screen[0],screen[1],TouchLayout.EDITABLE.length,screen[2]);
+            check(r!=null && r.length==TouchLayout.EDITABLE.length+2,"the button panel fits "+screen[0]+"x"+screen[1]);
+            check(r[0][0]>=0 && r[0][1]>=0 && r[0][2]<=screen[0] && r[0][3]<=screen[1],"the card stays on screen");
+            for (int i=2;i<r.length;++i) {
+                check(r[i][0]>=r[0][0] && r[i][2]<=r[0][2] && r[i][1]>=r[0][1] && r[i][3]<=r[0][3],"cells stay in the card");
+                check(r[i][3]-r[i][1]>=32*screen[2]-.01f,"cells keep a 32dp touch height");
+                float[] previous=null;
+                for (int place=0;place<3;++place) {
+                    float[] s=TouchLayout.segment(r[i],place,screen[2]);
+                    check(s[0]>=r[i][0] && s[2]<=r[i][2] && s[2]-s[0]>=40*screen[2],"segments stay in the cell, 40dp+ wide");
+                    if (previous!=null) check(s[0]>=previous[2],"segments do not overlap");
+                    previous=s;
+                }
+            }
+        }
+        check(TouchLayout.palette(0,0,400,300,17,2)==null,"no panel without room");
+        for (int a:TouchLayout.EDITABLE) check(TouchIcons.has(a),"every editable control has an icon: "+a);
+        for (int a:new int[]{VEHICLE_BOOST,VEHICLE_BRAKE,EXIT_VEHICLE,VEHICLE_HORN,SWITCH_SEATS,LOOK_BACK,DRIVER_FIRE_TURRET,BACK,CONFIRM,SKIP})
+            check(TouchIcons.has(a),"seat, menu and cinematic buttons have icons: "+a);
+        check(!TouchIcons.has(UI_ACTION) && !TouchIcons.has(UI_OTHER),"screen-specific menu keys keep their captions");
+        check(NativeTouchControls.tapButton(INVENTORY) && NativeTouchControls.tapButton(MAP) && NativeTouchControls.tapButton(CHAT)
+                && !NativeTouchControls.tapButton(MELEE) && !NativeTouchControls.tapButton(FIRE),"menu buttons act on a tap");
+    }
     public static void main(String[] args) throws Exception {
         check(TouchContract.MOVIE_PLAYING==1 && TouchContract.MOVIE_STARTUP==2,
                 "movie state bits match kMovie* in bl2_touch_input.h");
-        checkChatEntry();checkStageFive();checkStageSix();checkStageSeven();checkDeferredSettingsWrite();
+        checkChatEntry();checkStageFive();checkStageSix();checkStageSeven();checkDeferredSettingsWrite();checkLayoutEditor();
         checkHudGestures();checkAutoRun();checkReferenceCluster();checkObjectiveHud();
         TouchPreferences hints=new TouchPreferences();
         check(!hints.mapTapHintSeen && !hints.weaponGestureHintSeen,"one-shot HUD hints begin unseen");
@@ -724,12 +852,14 @@ public final class TouchInputTest {
                 "interface scale is bounded independently of render scale");
         check(TouchPreferences.uiPercent(Float.NaN)==125 && TouchPreferences.uiPercent(Float.POSITIVE_INFINITY)==125,
                 "invalid interface scale restores the 125-percent default");
-        int[] settings={8,1,0,100,Float.floatToIntBits(.42f),Float.floatToIntBits(1),
+        int[] settings={10,1,0,100,Float.floatToIntBits(.42f),Float.floatToIntBits(1),
             Float.floatToIntBits(.22f),Float.floatToIntBits(.55f),0,0,0,0,1,1,
             Float.floatToIntBits(1),Float.floatToIntBits(.4f),0,1,1,0,125,0,0};
-        settings=java.util.Arrays.copyOf(settings,40);
+        settings=java.util.Arrays.copyOf(settings,44);
         java.util.Arrays.fill(settings,24,35,-1);
         settings[38]=1;
+        settings[41]=1; // v9: icons ON; inset margin and hidden gamepad images OFF.
+        settings[43]=1; // v10: look acceleration ON.
         check(TouchPreferences.validSettingsWire(settings),"native settings protocol admits bounded full vector");
         int[] defaults = settings.clone();
         settings[0]=1;
@@ -747,8 +877,22 @@ public final class TouchInputTest {
         settings[0]=7;
         check(!TouchPreferences.validSettingsWire(settings),"v7 cannot silently accept the radial tap field");
         settings[0]=8;
-        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,39)),"old field count cannot be accepted as v8");
-        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,41)),"extra fields cannot be accepted as v8");
+        check(!TouchPreferences.validSettingsWire(settings),"v8 cannot silently accept the inset, icon and gamepad image fields");
+        settings[0]=9;
+        check(!TouchPreferences.validSettingsWire(settings),"v9 cannot silently accept the look acceleration field");
+        settings[0]=10;
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,43)),"the v9 field count cannot be accepted as v10");
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,42)),"old field count cannot be accepted as v10");
+        check(!TouchPreferences.validSettingsWire(java.util.Arrays.copyOf(settings,45)),"extra fields cannot be accepted as v10");
+        for(float sensitivity:new float[]{1.5f,2.5f,3}) {
+            settings[6]=Float.floatToIntBits(sensitivity);settings[7]=Float.floatToIntBits(sensitivity);
+            check(TouchPreferences.validSettingsWire(settings),"look and aim sensitivity reach 3x: "+sensitivity);
+        }
+        settings[6]=Float.floatToIntBits(3.01f);
+        check(!TouchPreferences.validSettingsWire(settings),"look sensitivity stays within 3x");
+        settings[6]=Float.floatToIntBits(.22f);settings[7]=Float.floatToIntBits(3.01f);
+        check(!TouchPreferences.validSettingsWire(settings),"aim sensitivity stays within 3x");
+        settings[7]=Float.floatToIntBits(.55f);
         for(int fps:new int[]{0,30,60,90}) {
             settings[22]=fps;
             check(TouchPreferences.validSettingsWire(settings),"exact selectable FPS mode admitted: "+fps);
@@ -785,6 +929,10 @@ public final class TouchInputTest {
                 "absent performance and frame pacing choices default ON");
         check(preferences.reloadButton && preferences.settingsWire(1)[37]==1,"absent Reload button choice defaults ON");
         check(!preferences.radialTap && preferences.settingsWire(1)[38]==0,"absent radial tap choice defaults OFF");
+        check(!preferences.screenInsets && preferences.settingsWire(1)[39]==0,"controls use the whole screen unless the inset margin is chosen");
+        check(preferences.buttonIcons && preferences.settingsWire(1)[40]==1,"absent icon choice defaults ON");
+        check(!preferences.hideGamepadGlyphs && preferences.settingsWire(1)[41]==0,"gamepad button images stay unless hidden");
+        check(preferences.lookAcceleration && preferences.settingsWire(1)[42]==1,"absent look acceleration choice defaults ON");
         settings[19]=0;
         check(TouchPreferences.validSettingsWire(settings),"toggle checks start from a valid vector");
         for(int invalid:new int[]{-1,2,Float.floatToIntBits(1)}) {
@@ -793,8 +941,26 @@ public final class TouchInputTest {
             settings[36]=0;settings[37]=invalid;check(!TouchPreferences.validSettingsWire(settings),"frame pacing must be boolean");
             settings[37]=0;settings[38]=invalid;check(!TouchPreferences.validSettingsWire(settings),"Reload button must be boolean");
             settings[38]=1;settings[39]=invalid;check(!TouchPreferences.validSettingsWire(settings),"radial tap must be boolean");
-            settings[39]=0;
+            settings[39]=0;settings[40]=invalid;check(!TouchPreferences.validSettingsWire(settings),"inset margin must be boolean");
+            settings[40]=0;settings[41]=invalid;check(!TouchPreferences.validSettingsWire(settings),"icons must be boolean");
+            settings[41]=1;settings[42]=invalid;check(!TouchPreferences.validSettingsWire(settings),"hidden gamepad images must be boolean");
+            settings[42]=0;settings[43]=invalid;check(!TouchPreferences.validSettingsWire(settings),"look acceleration must be boolean");
+            settings[43]=1;
         }
+        settings[43]=0;
+        TouchPreferences v10=new TouchPreferences();
+        check(v10.applySettingsWire(settings) && !v10.lookAcceleration && v10.settingsWire(1)[42]==0,
+                "look acceleration OFF travels from the native page");
+        settings[43]=1;settings[6]=Float.floatToIntBits(2.5f);
+        check(v10.applySettingsWire(settings) && v10.lookAcceleration && Math.abs(v10.look-2.5f)<1e-6f
+                && v10.settingsWire(1)[5]==Float.floatToIntBits(2.5f),"look acceleration ON and a 2.5x look travel both ways");
+        settings[6]=Float.floatToIntBits(.22f);
+        settings[40]=1;settings[41]=0;settings[42]=1;
+        TouchPreferences v9=new TouchPreferences();
+        check(v9.applySettingsWire(settings) && v9.screenInsets && !v9.buttonIcons && v9.hideGamepadGlyphs
+                && v9.settingsWire(1)[39]==1 && v9.settingsWire(1)[40]==0 && v9.settingsWire(1)[41]==1,
+                "the three v9 choices travel both ways");
+        settings[40]=0;settings[41]=1;settings[42]=0;
         settings[23]=2;check(!TouchPreferences.validSettingsWire(settings),"Potato must be boolean");settings[23]=0;
         settings[24]=2;check(!TouchPreferences.validSettingsWire(settings),"graphics toggle must be boolean or original default");settings[24]=-1;
         settings[34]=5;check(!TouchPreferences.validSettingsWire(settings),"anisotropy index bounded to proven choices");settings[34]=-1;
@@ -845,7 +1011,7 @@ public final class TouchInputTest {
         check(preferences.uiPercent==130 && preferences.renderPercent==90,"saved UI percentage normalizes independently of rendering");
         preferences.uiPercent=125;preferences.save();preferences.reload();
         check(preferences.uiPercent==125 && "125".equals(store.getProperty("uiPercent")),"125-percent default survives save and reload exactly");
-        check(preferences.settingsWire(1).length==39 && preferences.settingsWire(1)[0]==8
+        check(preferences.settingsWire(1).length==43 && preferences.settingsWire(1)[0]==10
                 && preferences.settingsWire(1)[19]==125,"new FPS fields leave the UI and Debug IDs unchanged");
         int[] edited = defaults.clone();
         edited[1]=2; edited[2]=8; edited[3]=110;
@@ -986,6 +1152,44 @@ public final class TouchInputTest {
         other.down(9,TouchInput.LOOK,-1,0,0);
         for(int i=1;i<=10;i++) other.move(9,i*2,0);
         near(batched.yaw(),2.2f,"history splitting preserves integrated camera displacement");
+        // LOOK ACCELERATION (density 2, .22 deg/dp): linear below .5 dp/ms, 2.5x from 2.5 dp/ms.
+        near(TouchInput.accelerationGain(.2f),1,"slow drags stay linear");
+        near(TouchInput.accelerationGain(1.5f),1.75f,"the gain rises evenly between the thresholds");
+        near(TouchInput.accelerationGain(9),2.5f,"fast flicks are capped");
+        check(TouchInput.accelerationGain(Float.NaN)==1,"a bad speed stays linear");
+        Sink slow=new Sink(); TouchInput precise=new TouchInput(slow);
+        precise.configure(2,60,.22f,.5f,false); precise.setContext(play(1));
+        precise.down(9,TouchInput.LOOK,-1,0,0,1000);
+        for(int i=1;i<=20;i++) precise.move(9,i*4,0,1000+i*8);
+        near(slow.yaw(),40*.22f,"a slow timed drag (.25 dp/ms) turns exactly as before");
+        Sink fast=new Sink(); TouchInput flick=new TouchInput(fast);
+        flick.configure(2,60,.22f,.5f,false); flick.setContext(play(1));
+        flick.down(9,TouchInput.LOOK,-1,0,0,1000);
+        for(int i=1;i<=20;i++) flick.move(9,i*64,0,1000+i*8);
+        check(fast.yaw()>640*.22f*1.8f && fast.yaw()<640*.22f*2.5f+.001f,"a 4 dp/ms flick turns about 2.4 times further: "+fast.yaw());
+        near(fast.last().yaw,32*.22f*2.5f,"the smoothed speed reaches the full gain");
+        Sink off=new Sink(); TouchInput linear=new TouchInput(off);
+        linear.configure(2,60,.22f,.5f,false); linear.lookAcceleration(false); linear.setContext(play(1));
+        linear.down(9,TouchInput.LOOK,-1,0,0,1000);
+        for(int i=1;i<=20;i++) linear.move(9,i*64,0,1000+i*8);
+        near(off.yaw(),640*.22f,"LOOK ACCELERATION OFF keeps the linear camera");
+        Sink same=new Sink(); TouchInput burst=new TouchInput(same);
+        burst.configure(2,60,.22f,.5f,false); burst.setContext(play(1));
+        burst.down(9,TouchInput.LOOK,-1,0,0,1000);
+        burst.move(9,64,0,1000); burst.move(9,128,0,1000); burst.move(9,192,0,1016);
+        check(Float.isFinite(same.yaw()) && same.yaw()>=96*.22f-.001f && same.yaw()<=96*.22f*2.5f,
+                "samples sharing a millisecond are timed with the next one: "+same.yaw());
+        Sink moving=new Sink(); TouchInput stick=new TouchInput(moving);
+        stick.configure(2,60,.22f,.5f,false); stick.setContext(play(1));
+        stick.down(10,TouchInput.MOVEMENT,-1,0,0,1000);
+        for(int i=1;i<=10;i++) stick.move(10,0,-i*64,1000+i*8);
+        near(moving.yaw(),0,"a fast stick never turns the camera");
+        Sink wide=new Sink(); TouchInput turn=new TouchInput(wide);
+        turn.configure(2,60,5,5,false); turn.setContext(play(1));
+        turn.down(11,TouchInput.LOOK,-1,0,0); turn.move(11,20,0);
+        near(wide.yaw(),30,"look sensitivity is clamped to 3x (3 deg/dp)");
+        turn.down(12,TouchInput.BUTTON,AIM,0,0); turn.move(11,40,0);
+        near(wide.last().yaw,90,"aim sensitivity is clamped to 3x");
         other.down(12,TouchInput.BUTTON,JUMP,0,0); other.up(12,0,0);
         check(batched.packets.get(batched.packets.size()-3).held==bit(JUMP)
                 && batched.last().held==0,"quick tap sends both states without 600ms dwell");
@@ -1103,6 +1307,6 @@ public final class TouchInputTest {
         TouchLayout.reserveGameplayHud(22,10,2446,1090,offsetHud);
         for(int i=0;i<hud.size();++i) for(int axis=0;axis<4;++axis)
             near(offsetHud.get(i)[axis],hud.get(i)[axis]+(axis%2==0?22:10),"HUD reservation follows Surface origin independently of safe insets");
-        System.out.println("TouchInputTest: HUD gestures, held action margins, pointer lifecycle, tutorials, settings v8, deferred writer, stick-zone camera, hint span, render50, graphics/performance/pacing/Reload button persistence and reset passed");
+        System.out.println("TouchInputTest: HUD gestures, held action margins, pointer lifecycle, tutorials, settings v10 (look acceleration, 3x sensitivity), layout editor placements, Fire-to-Melee, deferred writer, stick-zone camera, hint span, render50, graphics/performance/pacing/Reload button persistence and reset passed");
     }
 }

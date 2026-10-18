@@ -74,7 +74,8 @@
 +    __atomic_store_n(&block_emitted_hook, hook, __ATOMIC_RELEASE);
 +}
 +
- void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) {
+-void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
++void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) {
 +    if (const auto hook = __atomic_load_n(&block_emitted_hook, __ATOMIC_ACQUIRE))
 +        hook(block.Location().Value());
      const A32::LocationDescriptor descriptor{block.Location()};

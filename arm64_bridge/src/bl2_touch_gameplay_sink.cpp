@@ -358,7 +358,14 @@ struct Ue3GameplaySink::State {
         }
         bool spare = false;
         if (boolQuery(target, weapon, "HasSpareAmmo", "WillowWeapon", 0x00020102, spare) &&
-            targetUnchanged(target)) known(Action::Reload, spare);
+            targetUnchanged(target)) {
+            known(Action::Reload, spare);
+            // An empty magazine with no spare ammo (no reload running, no
+            // overheat weapon) cannot fire: Fire's place then melees. Only the
+            // equipped weapon of a known slot word carries the bit.
+            if (!loaded && !spare && (observation.weaponSlots & kWeaponSlotsKnown) &&
+                ((observation.weaponSlots >> 8) & 7u)) observation.weaponSlots |= kWeaponEquippedEmpty;
+        }
     }
     void known(Action action, bool enabled) {
         const auto bit = actionBit(action);

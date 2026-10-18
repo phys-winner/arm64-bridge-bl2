@@ -8,6 +8,7 @@
 #include "bl2_touch_ui_model_probe.h"
 #include "bl2_touch_ui_model.h"
 #include "bl2_pause_debug_menu.h"
+#include "bl2_touch_gamepad_glyphs.h"
 #include "bl2_graphics_settings.h"
 #include "bl2_performance_settings.h"
 #include "bl2_perf_hint.h"
@@ -473,6 +474,9 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
     if (!active || insideProbe) return;
     insideProbe = true;
     struct Guard { ~Guard() { insideProbe = false; } } guard;
+    // Keys sent from here are the touch route's; ProcessInput's own body
+    // handles the queued device keys after this hook returns.
+    const bl2::touch::TouchDispatchScope dispatching;
     SyncBl2GraphicsSettings(host);
     SyncBl2PerformanceSettings();
     Bl2PerfHintGameThread();
@@ -582,6 +586,8 @@ void inputBoundary(Dynarmic::A32::Jit& jit, DynarmicHost& host) {
     Bl2GcDeferTick(host, context.mode == bl2::touch::Mode::Menu || context.mode == bl2::touch::Mode::Dialog ||
                              context.mode == bl2::touch::Mode::TextInput ||
                              context.mode == bl2::touch::Mode::Frontend);
+    // HIDE GAMEPAD BUTTONS rewrites the StringAliasMap button images (bl2_touch_gamepad_glyphs.cpp).
+    Bl2TouchGamepadGlyphsTick(host);
     auto& mailbox = bl2::touch::sharedMailbox();
     [[maybe_unused]] const auto epoch = mailbox.publishContext(context);
     if (combinedSink) bl2::touch::consumeIntoEngine(mailbox, tick,

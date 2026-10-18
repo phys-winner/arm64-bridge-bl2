@@ -15,7 +15,7 @@ Steps (in order):
   drag:<x>,<y>   (left button held while moving to x,y)
   wheel:<+n|-n>  (positive = away from the user)
   shot:<path.png>
-Example: python -I work/scripts/bl2_virtual_mouse.py home to:600,300 wait:300 click:left
+Example: python -I work/scripts/bl2_virtual_mouse.py --serial SERIAL home to:600,300 wait:300 click:left
 """
 import argparse
 import json
@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-ADB = r"C:\Users\Xilonen\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+ADB = "adb"
 BUTTONS = {"left": 1, "right": 2, "middle": 4, "back": 8, "forward": 16}
 STEP = 6          # counts per report while positioning
 STEP_MS = 15      # 400 counts/s stays under the default 500 px/s threshold
@@ -137,7 +137,7 @@ def run(mouse, step):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--serial", default="61151JEA326613")
+    parser.add_argument("--serial", required=True, help="adb device serial")
     parser.add_argument("--settle", type=float, default=7.0)
     parser.add_argument("--gap", type=int, default=200, help="ms between steps")
     parser.add_argument("--gain", type=float, default=2.7,

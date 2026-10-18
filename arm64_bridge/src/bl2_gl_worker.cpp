@@ -1,6 +1,6 @@
 // GL worker: the GL/EGL calls of BL2's rendering thread run on one host thread.
 //
-// Measured on abb24fae (Outwash, slow view after the camera turn): the guest
+// Measured on Adreno 650 (Outwash, slow view after the camera turn): the guest
 // rendering thread is ~97% on-CPU and issues ~8,200 GL calls per frame; about
 // half of its time is the Adreno driver and the bridge's GL translation, while
 // the GPU is ~41% busy. Unless debug.bl2.gl_worker=0 (read once), the guest thread

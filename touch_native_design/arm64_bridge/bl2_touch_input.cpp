@@ -36,11 +36,13 @@ std::uint64_t floatPair(float low, float high) {
     std::memcpy(&b, &high, sizeof(b));
     return a | (std::uint64_t{b} << 32);
 }
-// The equipped slot and every type code must belong to an occupied slot.
+// The equipped slot and every type code must belong to an occupied slot; only
+// an equipped weapon can be out of ammo.
 std::uint32_t validWeaponSlots(std::uint32_t word) {
-    if ((word & kWeaponSlotsKnown) == 0 || (word & 0x78F0u) != 0) return 0;
+    if ((word & kWeaponSlotsKnown) == 0 || (word & 0x70F0u) != 0) return 0;
     const auto occupied = word & 15u, equipped = (word >> 8) & 7u;
     if (equipped > 4 || (equipped && (occupied & (1u << (equipped - 1))) == 0)) return 0;
+    if ((word & kWeaponEquippedEmpty) && !equipped) return 0;
     for (unsigned slot = 0; slot < 4; ++slot) {
         const auto type = (word >> (16 + 4 * slot)) & 15u;
         if (type > 6 || (type && (occupied & (1u << slot)) == 0)) return 0;

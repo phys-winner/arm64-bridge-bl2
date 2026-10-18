@@ -696,6 +696,11 @@ static void testStageFiveTapTargetsAndSlots() {
     const auto epoch = ready(box, context);
     auto words = box.snapshot().wire();
     CHECK(words[9] == (HudSkill | HudExperience | HudChallenge) && words[24] == slots);
+    // Bit 11 marks the equipped weapon as out of ammo (Fire's place melees).
+    context.weaponSlots = slots | kWeaponEquippedEmpty;
+    CHECK(box.publishContext(context) == epoch && box.snapshot().wire()[24] == (slots | kWeaponEquippedEmpty));
+    context.weaponSlots = slots;
+    CHECK(box.publishContext(context) == epoch && box.snapshot().wire()[24] == slots);
     CHECK(near(unpackFloat(words[18], false), .05f) && near(unpackFloat(words[19], true), .84f));
     CHECK(near(unpackFloat(words[20], false), .34f) && near(unpackFloat(words[21], false), .66f));
     CHECK(near(unpackFloat(words[22], true), .68f) && near(unpackFloat(words[23], true), .75f));
@@ -704,7 +709,8 @@ static void testStageFiveTapTargetsAndSlots() {
     context.challengeRect = {.3f, .7f, .2f, .75f};
     for (const auto bad : {std::uint32_t{0xBu | (2u << 8)}, kWeaponSlotsKnown | 0xBu | (3u << 8),
                            kWeaponSlotsKnown | 0x1u | (1u << 20), kWeaponSlotsKnown | 0x1u | (7u << 16),
-                           kWeaponSlotsKnown | 0x1u | (5u << 8), kWeaponSlotsKnown | 0x1u | 0x10u}) {
+                           kWeaponSlotsKnown | 0x1u | (5u << 8), kWeaponSlotsKnown | 0x1u | 0x10u,
+                           kWeaponSlotsKnown | 0x1u | kWeaponEquippedEmpty, kWeaponSlotsKnown | 0x1u | (1u << 8) | (1u << 12)}) {
         context.weaponSlots = bad;
         CHECK(box.publishContext(context) == epoch);
         words = box.snapshot().wire();

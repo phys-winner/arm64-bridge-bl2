@@ -77,5 +77,34 @@ int main() {
         state.disconnected(0, 60000);
         assert(state.ownsInput(60799) && !state.ownsInput(60800)); // A held key keeps the neutral interval.
     }
-    std::cout << "PASS: physical held-key, controller, axis, mouse, neutral and malformed-input ownership\n";
+    {
+        // A keyboard (controller 0: letters, arrows) never owns input: the captured
+        // mouse and touch keep their route beside it; it is only reported.
+        PhysicalOwnership state;
+        assert(PhysicalOwnership::keyboardKey(0, 51) && PhysicalOwnership::keyboardKey(0, 19) &&
+               !PhysicalOwnership::keyboardKey(0, 96) && !PhysicalOwnership::keyboardKey(0, 110) &&
+               !PhysicalOwnership::keyboardKey(0, 188) && !PhysicalOwnership::keyboardKey(1, 51));
+        state.key(0, 0, 51, 1000); // W held
+        assert(!state.ownsInput(100000) && state.keyboardActive(100000) && state.anyPhysical(100000));
+        state.key(0, 1, 51, 100000);
+        assert(state.keyboardActive(100799) && !state.keyboardActive(100800) && !state.anyPhysical(100800));
+        state.key(1, 0, 96, 200000); // A gamepad still takes over.
+        assert(state.ownsInput(200000) && state.anyPhysical(200000) && !state.keyboardActive(200900));
+        state.key(1, 1, 96, 200000);
+        state.key(0, 0, 32, 300000); state.disconnected(0, 300500); // pointer capture reconfigures the mouse
+        assert(!state.ownsInput(300500) && state.keyboardActive(301299) && !state.keyboardActive(301300));
+        state.key(0, 7, 32, 400000);
+        assert(state.ownsInput(500000)); // An unknown key action still fails closed.
+    }
+    {
+        assert(!bl2::touch::TouchDispatchScope::active());
+        {
+            const bl2::touch::TouchDispatchScope outer;
+            { const bl2::touch::TouchDispatchScope inner; assert(bl2::touch::TouchDispatchScope::active()); }
+            assert(bl2::touch::TouchDispatchScope::active());
+        }
+        assert(!bl2::touch::TouchDispatchScope::active());
+    }
+    std::cout << "PASS: physical held-key, controller, axis, mouse, neutral and malformed-input ownership; "
+                 "keyboard beside mouse and touch; touch dispatch scope\n";
 }

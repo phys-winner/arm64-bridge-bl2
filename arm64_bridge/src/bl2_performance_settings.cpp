@@ -10,11 +10,17 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
-// Settings 32 onward are these replacements, then frame pacing, Reload and the tap radial.
+// Settings 32 onward are these replacements, then frame pacing, Reload, the tap
+// radial, the v9 inset margin, button icons and hidden gamepad images, and the
+// v10 look acceleration.
 static_assert(bl2::touch::kTouchFramePacingSetting == 32+kBl2PerformanceSettingBits.size() &&
               bl2::touch::kTouchReloadButtonSetting == bl2::touch::kTouchFramePacingSetting+1 &&
               bl2::touch::kTouchRadialTapSetting == bl2::touch::kTouchReloadButtonSetting+1 &&
-              bl2::touch::kTouchSettingCount == bl2::touch::kTouchRadialTapSetting+1);
+              bl2::touch::kTouchScreenInsetsSetting == bl2::touch::kTouchRadialTapSetting+1 &&
+              bl2::touch::kTouchButtonIconsSetting == bl2::touch::kTouchScreenInsetsSetting+1 &&
+              bl2::touch::kTouchHideGamepadGlyphsSetting == bl2::touch::kTouchButtonIconsSetting+1 &&
+              bl2::touch::kTouchLookAccelerationSetting == bl2::touch::kTouchHideGamepadGlyphsSetting+1 &&
+              bl2::touch::kTouchSettingCount == bl2::touch::kTouchLookAccelerationSetting+1);
 
 void SyncBl2PerformanceSettings() {
     // Saved choices and an optional QA override at an owned input boundary.

@@ -2,12 +2,12 @@ param(
     [Parameter(Mandatory)][string]$RunDirectory,
     [Parameter(Mandatory)][ValidateRange(1,255)][int]$KeyCode,
     [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9-]+$')][string]$Label,
-    [ValidateSet('61151JEA326613','HA22AHP1','83c14820','f4668e7b','abb24fae','jrjz95hut455yxq4','192.168.1.137:5555')]
-    [string]$Serial = '61151JEA326613',
+    [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9._:-]+$')]
+    [string]$Serial,
     [ValidateRange(100,2000)][int]$HoldMs = 250
 )
 $ErrorActionPreference = 'Stop'
-$adb = 'C:/Users/Xilonen/AppData/Local/Android/Sdk/platform-tools/adb.exe'
+$adb = 'adb'
 $runPath = (Resolve-Path -LiteralPath $RunDirectory).Path
 $trace = Join-Path $runPath 'trace.txt'
 $recordPath = Join-Path $runPath "manual-$Label.json"

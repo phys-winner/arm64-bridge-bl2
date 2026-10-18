@@ -972,7 +972,7 @@ struct Ue3UiSink::State {
         networkDiagnostic(target,"tab",direction);
     }
     bool advanceStartTitle(const Target& target) {
-        if (physicalOwnership().ownsInput(monotonicMilliseconds()) ||
+        if (physicalOwnership().anyPhysical(monotonicMilliseconds()) ||
             !Bl2TouchAtStartTitle({this,copyMemory},base,target.owner) ||
             name(base + 0x0300A328) != "XboxTypeS_Start") return false;
         const auto now = monotonicMilliseconds();
@@ -1551,7 +1551,7 @@ struct Ue3UiSink::State {
             return;
         }
         if(ended) {chatOwner={};chatObject=0;chatAttempts=0;chatAttemptAt=0;}
-        if(!identity || service.open || frame.resetReasons || physicalOwnership().ownsInput(monotonicMilliseconds())) return;
+        if(!identity || service.open || frame.resetReasons || physicalOwnership().anyPhysical(monotonicMilliseconds())) return;
         // Modal retirement is not a new authored StartTextChat episode. Keep
         // the once-opened input across touch-only epochs; completion itself
         // retains the full strict epoch/scene/generation identity above.

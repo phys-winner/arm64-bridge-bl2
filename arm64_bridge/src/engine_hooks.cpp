@@ -2,7 +2,7 @@
 
 #include "dynarmic_host.h"
 #include "elf_loader.h"
-#include "../../arm32_compat/src/native_render_nvsi.h"
+#include "native_render_nvsi.h"
 
 bool InstallBl2RenderWithoutNvsi(DynarmicHost& host) {
     using namespace bl2::native_render;

@@ -23,8 +23,13 @@ public final class TouchContract {
     public static final int DOWN = 0, MOVE = 1, UP = 2, CANCEL = 3, HOVER = 4;
     /** Context.weaponSlots layout is documented beside kWeaponSlotsKnown in bl2_touch_input.h. */
     public static final int WEAPON_SLOTS_KNOWN = 1 << 15;
+    /** Context.weaponSlots: the equipped weapon has neither a loaded round nor spare ammo. */
+    public static final int WEAPON_EQUIPPED_EMPTY = 1 << 11;
     /** TouchBridge.movieState() bits, kMovie* in bl2_touch_input.h (outside the mailbox). */
     public static final int MOVIE_PLAYING = 1, MOVIE_STARTUP = 2;
+    /** TouchBridge.physicalState() bits (bl2_touch_jni.cpp): a keyboard is in use,
+     *  a gamepad owns input. */
+    public static final int PHYSICAL_KEYBOARD = 1, PHYSICAL_PAD = 2;
     public static long bit(int action) { return 1L << action; }
 
     public static final class Context {
@@ -97,6 +102,8 @@ public final class TouchContract {
         public boolean slotOccupied(int slot) { return slotsKnown() && slot >= 0 && slot < 4 && (weaponSlots & (1 << slot)) != 0; }
         /** 1..4 for the equipped weapon's slot, 0 when none or unknown. */
         public int equippedSlot() { return slotsKnown() ? (weaponSlots >> 8) & 7 : 0; }
+        /** The equipped weapon can no longer fire: empty magazine and no spare ammo. */
+        public boolean equippedEmpty() { return equippedSlot() != 0 && (weaponSlots & WEAPON_EQUIPPED_EMPTY) != 0; }
         /** EWeaponType + 1 (pistol 1 .. launcher 6), 0 when unknown. */
         public int slotType(int slot) { return slot >= 0 && slot < 4 ? (weaponSlots >>> (16 + 4 * slot)) & 15 : 0; }
         private static boolean validRect(float[] rect) {

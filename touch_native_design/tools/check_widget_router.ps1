@@ -1,8 +1,8 @@
 param(
-    [string]$NdkRoot = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018',
-    [string]$MsvcRoot = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231',
-    [string]$WindowsSdkRoot = 'C:\Program Files (x86)\Windows Kits\10',
-    [string]$WindowsSdkVersion = '10.0.26100.0',
+    [string]$NdkRoot = "$env:ANDROID_HOME\ndk\27.2.12479018",
+    [string]$MsvcRoot = $env:VCToolsInstallDir,
+    [string]$WindowsSdkRoot = $env:WindowsSdkDir,
+    [string]$WindowsSdkVersion = "$env:WindowsSDKVersion".TrimEnd('\'),
     [switch]$BackEdgesOnly
 )
 $ErrorActionPreference = 'Stop'

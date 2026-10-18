@@ -1,8 +1,8 @@
 param(
-    [string]$NdkRoot = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018',
-    [string]$MsvcRoot = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231',
-    [string]$WindowsSdkRoot = 'C:\Program Files (x86)\Windows Kits\10',
-    [string]$WindowsSdkVersion = '10.0.26100.0'
+    [string]$NdkRoot = "$env:ANDROID_HOME\ndk\27.2.12479018",
+    [string]$MsvcRoot = $env:VCToolsInstallDir,
+    [string]$WindowsSdkRoot = $env:WindowsSdkDir,
+    [string]$WindowsSdkVersion = "$env:WindowsSDKVersion".TrimEnd('\')
 )
 $ErrorActionPreference = 'Stop'
 $kitRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -40,7 +40,7 @@ try {
 } finally { $env:PATH = $previousPath }
 & $executable
 if ($LASTEXITCODE -ne 0) { throw 'UI transaction test failed' }
-& 'C:\Program Files\Python313\python.exe' -X utf8 -B (Join-Path $PSScriptRoot 'test_footer_keys.py') $buildRoot
+& python -X utf8 -B (Join-Path $PSScriptRoot 'test_footer_keys.py') $buildRoot
 if ($LASTEXITCODE -ne 0) { throw 'Production footer key extraction failed' }
 $footerExecutable = Join-Path $buildRoot 'ui_footer_key_test.exe'
 $footerArgs = @($hostArgs | Where-Object {

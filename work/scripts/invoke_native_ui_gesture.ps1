@@ -9,7 +9,7 @@ param(
     [ValidateRange(-1,8191)][int]$EndY = -1,
     [ValidateRange(50,30000)][int]$HoldMs = 100,
     [ValidateRange(0,30000)][int]$DelayMs = 0,
-    [ValidatePattern('^(?:[a-zA-Z0-9]+|192\.168\.1\.137:5555)$')][string]$Serial = '61151JEA326613',
+    [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9._:-]+$')][string]$Serial,
     [ValidatePattern('^/data/local/tmp/[a-zA-Z0-9_.-]+\.jar$')][string]$InjectorPath = '/data/local/tmp/bl2-touch-qa.jar',
     [ValidateSet('swipe','tap','double','tap-hold','drag','cancel-drag','hold-drag','hold-cancel','stick-hold','two-drag','two-cancel','two-hold')][string]$Gesture = 'swipe',
     [ValidateRange(-1,8191)][int]$SecondX = -1,
@@ -18,7 +18,7 @@ param(
     [ValidateRange(-1,8191)][int]$SecondEndY = -1
 )
 $ErrorActionPreference = 'Stop'
-$adb = 'C:/Users/Xilonen/AppData/Local/Android/Sdk/platform-tools/adb.exe'
+$adb = 'adb'
 $serial = $Serial
 $package = 'com.tt2kgames.Borderlands2'
 if ($DelayMs -gt 0 -and $Gesture -eq 'swipe') { throw 'Delayed input requires the touch harness' }

@@ -167,6 +167,18 @@ if(NOT learned_warmup_patch_result EQUAL 0)
     message(FATAL_ERROR "Learned warmup patch is incompatible with the selected Dynarmic")
 endif()
 
+# Opt-in debug.bl2.jit_map=1 record of every emitted block (host range, guest
+# range) for attributing simpleperf samples to guest code.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${dynarmic_SOURCE_DIR}"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-arm64-jit-map.patch"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyGitPatch.cmake"
+    RESULT_VARIABLE jit_map_patch_result)
+if(NOT jit_map_patch_result EQUAL 0)
+    message(FATAL_ERROR "JIT map patch is incompatible with the selected Dynarmic")
+endif()
+
 # An unattached coprocessor (a guest jump into data decodes LDC/STC) raises the
 # guest undefined-instruction exception instead of aborting while compiling.
 execute_process(
@@ -284,6 +296,7 @@ set(BRIDGE_SOURCES
     src/bl2_touch_widget_commands.cpp
     src/bl2_touch_widget_router.cpp
     src/bl2_touch_widget_sink.cpp
+    src/bl2_touch_gamepad_glyphs.cpp
     src/thunks_gl.cpp
     src/thunks_gl_gles2_core.cpp
     src/thunks_android.cpp

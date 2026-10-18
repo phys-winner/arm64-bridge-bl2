@@ -1,31 +1,39 @@
-*.apk -text
-*.apks -text
-*.xapk -text
-*.obb -text
+# Binary files are stored as-is.
 *.so -text
-*.dex -text
 *.jar -text
 *.zip -text
 *.bin -text
-*.img -text
 *.png -text
-*.jpg -text
-*.jpeg -text
-*.ogg -text
-*.mp4 -text
-*.bik -text
-*.uasset -text
-*.upk -text
-*.tfc -text
+*.apk -text
+*.obb -text
+
+# Scripts, patches and documents use LF.
+*.patch text eol=lf
 *.py text eol=lf
 *.sh text eol=lf
 *.md text eol=lf
-*.smali text eol=lf
 *.xml text eol=lf
 *.yml text eol=lf
 
-# Exact current bridge build inputs (seed295 source-build-match295.json).
-.gitattributes -text
+# Sources stored byte-exact; several of them mix CRLF and LF line endings,
+# keep them unnormalized so diffs show only real changes.
+/android_port/src/com/tt2kgames/Borderlands2/DisplayModePolicy.java -text
+/android_port/src/com/tt2kgames/Borderlands2/Downloader.java -text
+/android_port/src/com/tt2kgames/Borderlands2/GameStorage.java -text
+/android_port/src/com/tt2kgames/Borderlands2/LaunchControls.java -text
+/android_port/src/com/tt2kgames/Borderlands2/LocalAchievements.java -text
+/android_port/src/com/tt2kgames/Borderlands2/LocalIdentity.java -text
+/android_port/src/com/tt2kgames/Borderlands2/LocalPlatform.java -text
+/android_port/src/com/tt2kgames/Borderlands2/LocalSaveGame.java -text
+/android_port/src/com/tt2kgames/Borderlands2/touch/NativeTouchControls.java -text
+/android_port/src/com/tt2kgames/Borderlands2/touch/TouchBridge.java -text
+/android_port/src/com/tt2kgames/Borderlands2/touch/TouchContract.java -text
+/android_port/src/com/tt2kgames/Borderlands2/touch/TouchInput.java -text
+/android_port/src/com/tt2kgames/Borderlands2/touch/TouchLayout.java -text
+/android_port/src/com/tt2kgames/Borderlands2/touch/TouchPreferences.java -text
+/android_port/src/com/tt2kgames/Borderlands2/touch/TouchSources.java -text
+/arm64_bridge/CMakeLists.txt -text
+/arm64_bridge/patches/dynarmic-arm64-fastmem-fpsr.patch -text
 /arm64_bridge/src/arm32_network_abi.h -text
 /arm64_bridge/src/bl2_convex_fastpath.cpp -text
 /arm64_bridge/src/bl2_convex_fastpath.h -text
@@ -35,9 +43,9 @@
 /arm64_bridge/src/bl2_fog_audit.h -text
 /arm64_bridge/src/bl2_io_failure_probe.cpp -text
 /arm64_bridge/src/bl2_io_failure_probe.h -text
-/arm64_bridge/src/bl2_locale_payload.h -text
 /arm64_bridge/src/bl2_locale.cpp -text
 /arm64_bridge/src/bl2_locale.h -text
+/arm64_bridge/src/bl2_locale_payload.h -text
 /arm64_bridge/src/bl2_native_resolution.cpp -text
 /arm64_bridge/src/bl2_native_resolution.h -text
 /arm64_bridge/src/bl2_pause_debug_menu.cpp -text
@@ -57,10 +65,10 @@
 /arm64_bridge/src/bl2_touch_physical.h -text
 /arm64_bridge/src/bl2_touch_runtime.cpp -text
 /arm64_bridge/src/bl2_touch_runtime.h -text
-/arm64_bridge/src/bl2_touch_ui_model_probe.cpp -text
-/arm64_bridge/src/bl2_touch_ui_model_probe.h -text
 /arm64_bridge/src/bl2_touch_ui_model.cpp -text
 /arm64_bridge/src/bl2_touch_ui_model.h -text
+/arm64_bridge/src/bl2_touch_ui_model_probe.cpp -text
+/arm64_bridge/src/bl2_touch_ui_model_probe.h -text
 /arm64_bridge/src/bl2_touch_ui_sink.cpp -text
 /arm64_bridge/src/bl2_touch_ui_sink.h -text
 /arm64_bridge/src/bl2_touch_ui_transactions.cpp -text
@@ -108,8 +116,8 @@
 /arm64_bridge/src/thunk_types.h -text
 /arm64_bridge/src/thunks_android.cpp -text
 /arm64_bridge/src/thunks_android.h -text
-/arm64_bridge/src/thunks_gl_gles2_core.cpp -text
 /arm64_bridge/src/thunks_gl.cpp -text
+/arm64_bridge/src/thunks_gl_gles2_core.cpp -text
 /arm64_bridge/src/thunks_libc.cpp -text
 /arm64_bridge/src/thunks_opensles.cpp -text
 /arm64_bridge/src/thunks_opensles.h -text
@@ -117,86 +125,18 @@
 /arm64_bridge/src/thunks_tegra.h -text
 /arm64_bridge/src/virtual_file_range.h -text
 /arm64_bridge/src/zip_stored_entry_bounds.h -text
+/arm64_bridge/tests/fastmem_fpsr_test.cpp -text
+/arm64_bridge/tests/guest_mapped_dirty_tracker_test.cpp -text
+/arm64_bridge/tests/obb_split_entry_test.cpp -text
+/arm64_bridge/tests/scene_upper_readback_test.cpp -text
 /touch_native_design/arm64_bridge/.gitignore -text
+/touch_native_design/arm64_bridge/CMakeLists.txt -text
 /touch_native_design/arm64_bridge/bl2_touch_bindings.h -text
 /touch_native_design/arm64_bridge/bl2_touch_engine_adapter.cpp -text
 /touch_native_design/arm64_bridge/bl2_touch_engine_adapter.h -text
 /touch_native_design/arm64_bridge/bl2_touch_input.cpp -text
 /touch_native_design/arm64_bridge/bl2_touch_input.h -text
 /touch_native_design/arm64_bridge/bl2_touch_jni.cpp -text
-/touch_native_design/arm64_bridge/CMakeLists.txt -text
-/touch_native_design/arm64_bridge/README.md -text
-/android_port/src/com/tt2kgames/Borderlands2/DisplayModePolicy.java -text
-/android_port/src/com/tt2kgames/Borderlands2/Downloader.java -text
-/android_port/src/com/tt2kgames/Borderlands2/GameStorage.java -text
-/android_port/src/com/tt2kgames/Borderlands2/LaunchControls.java -text
-/android_port/src/com/tt2kgames/Borderlands2/LocalAchievements.java -text
-/android_port/src/com/tt2kgames/Borderlands2/LocalIdentity.java -text
-/android_port/src/com/tt2kgames/Borderlands2/LocalPlatform.java -text
-/android_port/src/com/tt2kgames/Borderlands2/LocalSaveGame.java -text
-/android_port/src/com/tt2kgames/Borderlands2/touch/NativeTouchControls.java -text
-/android_port/src/com/tt2kgames/Borderlands2/touch/TouchBridge.java -text
-/android_port/src/com/tt2kgames/Borderlands2/touch/TouchContract.java -text
-/android_port/src/com/tt2kgames/Borderlands2/touch/TouchInput.java -text
-/android_port/src/com/tt2kgames/Borderlands2/touch/TouchLayout.java -text
-/android_port/src/com/tt2kgames/Borderlands2/touch/TouchPreferences.java -text
-/android_port/src/com/tt2kgames/Borderlands2/touch/TouchSources.java -text
-/app/smali/com/tt2kgames/Borderlands2/UE3JavaApp.smali -text
-/app/smali/com/tt2kgames/Borderlands2/Downloader.smali -text
-/app/AndroidManifest.xml -text
-/app/apktool.yml -text
-/arm64_bridge/tests/scene_upper_readback_test.cpp -text
-/work/scripts/capture_live_scene.ps1 -text
-/work/scripts/preview_scene_readbacks.py -text
-/work/scripts/restore_pixel_probe_data.py -text
-/work/build/seed293-build.json -text
-/work/build/seed294-build.json -text
-/.gitattributes -text
-/STATE.md -text
-/work/scripts/SignCacheWithoutVerity.java -text
-/work/scripts/build_cache_split.ps1 -text
-/work/scripts/inspect_cache_split.ps1 -text
-/work/scripts/invoke_game_stick.ps1 -text
-/arm64_bridge/tests/obb_split_entry_test.cpp -text
-/work/build/cache-patch-astc4-build.json -text
-/work/build/cache-patch-astc4-noverity-build.json -text
-/work/evidence/cache-astc4-split-20260928/** -text
-/work/evidence/astc-split-seed294-r4-abb-normal/** -text
-/work/evidence/device-abb24fae-seed294-r4-noverity-setup/** -text
-/work/evidence/device-abb24fae-seed294-r4-setup/commands.jsonl -text
-/work/evidence/device-abb24fae-seed294-r4-setup/post-rejection-integrity/result.json -text
-/work/evidence/device-abb24fae-seed294-r4-preflight/restore-after-294-noverity-normal.json -text
-/arm64_bridge/tests/guest_mapped_dirty_tracker_test.cpp -text
-/work/scripts/install_bridge_candidate.ps1 -text
-/work/scripts/invoke_game_button.ps1 -text
-/work/scripts/run_bridge_probe.ps1 -text
-/work/build/seed295-build.json -text
-/work/evidence/lan-new-pair-20260929/** -text
-/work/evidence/lan-warband-reference-20260929/independent-reference-review.md -text
-/work/evidence/lan-seed295-*/** -text
-/work/evidence/pixel-seed295-16k-ordinary-20260929/** -text
-/work/evidence/pixel-seed295-16k-resume-20260929/** -text
-/work/evidence/device-pixel-seed295-setup/** -text
-/work/evidence/device-f4668e7b-seed295-setup/** -text
-/work/evidence/device-jrjz95hut455yxq4-seed295-setup/** -text
-/work/evidence/device-pixel-seed292-preflight/restore-after-295-ordinary-resume.json -text
-/work/build/seed299-build.json -text
-/work/build/cache-patch-astc4-code1-noverity-build.json -text
-/work/evidence/hidden-code1-phase7-20260929/** -text
-/work/evidence/hidden-code1-f299-*/** -text
-
-# Exact302 optimization source, tests and scoped runtime receipts.
-/arm64_bridge/CMakeLists.txt -text
-/arm64_bridge/patches/dynarmic-arm64-fastmem-fpsr.patch -text
-/arm64_bridge/tests/fastmem_fpsr_test.cpp -text
-/arm64_bridge/tests/fastmem_fpsr_matrix.bin -text
 /work/scripts/build_bridge_apk.ps1 -text
-/work/scripts/measure_game_frames.py -text
-/work/scripts/native_clock.c -text
-/work/build/seed300-build.json -text
-/work/build/seed302-build.json -text
-/work/evidence/bridge-optimization-20260930/** -text
-/work/evidence/pixel302-*/** -text
-/work/evidence/device-pixel-seed300-setup*/** -text
-/work/evidence/device-pixel-seed302-setup*/** -text
-/work/evidence/pixel299-checks-20260930/** -text
+/work/scripts/invoke_game_button.ps1 -text
+/work/scripts/invoke_game_stick.ps1 -text

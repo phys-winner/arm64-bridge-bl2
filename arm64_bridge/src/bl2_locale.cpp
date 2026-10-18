@@ -404,6 +404,26 @@ size_t FileForPath(const char* path) {
     return kFileCount;
 }
 
+// Russian movie audio (.bka) is spliced into the video of the main OBB. Without
+// the embedded split pair (OBB files copied to Android/obb by hand) the same
+// main OBB is read from there.
+void OpenExternalMainObb() {
+    if (s_main_fd >= 0) return;
+    for (const std::string_view directory : {std::string_view("/storage/emulated/0/Android/obb/com.tt2kgames.Borderlands2/"),
+                                             std::string_view("/sdcard/Android/obb/com.tt2kgames.Borderlands2/")}) {
+        const std::string path = std::string(directory) + std::string(kMainObbName);
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        struct stat st{};
+        if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            s_main_fd = fd; s_main_offset = 0; s_main_bytes = static_cast<uint64_t>(st.st_size);
+            LOGI("voice movies read their video from the external main OBB: %s", path.c_str());
+            return;
+        }
+        close(fd);
+    }
+}
+
 bool IndexLocaleComponent(Zip& zip, size_t component) {
     const bool voice = component == 1;
     const auto* descriptor = zip.Find(voice ? kVoiceDescriptor : kDescriptor);
@@ -412,22 +432,40 @@ bool IndexLocaleComponent(Zip& zip, size_t component) {
     const size_t first = voice ? kTextFileCount : 0;
     const size_t stop = first + (voice ? kVoiceFileCount : kTextFileCount);
     std::array<Bl2LocaleEntry, kFileCount> candidate{};
+    [[maybe_unused]] size_t movies = 0, russianMovies = 0;  // Diagnostic builds log both.
     for (size_t f = first; f < stop; ++f) {
         const char* asset = voice ? bl2_voice_payload::kFiles[f - first].asset : kFiles[f].asset;
+        const std::string_view name(asset);
+        const bool movie = voice && name.ends_with(".bka");
+        movies += movie;
         const auto* entry = zip.Find(asset);
+        // Voice splits before R3 carried every movie whole (.bik).
+        if (!entry && movie) entry = zip.Find(std::string(name.substr(0, name.size() - 4)) + ".bik");
         if (!entry || entry->method != 0 ||
-            entry->name.size() >= sizeof(candidate[f].name)) return false;
+            entry->name.size() >= sizeof(candidate[f].name)) {
+            // The dialogue banks are required. A movie without its Russian
+            // audio keeps the original track, like the lines left in English.
+            if (movie) continue;
+            return false;
+        }
         std::memcpy(candidate[f].name, entry->name.c_str(), entry->name.size() + 1);
         candidate[f].data_offset = static_cast<off_t>(entry->offset);
         candidate[f].file_size = static_cast<off_t>(entry->bytes);
-        if (voice && std::string_view(asset).ends_with(".bka")) {
-            auto& movie = s_bink_movies[f - first];
-            if (!movie.Load(zip.fd, entry->offset, entry->bytes,
-                            s_main_fd, s_main_offset, s_main_bytes)) return false;
-            candidate[f].bink = &movie;
-            candidate[f].file_size = static_cast<off_t>(movie.Size());
+        if (movie && std::string_view(entry->name).ends_with(".bka")) {
+            OpenExternalMainObb();
+            auto& bink = s_bink_movies[f - first];
+            if (!bink.Load(zip.fd, entry->offset, entry->bytes,
+                           s_main_fd, s_main_offset, s_main_bytes)) {
+                LOGE("voice movie keeps its original audio (no matching main OBB video): %s", asset);
+                candidate[f] = {};
+                continue;
+            }
+            candidate[f].bink = &bink;
+            candidate[f].file_size = static_cast<off_t>(bink.Size());
         }
+        russianMovies += movie;
     }
+    if (voice) LOGI("voice movies with Russian audio: %zu of %zu", russianMovies, movies);
     const int fd = dup(zip.fd);
     if (fd < 0) return false;
     if (s_apk_fds[component] >= 0) close(s_apk_fds[component]);

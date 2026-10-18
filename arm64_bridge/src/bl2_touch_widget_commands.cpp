@@ -386,7 +386,10 @@ std::string footerLower(std::string value) {
     for(auto& c:value) if(c>='A' && c<='Z') c=static_cast<char>(c-'A'+'a');
     return value;
 }
-NativeFooterCommand footerGlyph(const std::string& glyph) {
+NativeFooterCommand footerGlyph(std::string glyph) {
+    // HIDE GAMEPAD BUTTONS may rename a source to bl2hidden_<source>
+    // (bl2_touch_gamepad_glyphs.cpp): the caption still names that button.
+    if(glyph.compare(0,10,"bl2hidden_")==0) glyph.erase(0,10);
     constexpr struct {const char* name;NativeFooterCommand command;} buttons[]={
         {"A",NativeFooterCommand::ButtonA},{"B",NativeFooterCommand::ButtonB},
         {"X",NativeFooterCommand::ButtonX},{"Y",NativeFooterCommand::ButtonY},

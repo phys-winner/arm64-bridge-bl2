@@ -14,8 +14,8 @@ namespace bl2::touch {
 #ifndef BL2_ENABLE_DEBUG_MENU_DEFAULT
 #define BL2_ENABLE_DEBUG_MENU_DEFAULT 0
 #endif
-constexpr std::uint32_t kTouchSettingsVersion = 8;
-constexpr std::size_t kTouchSettingCount = 37;
+constexpr std::uint32_t kTouchSettingsVersion = 10;
+constexpr std::size_t kTouchSettingCount = 41;
 // Keep the v8 wire slot for older preference files; Motion Blur stays disabled.
 constexpr std::size_t kTouchMotionBlurSetting = 22;
 // Present pacing (bl2_frame_pacer). Its Video row is commented out by user
@@ -25,6 +25,17 @@ constexpr std::size_t kTouchFramePacingSetting = 34;
 constexpr std::size_t kTouchReloadButtonSetting = 35;
 // A short tap on More keeps the radial open for a second tap; OFF by default.
 constexpr std::size_t kTouchRadialTapSetting = 36;
+// v9. Touch controls keep clear of the cutout, system bars and gesture areas
+// (the layout of earlier builds); OFF by default: the whole screen is used.
+constexpr std::size_t kTouchScreenInsetsSetting = 37;
+// Vector icons instead of captions on touch buttons; ON by default.
+constexpr std::size_t kTouchButtonIconsSetting = 38;
+// The game's own gamepad button images (StringAliasMap IMG markup) are hidden
+// (bl2_touch_gamepad_glyphs.cpp); OFF by default.
+constexpr std::size_t kTouchHideGamepadGlyphsSetting = 39;
+// v10. Fast camera swipes turn further (TouchInput.accelerationGain); ON by
+// default. LOOK and AIM SENSITIVITY reach 3.00 since v10 (1.00 before).
+constexpr std::size_t kTouchLookAccelerationSetting = 40;
 constexpr std::int32_t kTouchSettingsOpen = 0x6A100000;
 constexpr std::int32_t kTouchSettingsGraphicsOpen = 0x6A100004;
 constexpr std::int32_t kTouchSettingsValue = 0x6A100100;
@@ -36,8 +47,8 @@ constexpr std::int32_t kTouchSettingsNativeBack = 0x6A100206;
 struct TouchSettingSpec { const char* caption; double minimum, maximum, step; bool toggle; };
 inline constexpr TouchSettingSpec touchSettingSpecs[] = {
     {"RENDER RESOLUTION (%)",20,150,10,false}, {"BUTTON OPACITY",.15,.9,.05,false},
-    {"CONTROL SIZE",.85,1.4,.05,false}, {"LOOK SENSITIVITY",.04,1,.02,false},
-    {"AIM SENSITIVITY",.1,1,.05,false}, {"LEFT HANDED",0,1,1,true},
+    {"CONTROL SIZE",.85,1.4,.05,false}, {"LOOK SENSITIVITY",.04,3,.02,false},
+    {"AIM SENSITIVITY",.1,3,.05,false}, {"LEFT HANDED",0,1,1,true},
     {"INVERT LOOK Y",0,1,1,true}, {"AUTORUN LATCH",0,1,1,true},
     {"MICROPHONE",0,1,1,true}, {"TILT AIMING",0,1,1,true},
     {"TILT ONLY IN AIM",0,1,1,true}, {"TILT SENSITIVITY",.25,3,.05,false},
@@ -50,7 +61,9 @@ inline constexpr TouchSettingSpec touchSettingSpecs[] = {
     {"STATIC DECALS",0,1,1,true}, {"UNBATCHED DECALS",0,1,1,true}, {"LIGHT SHAFTS",0,1,1,true},
     {"DISTORTION",0,1,1,true}, {"RADIAL BLUR",0,1,1,true}, {"ANISOTROPIC FILTERING",0,4,1,false},
     {"FASTER VISIBILITY TESTS",0,1,1,true}, {"FASTER AUDIO LIMITER",0,1,1,true},
-    {"FRAME PACING",0,1,1,true}, {"RELOAD BUTTON",0,1,1,true}, {"RADIAL BY TAP",0,1,1,true}
+    {"FRAME PACING",0,1,1,true}, {"RELOAD BUTTON",0,1,1,true}, {"RADIAL BY TAP",0,1,1,true},
+    {"SCREEN CUTOUT MARGIN",0,1,1,true}, {"ICONS ON BUTTONS",0,1,1,true}, {"HIDE GAMEPAD BUTTONS",0,1,1,true},
+    {"LOOK ACCELERATION",0,1,1,true}
 };
 static_assert(std::size(touchSettingSpecs) == kTouchSettingCount);
 inline const char* TouchSettingCaption(std::size_t id, bool russian) {
@@ -64,7 +77,8 @@ inline const char* TouchSettingCaption(std::size_t id, bool russian) {
         "ДИНАМИЧЕСКИЕ ТЕНИ", "ТЕНИ ОСВЕЩЕНИЯ", "СТАТИЧЕСКИЕ ДЕКАЛИ", "ОТДЕЛЬНЫЕ ДЕКАЛИ",
         "СВЕТОВЫЕ ЛУЧИ", "ИСКАЖЕНИЯ", "РАДИАЛЬНОЕ РАЗМЫТИЕ", "АНИЗОТРОПНАЯ ФИЛЬТРАЦИЯ",
         "УСКОРЕНИЕ ОТСЕЧЕНИЯ ОБЪЕКТОВ", "УСКОРЕНИЕ АУДИОЛИМИТЕРА", "РОВНЫЙ ТЕМП КАДРОВ",
-        "КНОПКА ПЕРЕЗАРЯДКИ", "РАДИАЛ ПО ТАПУ"
+        "КНОПКА ПЕРЕЗАРЯДКИ", "РАДИАЛ ПО ТАПУ", "ОТСТУП ОТ ВЫРЕЗА ЭКРАНА", "ЗНАЧКИ НА КНОПКАХ",
+        "СКРЫТЬ КНОПКИ ГЕЙМПАДА", "УСКОРЕНИЕ ОБЗОРА"
     };
     static_assert(std::size(captions) == kTouchSettingCount);
     return russian ? captions[id] : touchSettingSpecs[id].caption;
@@ -88,6 +102,18 @@ inline const char* TouchSettingHint(std::size_t id, bool russian) {
     if (id == kTouchRadialTapSetting) return russian ?
         "Короткий тап по «Ещё» оставляет радиал открытым до следующего тапа. Удержание с протяжкой работает как раньше." :
         "A short tap on More keeps the radial open until the next tap. Hold and drag work as before.";
+    if (id == kTouchScreenInsetsSetting) return russian ?
+        "Кнопки и подсказки отступают от выреза камеры, системных панелей и зон жестов, как в прежних версиях. Выключено: используется весь экран." :
+        "Buttons and hints keep clear of the camera cutout, system bars and gesture areas, as in earlier versions. OFF uses the whole screen.";
+    if (id == kTouchButtonIconsSetting) return russian ?
+        "Векторные значки вместо надписей на сенсорных кнопках. Выключено: текстовые подписи." :
+        "Vector icons instead of captions on the touch buttons. OFF shows text captions.";
+    if (id == kTouchHideGamepadGlyphsSetting) return russian ?
+        "Убирает значки кнопок геймпада (A, B, X, Y, LB…) из подсказок и меню; подписи остаются и нажимаются тапом. Действует на новые экраны." :
+        "Removes gamepad button icons (A, B, X, Y, LB…) from the game's prompts and menus; captions stay and remain tappable. Applies to newly opened screens.";
+    if (id == kTouchLookAccelerationSetting) return russian ?
+        "Быстрый свайп поворачивает камеру дальше: для разворота хватает около половины экрана. Медленное движение остаётся точным." :
+        "Fast swipes turn the camera further: about half the screen turns you around. Slow finger movement stays precise.";
     if (id >= 21 && id < 32) return russian ?
         "Сохраняется отдельно. Картофельная графика временно перекрывает выбранное значение." :
         "Saved separately. Potato graphics temporarily overrides the selected value.";
@@ -138,8 +164,8 @@ struct TouchSettingsState {
     std::vector<std::int32_t> nativeEvents, events;
 };
 inline TouchSettingsState touchSettingsState;
-// Host input [version 8, revision acknowledgement, 37 values]; output
-// [version 8, revision, command bits, 37 values]. Bits 1-8 are one-shot
+// Host input [version 10, revision acknowledgement, 41 values]; output
+// [version 10, revision, command bits, 41 values]. Bits 1-8 are one-shot
 // commands; 16 is set while the video options page is shown, so Java can offer
 // a restart for a new render resolution once that page closes. Unacknowledged
 // native edits win over an older Java snapshot, including the final menu-close poll.
@@ -185,6 +211,10 @@ inline bool Bl2ShowFps() {
 inline std::uint32_t Bl2FrameRateLimit() {
     auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
     return state.initialized ? state.values[19] : 0u;
+}
+inline bool Bl2HideGamepadGlyphs() {
+    auto& state = touchSettingsState; std::lock_guard<std::mutex> lock(state.mutex);
+    return state.initialized && state.values[kTouchHideGamepadGlyphsSetting] != 0;
 }
 inline bool Bl2FramePacingEnabled() {
     // FRAME PACING is commented out by user request: always unpaced, whatever

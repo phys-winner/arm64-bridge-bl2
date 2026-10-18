@@ -1,4 +1,5 @@
 #include "bl2_touch_input.h"
+#include "../../arm64_bridge/src/bl2_touch_physical.h"
 #include "../../arm64_bridge/src/bl2_touch_settings.h"
 #include <jni.h>
 
@@ -54,6 +55,15 @@ Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeSkipMovie(JNIEnv*, jclas
 extern "C" JNIEXPORT jint JNICALL
 Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativeShaderProgress(JNIEnv*, jclass) {
     return static_cast<jint>(bl2::touch::shaderFormationProgress());
+}
+
+// TouchContract.PHYSICAL_*: 1 a keyboard is in use, 2 a gamepad owns input.
+// Outside the mailbox: a keyboard never changes the touch context or epoch.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_tt2kgames_Borderlands2_touch_TouchBridge_nativePhysicalState(JNIEnv*, jclass) {
+    const auto now = monotonicMilliseconds();
+    const auto& ownership = bl2::touch::physicalOwnership();
+    return (ownership.keyboardActive(now) ? 1 : 0) | (ownership.ownsInput(now) ? 2 : 0);
 }
 
 extern "C" JNIEXPORT void JNICALL

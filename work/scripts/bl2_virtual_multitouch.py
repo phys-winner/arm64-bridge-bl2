@@ -17,7 +17,7 @@ Every scenario therefore starts with a 7 s wait.
 
 Steps: wait:<ms> | f1:<x>,<y> | f2:<x>,<y> | up1 | up2   (one report per step)
 Example, a stick held by finger 1 while finger 2 drags:
-  python -I work/scripts/bl2_virtual_multitouch.py f1:500,850 wait:400 f2:730,700 f2:1000,700 up2 up1
+  python -I work/scripts/bl2_virtual_multitouch.py --serial SERIAL f1:500,850 wait:400 f2:730,700 f2:1000,700 up2 up1
 """
 import argparse
 import json
@@ -25,7 +25,7 @@ import pathlib
 import subprocess
 import tempfile
 
-ADB = r"C:\Users\Xilonen\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+ADB = "adb"
 WIDTH, HEIGHT = 1080, 2424  # natural portrait panel
 
 
@@ -83,7 +83,7 @@ def scenario(steps, rotation):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--serial", default="61151JEA326613")
+    parser.add_argument("--serial", required=True, help="adb device serial")
     parser.add_argument("--rotation", type=int, choices=(90, 270), default=90)
     parser.add_argument("steps", nargs="+")
     args = parser.parse_args()

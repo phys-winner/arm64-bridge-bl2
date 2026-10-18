@@ -1,6 +1,6 @@
 // Submit long frames in parts on the drawing thread.
 //
-// Measured on Adreno 650 (abb24fae, Outwash): the driver keeps a whole frame of
+// Measured on Adreno 650 (Outwash): the driver keeps a whole frame of
 // ~1650 draws unsubmitted, the GPU idles until the guest's own glFlush or the
 // swap, and near the end of the frame one draw blocks 10-17 ms in
 // "FreeAllocationOnTimestamp - WaitForTimestamp" until the GPU catches up.

@@ -1,8 +1,8 @@
 param(
-    [string]$NdkRoot = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018',
-    [string]$MsvcRoot = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231',
-    [string]$WindowsSdkRoot = 'C:\Program Files (x86)\Windows Kits\10',
-    [string]$WindowsSdkVersion = '10.0.26100.0'
+    [string]$NdkRoot = "$env:ANDROID_HOME\ndk\27.2.12479018",
+    [string]$MsvcRoot = $env:VCToolsInstallDir,
+    [string]$WindowsSdkRoot = $env:WindowsSdkDir,
+    [string]$WindowsSdkVersion = "$env:WindowsSDKVersion".TrimEnd('\')
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'check_gfx_values.ps1') -NdkRoot $NdkRoot -MsvcRoot $MsvcRoot `
@@ -23,3 +23,22 @@ try {
 } finally { $env:PATH = $previousPath }
 & $commandExecutable (Join-Path $buildRoot 'gfx_abi_fixture.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Widget command test failed' }
+# HIDE GAMEPAD BUTTONS: the Android object of the StringAliasMap rewrite and its host markup checks.
+& $compiler '--target=aarch64-linux-android24' '-std=c++20' '-Wall' '-Wextra' '-Werror' '-fPIC' `
+    '-I' $sourceRoot '-I' (Join-Path $projectRoot 'arm64_bridge\third_party\_deps\dynarmic-src\src') `
+    '-c' (Join-Path $sourceRoot 'bl2_touch_gamepad_glyphs.cpp') '-o' (Join-Path $buildRoot 'bl2_touch_gamepad_glyphs.android.o')
+if ($LASTEXITCODE -ne 0) { throw 'Gamepad glyph Android compilation failed' }
+$glyphExecutable = Join-Path $buildRoot 'gamepad_glyphs_test.exe'
+$glyphArgs = $hostArgs | Where-Object { $_ -ne ('/Fe' + $executable) -and $_ -ne (Join-Path $sourceRoot 'bl2_touch_gfx_values.cpp') -and
+    $_ -ne (Join-Path $kitRoot 'tests\gfx_values_test.cpp') }
+$linkAt = [Array]::IndexOf($glyphArgs, '/link')
+$glyphArgs = @(('/Fe' + $glyphExecutable), '/DBL2_GAMEPAD_GLYPHS_HOST_TEST') + @($glyphArgs[0..($linkAt - 1)]) +
+    @((Join-Path $sourceRoot 'bl2_touch_gamepad_glyphs.cpp'), (Join-Path $kitRoot 'tests\gamepad_glyphs_test.cpp')) +
+    @($glyphArgs[$linkAt..($glyphArgs.Length - 1)])
+try {
+    $env:PATH = $msvcBin + ';' + $previousPath
+    & (Join-Path $msvcBin 'cl.exe') @glyphArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Gamepad glyph test compilation failed' }
+} finally { $env:PATH = $previousPath }
+& $glyphExecutable
+if ($LASTEXITCODE -ne 0) { throw 'Gamepad glyph test failed' }

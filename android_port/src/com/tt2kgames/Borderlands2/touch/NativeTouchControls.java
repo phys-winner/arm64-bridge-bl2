@@ -45,7 +45,11 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         SurfaceHolder.Callback, SensorEventListener {
     public interface RouteListener { void nativeRouteChanged(boolean ownsInput); }
     private static final String TAG = "BL2NativeTouch";
-    private static final int MORE = -2, DONE = -3;
+    private static final int MORE = TouchLayout.MORE_BUTTON, DONE = -3;
+    /** Layout editor toolbar pills (never buttons of the play layout). */
+    private static final int TOOL_BUTTONS = -10, TOOL_LEFT = -11, TOOL_RESET = -12;
+    /** Editor buttons offered outside the cluster, in panel order. */
+    private static final int[] OPTIONAL = {MELEE, CROUCH, SKILL, NEXT_WEAPON, PREV_WEAPON, INVENTORY, MAP, CHAT, SUICIDE};
     private static final int LEGACY = 1000;
     // On foot; Give up exists only where InputSet_Injured offers Suicide (FFYL).
     private static final int[] RADIAL = {NEXT_WEAPON, SKILL, CROUCH, MELEE, INVENTORY, MAP, PREV_WEAPON, RELOAD, SUICIDE, CHAT};
@@ -65,15 +69,18 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             HINT_DEBUG_MORE = TouchPreferences.HINT_DEBUG_MORE, HINT_AUTORUN = TouchPreferences.HINT_AUTORUN,
             HINT_MAP_NAVIGATION = TouchPreferences.HINT_MAP_NAVIGATION, HINT_LAYOUT = TouchPreferences.HINT_LAYOUT,
             HINT_SLOTS = TouchPreferences.HINT_SLOTS, HINT_SKILL_TAP = TouchPreferences.HINT_SKILL_TAP,
-            HINT_STATUS_TAPS = TouchPreferences.HINT_STATUS_TAPS;
+            HINT_STATUS_TAPS = TouchPreferences.HINT_STATUS_TAPS, HINT_EDITOR = TouchPreferences.HINT_EDITOR;
     private static volatile WeakReference<NativeTouchControls> active = new WeakReference<>(null);
     private static final class Button {
         final int action;
+        /** The layout place it occupies: Fire's place shows Melee while the weapon is empty. */
+        final int slot;
         final String label;
         final RectF rect;
         final float hitSlop;
-        Button(int action, String label, RectF rect,float hitSlop) {
-            this.action = action; this.label = label; this.rect = rect; this.hitSlop=hitSlop;
+        Button(int action, String label, RectF rect,float hitSlop) { this(action,action,label,rect,hitSlop); }
+        Button(int action, int slot, String label, RectF rect,float hitSlop) {
+            this.action = action; this.slot = slot; this.label = label; this.rect = rect; this.hitSlop=hitSlop;
         }
         boolean contains(float x,float y) { return TouchLayout.circleContains(x,y,rect.centerX(),rect.centerY(),rect.width()/2,hitSlop); }
     }
@@ -130,6 +137,17 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private int insetL, insetT, insetR, insetB, editPointer = -1;
     private Button editButton;
     private float editOffsetX, editOffsetY;
+    /** Layout editor: the button panel, the armed reset and the toolbar pills. */
+    private boolean paletteOpen;
+    private long resetArmedUntil;
+    private float[][] toolRects, paletteRects;
+    private int[] toolIds;
+    /** A left-hand toggle in the editor reaches the native settings page at once. */
+    private boolean settingsPollRequested;
+    /** Give up placed on the screen acts after a one-second hold, like its sector. */
+    private int confirmPointer = -1;
+    private long confirmStarted;
+    private Button confirmButton;
     private long lastFrame = -1, lastFrameTime;
     private int settingsRevision, renderRestartOffered, videoOptionsAway;
     private long lastSettingsPoll;
@@ -175,6 +193,12 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private android.hardware.input.InputManager.InputDeviceListener mouseListener;
     /** A mouse is connected; without one nothing below changes focus or capture. */
     private boolean mousePresent, mouseCapture, cursorHidden, mouseStream;
+    /**
+     * Keyboard with a mouse plays like the PC game: once a key is used while the
+     * mouse plays, the on-screen controls hide until the screen is touched. The
+     * mouse and the keys keep working; the first touch only shows the controls.
+     */
+    private boolean keyboardMouse, mouseUsed, touchSwallowed;
     private int mouseButtons;
     private long mouseCaptureRetry;
     private PointerIcon hiddenCursor;
@@ -283,7 +307,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         return view.back();
     }
     private boolean back() {
-        if (editing) { editing=false; expanded=false; cancelInput(); return true; }
+        if (editing && paletteOpen) { paletteOpen=false; invalidate(); return true; }
+        if (editing) { stopEditing(); return true; }
         if (radialOpen) { closeRadial(); invalidate(); return true; }
         if (expanded && context.menu()) { clearMenuMore(); buildButtons(); invalidate(); return true; }
         if (context.has(PHYSICAL_OWNS_INPUT)) return false;
@@ -361,7 +386,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 saveLayout();
                 clearMenuMore();
                 uiPointers.clear(); menuPointer = -1; editPointer = -1; editButton = null;
-                if(!next.gameplay()) editing=false;
+                if(!next.gameplay()) { editing=false; paletteOpen=false; }
+                clearConfirm();
                 closeRadial(); utilityPointers.clear(); legacyPointers.clear();
                 hudGesture.cancel(); hudTaps.cancel(); closeSlots(); hudPointers.clear(); hintUntil = 0;
                 LaunchControls.cancel(activity);
@@ -395,9 +421,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if (!context.menu()) clearMenuMore();
             if (eligible) updateMenuMore(now);
             if (layoutEditPending && eligible && context.gameplay()) {
-                layoutEditPending = false; editing = true; layoutDirty = true;
-                showHint("Drag the buttons; tap Done to save", "Перетащите кнопки; нажмите «Готово», чтобы сохранить",HINT_LAYOUT);
+                layoutEditPending = false; editing = true; paletteOpen = false; layoutDirty = true;
+                showHint("Drag buttons; × removes one, Buttons adds and fills More", "Перетаскивайте кнопки; × убирает, «Кнопки» — добавить и заполнить «Ещё»",HINT_EDITOR);
             }
+            updateKeyboardMouse((bridge.physicalState() & PHYSICAL_KEYBOARD) != 0);
             // Focus/IME/settings temporarily suppress gestures while retaining the
             // native route, so an old overlay cannot appear over a modal keyboard.
             publishRoute(true);
@@ -420,8 +447,10 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 if (hudGesture.slotHoldDue(now,context,dp(14))) openSlots();
                 if (!hudGesture.slotsOpen() && slotCells != null) { closeSlots(); invalidate(); }
                 confirmRadialHold(now);
+                confirmButtonHold(now);
                 offerHudHint(now);
             }
+            if (editing && resetArmedUntil != 0 && now >= resetArmedUntil) { resetArmedUntil = 0; layoutDirty = true; invalidate(); }
         } catch (UnsatisfiedLinkError error) {
             linkageFailed = true; eligible = false; buttons.clear();
             invalidate();
@@ -439,13 +468,18 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 surfaceLocation[1] - screenLocation[1] + surface.getHeight());
         if (!viewport.equals(next)) { cancelInput(); viewport.set(next); layoutDirty=true; applyRenderScale(); }
         next.set(viewport);
-        if (!next.intersect(insetL, insetT, getWidth() - insetR, getHeight() - insetB)) next.setEmpty();
+        // The whole Surface by default; SCREEN CUTOUT MARGIN restores the inset
+        // layout of earlier builds (cutout, system bars, mandatory gestures).
+        boolean inset = preferences.screenInsets;
+        if (!next.intersect(inset ? insetL : 0, inset ? insetT : 0, getWidth() - (inset ? insetR : 0),
+                getHeight() - (inset ? insetB : 0))) next.setEmpty();
         if (!safe.equals(next)) { safe.set(next); layoutDirty=true; }
         layoutScale=Math.min(preferences.scale,Math.max(.75f,(safe.height()/dp(1)-64)/260));
         input.configure(getResources().getDisplayMetrics().density, 60 * preferences.scale,
                 preferences.look, preferences.ads, preferences.invertY);
         input.autoSprint(preferences.autoSprint);
         input.aimToggle(preferences.aimToggle);
+        input.lookAcceleration(preferences.lookAcceleration);
     }
     private void add(int action, String label, float fromRightDp, float fromBottomDp, float sizeDp) {
         if (action >= 0 && action < LEGACY && !context.allows(action)) return;
@@ -502,19 +536,36 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         return c.mode==GAMEPLAY && c.weaponCount==0 && c.known(FIRE) && !c.allows(FIRE);
     }
     private void addGameplay(int action,String text) {
-        if (action >= 0 && !editing && !context.allows(action)) return;
-        float[] anchor = TouchLayout.gameplayAnchor(action);
-        boolean custom = action >= 0 && customPosition(preferences,action);
-        float nx = custom ? preferences.x(action,anchor[0]) : anchor[0];
-        float ny = custom ? preferences.y(action,anchor[1]) : anchor[1];
-        float size = TouchLayout.gameplaySize(action,safe.height(),dp(1),layoutScale);
-        float[] placed = TouchLayout.placeGameplay(action,nx,ny,size,safe.left,safe.top,safe.right,safe.bottom,
+        int shown = shownAction(action);
+        addGameplay(action,shown,shown == action ? text : buttonLabel(shown));
+    }
+    /** slot: the place (anchor, saved position, size); shown: what the button does there. */
+    private void addGameplay(int slot,int shown,String text) {
+        if (slot >= 0 && !editing && !context.allows(shown)) return;
+        float[] anchor = TouchLayout.gameplayAnchor(slot);
+        boolean custom = (slot >= 0 || slot == MORE) && customPosition(preferences,slot);
+        float nx = custom ? preferences.x(slot,anchor[0]) : anchor[0];
+        float ny = custom ? preferences.y(slot,anchor[1]) : anchor[1];
+        float size = TouchLayout.gameplaySize(slot,safe.height(),dp(1),layoutScale);
+        float[] placed = TouchLayout.placeGameplay(slot,nx,ny,size,safe.left,safe.top,safe.right,safe.bottom,
                 dp(1),preferences.leftHanded,custom,occupied,hudReserved);
         if (placed != null) {
             occupied.add(placed);
-            buttons.add(new Button(action,text,new RectF(placed[0],placed[1],placed[2],placed[3]),
-                    TouchLayout.gameplayHitSlop(action,dp(1))));
+            buttons.add(new Button(shown,slot,text,new RectF(placed[0],placed[1],placed[2],placed[3]),
+                    TouchLayout.gameplayHitSlop(shown,dp(1))));
         }
+    }
+    /**
+     * Fire's place melees while the equipped weapon has neither a loaded round
+     * nor spare ammo (native weapon word); never in a seat, in FFYL or the editor.
+     */
+    static boolean fireShowsMelee(Context c,boolean editing) {
+        return !editing && c.mode == GAMEPLAY && c.equippedEmpty() && c.allows(MELEE);
+    }
+    private int shownAction(int slot) { return slot == FIRE && fireShowsMelee(context,editing) ? MELEE : slot; }
+    /** On foot the editor decides; a seat keeps its own fixed layout. */
+    private boolean placedOnScreen(int action) {
+        return context.mode != GAMEPLAY || preferences.placement(action) == TouchLayout.PLACE_SCREEN;
     }
     private static float[] hudBox(RectF target) {
         return target.isEmpty() ? null : new float[]{target.left,target.top,target.right,target.bottom};
@@ -530,8 +581,24 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (!target.intersect(safe)) target.setEmpty();
     }
     private void addGameplayCluster() {
+        long mask = editing ? (1L<<26)-1 : context.actions;
+        // A cluster member the editor removed leaves its place empty; the others keep theirs.
+        for (int action : new int[]{FIRE,AIM,GRENADE,JUMP}) if (!placedOnScreen(action)) mask &= ~bit(action);
         addCluster(new int[]{FIRE,AIM,GRENADE,JUMP},new String[]{label("Fire", "Огонь"),label("Aim", "Прицел"),
-                label("Grenade", "Граната"),label("Jump", "Прыжок")},editing ? (1L<<26)-1 : context.actions);
+                label("Grenade", "Граната"),label("Jump", "Прыжок")},mask);
+    }
+    private String buttonLabel(int action) {
+        switch (action) {
+            case FIRE: return label("Fire", "Огонь");
+            case AIM: return label("Aim", "Прицел");
+            case GRENADE: return label("Grenade", "Граната");
+            case JUMP: return label("Jump", "Прыжок");
+            case RELOAD: return label("Reload", "Зарядить");
+            case USE: return label("Use", "Действие");
+            case PAUSE: return label("Pause", "Пауза");
+            case MORE: return label("More", "Ещё");
+            default: return radialLabel(action,russian);
+        }
     }
     /**
      * A vehicle seat replaces the on-foot cluster (review 4.4): the driver keeps
@@ -557,7 +624,9 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
         for(int i=0;i<actions.length;++i) if(group[i]!=null) {
             occupied.add(group[i]);
-            buttons.add(new Button(actions[i],labels[i],new RectF(group[i][0],group[i][1],group[i][2],group[i][3]),dp(2)));
+            int shown=shownAction(actions[i]);
+            buttons.add(new Button(shown,actions[i],shown==actions[i] ? labels[i] : buttonLabel(shown),
+                    new RectF(group[i][0],group[i][1],group[i][2],group[i][3]),dp(2)));
         }
     }
     private void buildButtons() {
@@ -569,7 +638,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         hudTarget(experienceTarget,context.experienceRect,context.hudExperience());
         hudTarget(challengeTarget,context.challengeRect,context.hudChallenge());
         hudTarget(objectiveTarget,context.objectiveRect,context.hudObjectives());
-        if (!eligible) return;
+        if (!eligible || keyboardMouse) return;
         if (context.gameplay()) {
             // HUD follows the full Surface; insets and left-hand mode affect
             // controls only. Never rewrite a player's deliberately saved layout.
@@ -581,21 +650,29 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             // challenge notice. They stay tappable but never displace controls.
             for (RectF rect : new RectF[]{mapTarget,ammoTarget,skillTarget,experienceTarget}) if (!rect.isEmpty())
                 hudReserved.add(new float[]{rect.left,rect.top,rect.right,rect.bottom});
-            addGameplay(PAUSE,label("Pause", "Пауза"));
-            addGameplay(editing ? DONE : MORE,editing ? label("Done", "Готово") : label("More", "Ещё"));
             boolean seat=context.mode == VEHICLE;
+            // The layout editor places every on-foot control: on the screen, in
+            // More or nowhere. Pause may go (system Back pauses); a seat keeps More
+            // because its radial holds Horn, Switch seat, Look back and Turret.
+            if (preferences.placement(PAUSE) == TouchLayout.PLACE_SCREEN) addGameplay(PAUSE,label("Pause", "Пауза"));
+            if (seat || preferences.placement(MORE) == TouchLayout.PLACE_SCREEN) addGameplay(MORE,label("More", "Ещё"));
             if (seat) addSeatCluster();
             else addGameplayCluster();
             // A seat shows Reload only where the engine offers it (an attached
             // rider's own weapon); its layout editor never adds on-foot buttons.
-            if ((!seat || !editing) && reloadButtonShown(context,!ammoTarget.isEmpty(),editing,preferences.reloadButton))
+            if ((!seat || !editing) && placedOnScreen(RELOAD)
+                    && reloadButtonShown(context,!ammoTarget.isEmpty(),editing,preferences.reloadButton))
                 addGameplay(RELOAD,label("Reload", "Зарядить"));
             // A seat's Exit is in its cluster; Horn and Switch seat are in the radial.
-            if (!seat) addGameplay(USE,label("Use", "Действие"));
+            if (!seat) {
+                if (placedOnScreen(USE)) addGameplay(USE,label("Use", "Действие"));
+                for (int action : OPTIONAL) if (placedOnScreen(action)) addGameplay(action,buttonLabel(action));
+            }
+            if (editing) buildEditor();
         } else if (context.mode == CINEMATIC && context.has(CAN_SKIP)) {
             // The cinematic replaces the cluster: Pause where it always is,
             // Skip only while the original SkipCinematic is available.
-            addGameplay(PAUSE,label("Pause", "Пауза"));
+            if (preferences.placement(PAUSE) == TouchLayout.PLACE_SCREEN) addGameplay(PAUSE,label("Pause", "Пауза"));
             add(SKIP, label("Skip", "Пропуск"), 48, 40, 64);
         } else if (context.menu()) {
             add(BACK, label("Back", "Назад"), 36, 36, 56);
@@ -685,6 +762,16 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 && !(context.weaponCount >= 0 && context.weaponCount < 2 && (action == NEXT_WEAPON || action == PREV_WEAPON));
     }
     static int[] radialActions(Context context) { return context.mode == VEHICLE ? RADIAL_VEHICLE : RADIAL; }
+    /** More on foot: the editor's items, plus Reload kept on the screen as the radial's fallback. */
+    static int[] footRadial(TouchPreferences preferences) {
+        int[] items=new int[TouchLayout.RADIAL_ORDER.length];
+        int count=0;
+        for (int action:TouchLayout.RADIAL_ORDER) {
+            int place=preferences.placement(action);
+            if (place == TouchLayout.PLACE_MORE || (action == RELOAD && place == TouchLayout.PLACE_SCREEN)) items[count++]=action;
+        }
+        return Arrays.copyOf(items,count);
+    }
     /**
      * The radial adapts to the ways that already work (review section 5): no
      * unavailable item, no Map while the minimap tap opens it, no Reload while
@@ -692,7 +779,11 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
      * Give up only where FFYL offers it. Fewer sectors make larger targets.
      */
     static int[] radialItems(Context context,boolean fallback,boolean mapTap,boolean reloadElsewhere) {
-        int[] base=radialActions(context),items=new int[base.length];
+        return radialItems(context,fallback,mapTap,reloadElsewhere,RADIAL);
+    }
+    /** footItems: More's content on foot from the layout editor; a seat keeps its own items. */
+    static int[] radialItems(Context context,boolean fallback,boolean mapTap,boolean reloadElsewhere,int[] footItems) {
+        int[] base=context.mode == VEHICLE ? RADIAL_VEHICLE : footItems,items=new int[base.length];
         int count=0;
         if (!context.usable()) return new int[0];
         for (int action:base) {
@@ -735,10 +826,18 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         // the other sectors underneath an already held finger.
         boolean mapTap=!fallback && !mapTarget.isEmpty() && context.allows(MAP);
         boolean ammoBar=!ammoTarget.isEmpty();
-        boolean reloadElsewhere=reloadButtonShown(context,ammoBar,false,preferences.reloadButton)
-                || (!fallback && context.mode == GAMEPLAY && ammoBar && context.known(RELOAD));
-        int[] items=radialItems(context,fallback,mapTap,reloadElsewhere);
-        if (items.length == 0) return;
+        // Reload put into More stays there; on the screen it is the radial's
+        // fallback only while neither its button nor the ammo strip reloads.
+        boolean reloadElsewhere=preferences.placement(RELOAD) == TouchLayout.PLACE_SCREEN
+                && (reloadButtonShown(context,ammoBar,false,preferences.reloadButton)
+                || (!fallback && context.mode == GAMEPLAY && ammoBar && context.known(RELOAD)));
+        int[] foot=footRadial(preferences);
+        int[] items=radialItems(context,fallback,mapTap,reloadElsewhere,foot);
+        if (items.length == 0) {
+            if (context.mode == GAMEPLAY && preferences.moreItemCount() == 0)
+                showHint("More is empty: add buttons in the layout editor", "«Ещё» пусто: добавьте кнопки в редакторе раскладки",0);
+            return;
+        }
         radialOpen=true; radialPointer=id; radialSelection=-1; radialDragged=false; radialSelectedAt=0;
         radialStartX=x; radialStartY=y; radialStarted=SystemClock.uptimeMillis();
         radial=items; radialCount=items.length;
@@ -750,6 +849,19 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         buildRadial(); haptic(HapticFeedbackConstants.VIRTUAL_KEY);
     }
     private void closeRadial() { radialOpen=false;radialTapMode=false;radialPointer=-1;radialSelection=-1;radialSelectedAt=0;radialButtons.clear(); }
+    /** Menu buttons the editor can put on the screen act on a tap, never as a hold. */
+    static boolean tapButton(int action) { return action == INVENTORY || action == MAP || action == CHAT; }
+    private void clearConfirm() { confirmPointer=-1; confirmButton=null; confirmStarted=0; }
+    /** Give up on its own button acts once its finger has stayed for a second. */
+    private void confirmButtonHold(long now) {
+        if (confirmPointer < 0 || confirmButton == null) return;
+        if (utilityPointers.get(confirmPointer) != confirmButton) { clearConfirm(); invalidate(); return; }
+        if (now-confirmStarted < CONFIRM_HOLD_MS) { invalidate(); return; }
+        clearConfirm();
+        if (context.allows(SUICIDE)) activate(nextLegacyId++,SUICIDE,0,0);
+        haptic(HapticFeedbackConstants.LONG_PRESS);
+        invalidate();
+    }
     /** Give up acts once the finger has stayed on its sector for a second. */
     private void confirmRadialHold(long now) {
         if (!radialOpen || radialPointer<0 || radialSelection<0 || radialSelectedAt==0
@@ -824,7 +936,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     }
     private void moreHint() { showHint("Crouch, melee, inventory: hold More and drag", "Присесть, удар, рюкзак: удерживайте «Ещё» и сдвиньте палец",HINT_GAME_MORE); }
     private void offerHudHint(long now) {
-        if (!context.gameplay() || fallback || radialOpen || now < hintUntil) return;
+        if (!context.gameplay() || fallback || radialOpen || keyboardMouse || now < hintUntil) return;
         if (!preferences.mapTapHintSeen && !mapTarget.isEmpty() && context.allows(MAP))
             showHint("Tap the minimap to open the map", "Тап по мини-карте открывает карту",HINT_MAP);
         else if (!preferences.weaponGestureHintSeen && context.mode == GAMEPLAY && context.weaponCount >= 2 && !ammoTarget.isEmpty()
@@ -871,7 +983,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private void drawHint(Canvas canvas) {
         if (hintText == null || SystemClock.uptimeMillis() >= hintUntil) return;
         paint.setTextSize(dp(14)); paint.setTextAlign(Paint.Align.CENTER); paint.setStyle(Paint.Style.FILL);
-        float cy=safe.top+dp(74);
+        // In the layout editor the pill goes below its toolbar.
+        float cy=editing && toolRects != null && toolRects.length > 0 ? toolRects[0][3]+dp(30) : safe.top+dp(74);
         // The pill shifts or narrows to stay off the minimap, objectives and challenge notice.
         float[] span=TouchLayout.hintSpan(safe.centerX(),paint.measureText(hintText)+dp(24),safe.left+dp(16),safe.right-dp(16),
                 cy-dp(18),cy+dp(18),dp(8),hudBox(mapTarget),hudBox(objectiveTarget),hudBox(challengeTarget));
@@ -894,7 +1007,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             canvas.drawText(label("Loading…", "Загрузка…"), getWidth() / 2f, getHeight() / 2f + dp(6), paint);
             return;
         }
-        if (!eligible) return;
+        if (!eligible || keyboardMouse) return;
         canvas.save(); canvas.clipRect(safe);
         if (input.moving()) {
             boolean running=(input.held()&bit(SPRINT))!=0;
@@ -911,21 +1024,29 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
         for (Button b : buttons) {
             boolean held = b.action >= 0 && b.action<LEGACY && ((input.held() & bit(b.action)) != 0
-                    || (b.action==USE && legacyKeys.get(99)!=null));
+                    || (b.slot >= 0 && b.slot != b.action && (input.held() & bit(b.slot)) != 0)
+                    || (b.action==USE && legacyKeys.get(99)!=null) || b == confirmButton);
             paint.setStyle(Paint.Style.FILL); paint.setColor(Color.BLACK);
             paint.setAlpha((int)(255*(held || editing ? .72f : preferences.opacity)));
             canvas.drawCircle(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,paint);
-            paint.setColor(held ? 0xFFFFD569 : Color.WHITE); paint.setAlpha(held || editing ? 255 : 180);
-            paint.setTextSize(dp(10)); paint.setTextAlign(Paint.Align.CENTER);
-            float measured=paint.measureText(b.label),available=b.rect.width()-dp(8);
-            if (measured > available) paint.setTextSize(dp(10)*available/measured);
-            canvas.drawText(b.label, b.rect.centerX(), b.rect.centerY()+dp(4), paint);
+            drawLabel(canvas,b,held ? 0xFFFFD569 : Color.WHITE,held || editing ? 255 : 180);
+            if (b == confirmButton && confirmStarted > 0) {
+                // Give up fills a ring while it is held; lifting early cancels.
+                float progress=Math.min(1f,(SystemClock.uptimeMillis()-confirmStarted)/(float)CONFIRM_HOLD_MS);
+                paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(dp(3));paint.setColor(0xFFE0483A);paint.setAlpha(255);
+                RectF ring=new RectF(b.rect);ring.inset(-dp(3),-dp(3));
+                canvas.drawArc(ring,-90,360*progress,false,paint);
+                paint.setStyle(Paint.Style.FILL);
+            }
         }
+        if (editing) drawEditorBadges(canvas);
         if(radialOpen) {
             paint.setStyle(Paint.Style.FILL);paint.setColor(0xE6222830);paint.setAlpha(235);
             canvas.drawCircle(radialX,radialY,radialRadius+radialItemRadius+dp(4),paint);
+            String chosen=null;
             for(Button b:radialButtons) {
                 boolean selected=radialSelection>=0 && radial[radialSelection]==b.action;
+                if (selected) chosen=b.label;
                 paint.setColor(selected?0xFFFFD569:0xFF454F5D);canvas.drawCircle(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,paint);
                 if (selected && radialConfirm(b.action) && radialSelectedAt>0) {
                     // Give up fills a ring while it is held; lifting early cancels.
@@ -935,19 +1056,126 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                     canvas.drawArc(ring,-90,360*progress,false,paint);
                     paint.setStyle(Paint.Style.FILL);
                 }
-                paint.setColor(selected?Color.BLACK:Color.WHITE);paint.setTextSize(dp(10));paint.setTextAlign(Paint.Align.CENTER);
-                float measured=paint.measureText(b.label),available=b.rect.width()-dp(8);
-                if (measured > available) paint.setTextSize(dp(10)*available/measured);
-                canvas.drawText(b.label,b.rect.centerX(),b.rect.centerY()+dp(4),paint);
+                drawLabel(canvas,b,selected?Color.BLACK:Color.WHITE,255);
             }
-            paint.setColor(Color.WHITE);paint.setTextSize(dp(10));
-            canvas.drawText(label("Choose", "Выберите"),radialX,radialY-dp(3),paint);
-            canvas.drawText(label("action", "действие"),radialX,radialY+dp(12),paint);
+            paint.setStyle(Paint.Style.FILL);paint.setColor(Color.WHITE);paint.setAlpha(255);
+            paint.setTextAlign(Paint.Align.CENTER);
+            if (chosen != null && preferences.buttonIcons) {
+                // Icons name nothing by themselves: the centre names the chosen sector.
+                paint.setTextSize(dp(12));
+                float measured=paint.measureText(chosen),available=radialRadius*2-radialItemRadius*2-dp(8);
+                if (available > 0 && measured > available) paint.setTextSize(dp(12)*available/measured);
+                canvas.drawText(chosen,radialX,radialY+dp(4),paint);
+            } else {
+                paint.setTextSize(dp(10));
+                canvas.drawText(label("Choose", "Выберите"),radialX,radialY-dp(3),paint);
+                canvas.drawText(label("action", "действие"),radialX,radialY+dp(12),paint);
+            }
         }
         drawSlots(canvas);
+        if (editing) drawEditorPanels(canvas);
         drawHint(canvas);
         drawShaderProgress(canvas);
         canvas.restore();
+    }
+    /** A button's vector icon (BUTTON ICONS), or its caption fitted inside the circle. */
+    private void drawLabel(Canvas canvas,Button b,int color,int alpha) {
+        if (preferences.buttonIcons && TouchIcons.draw(canvas,paint,b.action,b.rect.centerX(),b.rect.centerY(),
+                Math.min(dp(30),b.rect.width()*.5f),color,alpha)) return;
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(color); paint.setAlpha(alpha);
+        paint.setTextSize(dp(10)); paint.setTextAlign(Paint.Align.CENTER);
+        float measured=paint.measureText(b.label),available=b.rect.width()-dp(8);
+        if (measured > available) paint.setTextSize(dp(10)*available/measured);
+        canvas.drawText(b.label, b.rect.centerX(), b.rect.centerY()+dp(4), paint);
+    }
+    /** Remove badges on the buttons, and More's item count while it cannot go. */
+    private void drawEditorBadges(Canvas canvas) {
+        if (paletteOpen || context.mode != GAMEPLAY) return;
+        for (Button b : buttons) {
+            boolean removable=editorRemovable(b);
+            boolean count=b.slot == MORE && !removable;
+            if (!removable && !count) continue;
+            float[] badge=TouchLayout.removeBadge(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,dp(1));
+            paint.setStyle(Paint.Style.FILL); paint.setColor(removable ? 0xFFE0483A : 0xFF454F5D); paint.setAlpha(255);
+            canvas.drawCircle(badge[0],badge[1],badge[2],paint);
+            paint.setColor(Color.WHITE);
+            if (removable) {
+                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(dp(2)); paint.setStrokeCap(Paint.Cap.ROUND);
+                float d=badge[2]*.42f;
+                canvas.drawLine(badge[0]-d,badge[1]-d,badge[0]+d,badge[1]+d,paint);
+                canvas.drawLine(badge[0]-d,badge[1]+d,badge[0]+d,badge[1]-d,paint);
+                paint.setStyle(Paint.Style.FILL);
+            } else {
+                paint.setTextSize(dp(11)); paint.setTextAlign(Paint.Align.CENTER);
+                canvas.drawText(Integer.toString(preferences.moreItemCount()),badge[0],badge[1]+dp(4),paint);
+            }
+        }
+    }
+    private void drawPill(Canvas canvas,float[] r,String text,boolean active,boolean enabled) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(active ? 0xFFFFD569 : Color.BLACK); paint.setAlpha(active ? 255 : enabled ? 200 : 110);
+        canvas.drawRoundRect(r[0],r[1],r[2],r[3],(r[3]-r[1])/2,(r[3]-r[1])/2,paint);
+        paint.setColor(active ? Color.BLACK : Color.WHITE); paint.setAlpha(enabled ? 255 : 110);
+        paint.setTextAlign(Paint.Align.CENTER);
+        float size=Math.min(dp(13),(r[3]-r[1])*.42f);
+        paint.setTextSize(size);
+        float measured=paint.measureText(text),available=r[2]-r[0]-dp(8);
+        if (measured > available) paint.setTextSize(size*available/measured);
+        canvas.drawText(text,(r[0]+r[2])/2,(r[1]+r[3])/2-(paint.ascent()+paint.descent())/2,paint);
+    }
+    /** The toolbar and, while open, the button panel over the dimmed layout. */
+    private void drawEditorPanels(Canvas canvas) {
+        if (toolRects != null && toolIds != null && !paletteOpen)
+            for (int i=0;i<toolRects.length;++i) {
+                int tool=toolIds[i];
+                boolean active=tool == DONE || (tool == TOOL_LEFT && preferences.leftHanded)
+                        || (tool == TOOL_RESET && SystemClock.uptimeMillis() < resetArmedUntil);
+                drawPill(canvas,toolRects[i],toolLabel(tool),active,true);
+            }
+        float[][] r=paletteRects;
+        if (!paletteOpen || r == null) return;
+        paint.setStyle(Paint.Style.FILL); paint.setColor(Color.BLACK); paint.setAlpha(140);
+        canvas.drawRect(safe,paint);
+        paint.setColor(0xF0222830); paint.setAlpha(245);
+        canvas.drawRoundRect(r[0][0],r[0][1],r[0][2],r[0][3],dp(14),dp(14),paint);
+        paint.setColor(Color.WHITE); paint.setAlpha(255); paint.setTextAlign(Paint.Align.LEFT); paint.setTextSize(dp(15));
+        canvas.drawText(label("Buttons", "Кнопки"),r[0][0]+dp(16),r[0][1]+dp(34),paint);
+        float titleWidth=paint.measureText(label("Buttons", "Кнопки"));
+        paint.setTextSize(dp(11)); paint.setAlpha(170);
+        String legend=label("Screen: a button · More: a More sector · None: hidden",
+                "Экран — кнопка · Ещё — пункт «Ещё» · Нет — скрыта");
+        float legendLeft=r[0][0]+dp(16)+titleWidth+dp(14),legendRight=r[1][0]-dp(10);
+        float measuredLegend=paint.measureText(legend);
+        if (legendRight-legendLeft > dp(60)) {
+            if (measuredLegend > legendRight-legendLeft) paint.setTextSize(dp(11)*(legendRight-legendLeft)/measuredLegend);
+            canvas.drawText(legend,legendLeft,r[0][1]+dp(33),paint);
+        }
+        drawPill(canvas,r[1],label("Done", "Готово"),true,true);
+        String[] places={label("Screen", "Экран"),label("More", "Ещё"),label("None", "Нет")};
+        int moreItems=preferences.moreItemCount();
+        for (int i=0;i<TouchLayout.EDITABLE.length;++i) {
+            int action=TouchLayout.EDITABLE[i];
+            float[] cell=r[i+2];
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setAlpha(18);
+            canvas.drawRoundRect(cell[0],cell[1],cell[2],cell[3],dp(8),dp(8),paint);
+            float iconSize=Math.min(dp(22),(cell[3]-cell[1])*.6f),textLeft=cell[0]+dp(10);
+            if (TouchIcons.draw(canvas,paint,action,cell[0]+dp(8)+iconSize/2,(cell[1]+cell[3])/2,iconSize,Color.WHITE,230))
+                textLeft=cell[0]+dp(14)+iconSize;
+            String name=buttonLabel(action);
+            float segmentsLeft=TouchLayout.segment(cell,TouchLayout.PLACE_SCREEN,dp(1))[0];
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setAlpha(255);
+            paint.setTextAlign(Paint.Align.LEFT); paint.setTextSize(dp(12));
+            float measured=paint.measureText(name),available=segmentsLeft-textLeft-dp(4);
+            if (available > 0 && measured > available) paint.setTextSize(dp(12)*available/measured);
+            canvas.drawText(name,textLeft,(cell[1]+cell[3])/2-(paint.ascent()+paint.descent())/2,paint);
+            int current=preferences.placement(action);
+            for (int place=TouchLayout.PLACE_SCREEN;place<=TouchLayout.PLACE_HIDDEN;++place) {
+                boolean allowed=TouchLayout.placementAllowed(action,place)
+                        && !(action == MORE && place != TouchLayout.PLACE_SCREEN && moreItems > 0);
+                drawPill(canvas,TouchLayout.segment(cell,place,dp(1)),places[place],current == place,allowed);
+            }
+        }
     }
     /** Main menu, bottom left (clear of the menu list and the right-hand buttons):
      *  the cache the first launch used to build before the menu now forms meanwhile. */
@@ -972,6 +1200,18 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if ((movieState & MOVIE_PLAYING) != 0 || movieStream) return movieTouch(event);
         int action = event.getActionMasked(), index = event.getActionIndex();
         boolean mouse = event.isFromSource(InputDevice.SOURCE_MOUSE);
+        if (mouse) mouseUsed = true;
+        else if (action == MotionEvent.ACTION_DOWN) {
+            // A new stream. After keyboard-and-mouse play the first touch only
+            // brings the controls back; a stream never left without its UP.
+            mouseUsed = false;
+            touchSwallowed = keyboardMouse;
+            if (keyboardMouse) { keyboardMouse = false; layoutDirty = true; invalidate(); }
+        }
+        if (touchSwallowed && !mouse) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) touchSwallowed = false;
+            return true;
+        }
         if (action == MotionEvent.ACTION_DOWN) {
             // A mouse clicks like a finger only where its arrow is shown (menus
             // and the layout editor) and with the primary button; play captures it.
@@ -998,12 +1238,14 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (editing) {
             editEvent(event);
         } else if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
-            down(event.getPointerId(index), event.getX(index), event.getY(index));
+            down(event.getPointerId(index), event.getX(index), event.getY(index), event.getEventTime());
         } else if (action == MotionEvent.ACTION_MOVE) {
             moveVisual(moveVisualBefore);
+            // Sample times pace LOOK ACCELERATION.
             for (int h = 0; h < event.getHistorySize(); h++) for (int i = 0; i < event.getPointerCount(); i++)
-                move(event.getPointerId(i), event.getHistoricalX(i,h), event.getHistoricalY(i,h));
-            for (int i = 0; i < event.getPointerCount(); i++) move(event.getPointerId(i), event.getX(i), event.getY(i));
+                move(event.getPointerId(i), event.getHistoricalX(i,h), event.getHistoricalY(i,h), event.getHistoricalEventTime(h));
+            for (int i = 0; i < event.getPointerCount(); i++)
+                move(event.getPointerId(i), event.getX(i), event.getY(i), event.getEventTime());
             moveVisual(moveVisualAfter);
             // Look drags draw nothing here. Redrawing this full-screen layer per
             // touch sample costs GPU time beside the game, and the compositor then
@@ -1047,6 +1289,9 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                         if (held) openMenuCommands(now);
                         else { clearMenuMore();buildButtons();menuMoreHint(); }
                     }
+                } else if (b.action==SUICIDE) {
+                    // Acted already from confirmButtonHold, or lifted early.
+                    if (id==confirmPointer) { clearConfirm(); showHint("Hold Give up for a second", "Удерживайте «Сдаться» секунду",0); }
                 } else if(b.contains(x,y)) activate(id,b.action,x,y);
             } else if(legacyPointers.get(id)!=null) {
                 int key=legacyPointers.get(id);legacyPointers.remove(id);
@@ -1062,7 +1307,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                         event.getX(index), event.getY(index));
                 uiPointers.remove(id);
             } else {
-                input.up(id, event.getX(index), event.getY(index));
+                input.up(id, event.getX(index), event.getY(index), event.getEventTime());
             }
             if (id == menuPointer) menuPointer = uiPointers.size()>0 ? uiPointers.keyAt(0) : -1;
             if (expanded) menuExpandedUntil=SystemClock.uptimeMillis()+6000;
@@ -1070,7 +1315,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (action == MotionEvent.ACTION_UP) streamOwned = false;
         invalidate(); return true;
     }
-    private void down(int id, float x, float y) {
+    private void down(int id, float x, float y, long time) {
         Button b = hit(x, y);
         if (context.menu()) {
             if (!menuPointerAllowed(context,menuPointer,uiPointers.size(),b!=null)) { cancelInput(); return; }
@@ -1081,7 +1326,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 // A held item stays pressed under this finger past the radial,
                 // through the same native held bit as a button; others act on release.
                 if (!fallback && radialHold(b.action)) {
-                    input.down(id, TouchInput.BUTTON, b.action, x, y);
+                    input.down(id, TouchInput.BUTTON, b.action, x, y, time);
                     haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
                 }
                 if (radialTapMode && radialPointer<0 && radialConfirm(b.action)) {
@@ -1116,13 +1361,21 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 return;
             }
             if(b.action>=LEGACY) {legacyPointers.put(id,b.action-LEGACY);publishLegacyKeys(fallback?legacyHeld:0);return;}
-            if(b.action<0 || b.action==PAUSE) {
-                utilityPointers.put(id,b);return;
+            if(b.action<0 || b.action==PAUSE || tapButton(b.action)) {
+                // Menu buttons act on release over the button, like Pause.
+                utilityPointers.put(id,b);
+                if (b.action >= 0) haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+                return;
+            }
+            if(b.action==SUICIDE) {
+                // Give up on the screen waits for the same one-second hold as its sector.
+                utilityPointers.put(id,b); confirmPointer=id; confirmButton=b; confirmStarted=SystemClock.uptimeMillis();
+                haptic(HapticFeedbackConstants.VIRTUAL_KEY); return;
             }
             // The native held Use bit presses the game's own X button: tap picks
             // up, hold equips, with no virtual controller. Fallback keeps key X.
             if(legacyUse(context,fallback,b.action)) { legacyPointers.put(id,99);publishLegacyKeys(legacyHeld);return; }
-            input.down(id, TouchInput.BUTTON, b.action, x, y);
+            input.down(id, TouchInput.BUTTON, b.action, x, y, time);
             haptic(HapticFeedbackConstants.VIRTUAL_KEY); return;
         }
         if (context.menu() && (fallback || context.has(DIRECT_UI | UI_TAP_TEST | UI_WIDGETS)) && viewport.contains(x, y)) {
@@ -1132,7 +1385,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             if (!fallback && context.known(USE) && context.allows(USE) && useTarget.contains(x,y)) {
                 // The transparent native hint shares the Action button's real
                 // press/hold/up path, including pickup and hold-to-equip.
-                input.down(id, TouchInput.BUTTON, USE, x, y);
+                input.down(id, TouchInput.BUTTON, USE, x, y, time);
                 haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
             }
             if (!fallback && (mapTarget.contains(x,y) || (context.mode == GAMEPLAY && ammoTarget.contains(x,y)))) {
@@ -1157,7 +1410,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                         SystemClock.uptimeMillis(),context.epoch);
                 return;
             }
-            input.down(id, movement ? TouchInput.MOVEMENT : TouchInput.LOOK, -1, x, y);
+            input.down(id, movement ? TouchInput.MOVEMENT : TouchInput.LOOK, -1, x, y, time);
         }
     }
     /** Tap-only HUD target under a new touch, while its action is available. */
@@ -1184,7 +1437,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         out[7] = moving ? Math.round(input.moveY() * reach) : 0;
         out[8] = slotCells != null ? slotSelection : -2;
     }
-    private void move(int id, float x, float y) {
+    private void move(int id, float x, float y, long time) {
         if (hudGesture.owns(id)) {
             hudGesture.move(id,x,y);
             if (hudGesture.slotsOpen() && slotCells != null) {
@@ -1197,7 +1450,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         }
         if (hudTaps.owns(id)) {
             float[] drag=hudTaps.move(id,x,y,dp(14));
-            if (drag != null) { input.down(id,(int)drag[0],-1,drag[1],drag[2]); input.move(id,x,y); }
+            if (drag != null) { input.down(id,(int)drag[0],-1,drag[1],drag[2]); input.move(id,x,y,time); }
             return;
         }
         if (id==menuMorePointer) {
@@ -1223,7 +1476,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             else sendUi(id,MOVE,x,y);
         }
         else {
-            boolean running=input.sprintLatched(); input.move(id,x,y);
+            boolean running=input.sprintLatched(); input.move(id,x,y,time);
             if (!running && input.sprintLatched()) {
                 haptic(HapticFeedbackConstants.LONG_PRESS);
                 showHint("Auto-run: pull back or tap the stick to stop", "Автобег: верните стик или коснитесь его, чтобы остановиться",HINT_AUTORUN);
@@ -1285,13 +1538,21 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     private void editEvent(MotionEvent event) {
         int action = event.getActionMasked(), index = event.getActionIndex();
         if (action == MotionEvent.ACTION_DOWN) {
-            Button b = hit(event.getX(),event.getY());
-            if (b != null && b.action == DONE) {
-                editing=false; expanded=false; cancelInput(); return;
+            float x=event.getX(), y=event.getY();
+            if (paletteOpen) { paletteTap(x,y); return; }
+            int tool=toolAt(x,y);
+            if (tool != 0) { toolTap(tool); return; }
+            Button removed=badgeAt(x,y);
+            if (removed != null) {
+                if (preferences.placement(removed.slot,TouchLayout.PLACE_HIDDEN)) {
+                    layoutChanged=true; saveLayout(); layoutDirty=true; haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+                }
+                return;
             }
-            if (b != null && b.action >= 0) {
+            Button b = hit(x,y);
+            if (b != null && (b.slot >= 0 || b.slot == MORE)) {
                 editButton=b; editPointer=event.getPointerId(0);
-                editOffsetX=b.rect.centerX()-event.getX(); editOffsetY=b.rect.centerY()-event.getY();
+                editOffsetX=b.rect.centerX()-x; editOffsetY=b.rect.centerY()-y;
             }
         } else if (action == MotionEvent.ACTION_MOVE && editButton != null) {
             int i=event.findPointerIndex(editPointer);
@@ -1299,12 +1560,110 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             float cx=Math.max(safe.left+editButton.rect.width()/2,Math.min(safe.right-editButton.rect.width()/2,event.getX(i)+editOffsetX));
             float cy=Math.max(safe.top+editButton.rect.height()/2,Math.min(safe.bottom-editButton.rect.height()/2,event.getY(i)+editOffsetY));
             float nx=(cx-safe.left)/safe.width(), ny=(cy-safe.top)/safe.height();
-            if (preferences.leftHanded && editButton.action != PAUSE) nx=1-nx;
-            preferences.position(editButton.action,nx,ny);
+            if (preferences.leftHanded && !TouchLayout.utility(editButton.slot)) nx=1-nx;
+            preferences.position(editButton.slot,nx,ny);
             layoutChanged = true;
             buildButtons();
         } else if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)
                 && event.getPointerId(index)==editPointer) { saveLayout(); editButton=null; editPointer=-1; }
+    }
+    private void stopEditing() {
+        editing=false; expanded=false; paletteOpen=false; resetArmedUntil=0; cancelInput();
+    }
+    private boolean editorRemovable(Button b) {
+        if (!editing || paletteOpen || context.mode != GAMEPLAY) return false;
+        if (b.slot == MORE) return preferences.moreItemCount() == 0;
+        return TouchLayout.placementAllowed(b.slot,TouchLayout.PLACE_HIDDEN);
+    }
+    private Button badgeAt(float x,float y) {
+        for (int i=buttons.size()-1;i>=0;--i) {
+            Button b=buttons.get(i);
+            if (!editorRemovable(b)) continue;
+            float[] badge=TouchLayout.removeBadge(b.rect.centerX(),b.rect.centerY(),b.rect.width()/2,dp(1));
+            if (Math.hypot(x-badge[0],y-badge[1]) <= badge[2]+dp(5)) return b;
+        }
+        return null;
+    }
+    private String toolLabel(int tool) {
+        switch (tool) {
+            case TOOL_BUTTONS: return label("Buttons", "Кнопки");
+            case TOOL_LEFT: return preferences.leftHanded ? label("Left-handed: on", "Для левшей: вкл.") : label("Left-handed: off", "Для левшей: выкл.");
+            case TOOL_RESET: return SystemClock.uptimeMillis() < resetArmedUntil ? label("Reset layout?", "Точно сбросить?") : label("Reset", "Сбросить");
+            default: return label("Done", "Готово");
+        }
+    }
+    /** Toolbar pills and, while open, the button panel, from the current safe area. */
+    private void buildEditor() {
+        int[] ids = context.mode == GAMEPLAY ? new int[]{TOOL_BUTTONS,TOOL_LEFT,TOOL_RESET,DONE} : new int[]{TOOL_LEFT,DONE};
+        paint.setTextSize(dp(13));
+        float[] widths=new float[ids.length];
+        // Each pill keeps the width of its longest caption, so an armed Reset or
+        // a toggled left-hand mode never slides the pills under the finger.
+        for (int i=0;i<ids.length;++i) {
+            float text=paint.measureText(toolLabel(ids[i]));
+            if (ids[i] == TOOL_RESET) text=Math.max(paint.measureText(label("Reset", "Сбросить")),
+                    paint.measureText(label("Reset layout?", "Точно сбросить?")));
+            else if (ids[i] == TOOL_LEFT) text=Math.max(paint.measureText(label("Left-handed: on", "Для левшей: вкл.")),
+                    paint.measureText(label("Left-handed: off", "Для левшей: выкл.")));
+            widths[i]=text+dp(28);
+        }
+        // Below the top row (Pause, menu buttons): its pills never cover a button there.
+        toolRects=TouchLayout.toolbar(safe.left,safe.top+dp(48),safe.right,widths,dp(1));
+        toolIds=toolRects == null ? null : ids;
+        paletteRects=paletteOpen && context.mode == GAMEPLAY
+                ? TouchLayout.palette(safe.left,safe.top,safe.right,safe.bottom,TouchLayout.EDITABLE.length,dp(1)) : null;
+        if (paletteOpen && paletteRects == null) paletteOpen=false;
+    }
+    private int toolAt(float x,float y) {
+        if (toolRects == null || toolIds == null) return 0;
+        for (int i=0;i<toolRects.length;++i) {
+            float[] r=toolRects[i];
+            if (x >= r[0]-dp(4) && x <= r[2]+dp(4) && y >= r[1]-dp(6) && y <= r[3]+dp(6)) return toolIds[i];
+        }
+        return 0;
+    }
+    private void toolTap(int tool) {
+        haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+        long now=SystemClock.uptimeMillis();
+        if (tool == DONE) { stopEditing(); return; }
+        if (tool == TOOL_BUTTONS) { paletteOpen=true; resetArmedUntil=0; }
+        else if (tool == TOOL_LEFT) {
+            // The same preference as the LEFT HANDED settings row; the native
+            // page learns it at the next exchange, requested right away.
+            preferences.leftHanded=!preferences.leftHanded;
+            layoutChanged=true; saveLayout(); settingsPollRequested=true;
+        } else if (tool == TOOL_RESET) {
+            if (now < resetArmedUntil) {
+                resetArmedUntil=0; preferences.resetLayout();
+                showHint("Layout reset", "Раскладка сброшена",0);
+            } else resetArmedUntil=now+3000;
+        }
+        layoutDirty=true; invalidate();
+    }
+    /** The button panel: a placement segment, the close pill, or outside the card. */
+    private void paletteTap(float x,float y) {
+        float[][] r=paletteRects;
+        if (r == null) { paletteOpen=false; layoutDirty=true; return; }
+        boolean inCard=x >= r[0][0] && x <= r[0][2] && y >= r[0][1] && y <= r[0][3];
+        boolean close=x >= r[1][0]-dp(6) && x <= r[1][2]+dp(6) && y >= r[1][1]-dp(6) && y <= r[1][3]+dp(6);
+        if (!inCard || close) { paletteOpen=false; layoutDirty=true; invalidate(); haptic(HapticFeedbackConstants.VIRTUAL_KEY); return; }
+        for (int i=0;i<TouchLayout.EDITABLE.length;++i) {
+            float[] cell=r[i+2];
+            if (y < cell[1] || y > cell[3] || x < cell[0] || x > cell[2]) continue;
+            int action=TouchLayout.EDITABLE[i];
+            for (int place=TouchLayout.PLACE_SCREEN;place<=TouchLayout.PLACE_HIDDEN;++place) {
+                float[] s=TouchLayout.segment(cell,place,dp(1));
+                if (x < s[0] || x > s[2]) continue;
+                if (preferences.placement(action) == place) return;
+                if (preferences.placement(action,place)) {
+                    layoutChanged=true; saveLayout(); layoutDirty=true; haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+                } else if (action == MORE && preferences.moreItemCount() > 0)
+                    showHint("Move the buttons out of More first", "Сначала уберите кнопки из «Ещё»",0);
+                invalidate();
+                return;
+            }
+            return;
+        }
     }
     private void saveLayout() {
         if (layoutChanged) { layoutChanged = false; preferences.save(); }
@@ -1397,8 +1756,11 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     }
     private boolean syncSettings(Context next, long now) {
         boolean finalPoll = context.menu() && !next.menu();
-        if (settingsRevision != 0 && !next.menu() && !finalPoll) return false;
-        if (!finalPoll && settingsRevision != 0 && now-lastSettingsPoll < 100) return false;
+        // The editor's left-hand toggle is pushed once, also outside menus.
+        boolean requested = settingsPollRequested;
+        settingsPollRequested = false;
+        if (settingsRevision != 0 && !next.menu() && !finalPoll && !requested) return false;
+        if (!finalPoll && !requested && settingsRevision != 0 && now-lastSettingsPoll < 100) return false;
         lastSettingsPoll = now;
         int[] host = preferences.settingsWire(settingsRevision);
         int[] guest = bridge.settingsExchange(host);
@@ -1431,7 +1793,8 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         return false;
     }
     private void updateSensor() {
-        boolean wanted = !disposed && resumed && focused && eligible && !editing
+        // Keyboard-and-mouse play leaves the phone on a stand: no tilt aiming.
+        boolean wanted = !disposed && resumed && focused && eligible && !editing && !keyboardMouse
                 && context.gameplay() && context.has(RELATIVE_LOOK) && preferences.gyroEnabled;
         if (wanted && !sensorRegistered && sensorManager != null && aimSensor != null) {
             sensorRegistered = sensorManager.registerListener(this, aimSensor, SensorManager.SENSOR_DELAY_GAME);
@@ -1447,7 +1810,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         sensorRegistered = false; gyro.reset();
     }
     @Override public void onSensorChanged(SensorEvent event) {
-        if (!sensorRegistered || !eligible || !focused || !resumed || editing || !context.gameplay()
+        if (!sensorRegistered || !eligible || !focused || !resumed || editing || keyboardMouse || !context.gameplay()
                 || !preferences.gyroEnabled || (preferences.gyroAdsOnly && (input.held() & bit(AIM)) == 0)) {
             gyro.reset(); return;
         }
@@ -1520,7 +1883,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         saveLayout();
         stopSensor();
         accessibilityFocus=hoverTarget=View.NO_ID;
-        closeRadial();clearMenuMore();utilityPointers.clear();legacyPointers.clear();
+        closeRadial();clearMenuMore();clearConfirm();utilityPointers.clear();legacyPointers.clear();
         hudGesture.cancel(); hudTaps.cancel(); closeSlots(); hudPointers.clear(); hintUntil = 0;
         uiPointers.clear(); menuPointer = -1; editPointer=-1; editButton=null; eligible=false; layoutDirty=true;
         mouseButtons = 0; // input.cancel() below releases the actions they held
@@ -1577,6 +1940,20 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
             setPointerIcon(hide ? hiddenCursor : null);
         }
     }
+    /**
+     * keyboard: a key is held or was released moments ago (native physical
+     * state, outside the mailbox). With the mouse in play since the last touch
+     * the controls hide; touch input waits for no stream, the editor shows them.
+     */
+    private void updateKeyboardMouse(boolean keyboard) {
+        boolean next = keyboardMouse;
+        if (!mousePresent || editing) next = false;
+        else if (keyboard && mouseUsed && !streamOwned && !touchSwallowed) next = true;
+        if (next == keyboardMouse) return;
+        keyboardMouse = next;
+        if (next) { closeRadial(); clearMenuMore(); clearConfirm(); hintUntil = 0; }
+        layoutDirty = true; invalidate();
+    }
     private void releaseMouseButtons() {
         if (mouseButtons != 0) { input.mouseButton(FIRE, false); input.mouseButton(AIM, false); }
         mouseButtons = 0;
@@ -1585,6 +1962,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
         if (!hasCapture) releaseMouseButtons();
     }
     @Override public boolean onCapturedPointerEvent(MotionEvent event) {
+        mouseUsed = true;
         if ((movieState & MOVIE_PLAYING) != 0) {
             // A click works like a tap: the intro ends, another movie shows its
             // Skip pill and the next click takes it.
@@ -1624,6 +2002,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     }
     @Override public boolean onGenericMotionEvent(MotionEvent event) {
         if (!event.isFromSource(InputDevice.SOURCE_MOUSE) || linkageFailed) return super.onGenericMotionEvent(event);
+        mouseUsed = true;
         // UE3JavaApp's NVIDIA mouse path is live on every device (AXIS_RELATIVE_X
         // exists): its button events would click again at unscaled display pixels.
         if (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS
@@ -1645,7 +2024,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
     @Override public boolean dispatchHoverEvent(MotionEvent event) {
         AccessibilityManager manager=(AccessibilityManager)activity.getSystemService(android.content.Context.ACCESSIBILITY_SERVICE);
         boolean exploring=manager!=null && manager.isTouchExplorationEnabled();
-        if(!exploring && event.isFromSource(InputDevice.SOURCE_MOUSE)) { mouseHover(event); return true; }
+        if(!exploring && event.isFromSource(InputDevice.SOURCE_MOUSE)) { mouseUsed = true; mouseHover(event); return true; }
         if(!eligible || !exploring) return super.dispatchHoverEvent(event);
         Button b=event.getActionMasked()==MotionEvent.ACTION_HOVER_EXIT?null:hit(event.getX(),event.getY());
         int id=b==null?View.NO_ID:b.action+4;
@@ -1662,7 +2041,7 @@ public final class NativeTouchControls extends View implements Choreographer.Fra
                 AccessibilityNodeInfo node=AccessibilityNodeInfo.obtain();
                 if(id==View.NO_ID) {
                     onInitializeAccessibilityNodeInfo(node);
-                    if(eligible) for(Button b:radialOpen?radialButtons:buttons) node.addChild(NativeTouchControls.this,b.action+4);
+                    if(eligible && !keyboardMouse) for(Button b:radialOpen?radialButtons:buttons) node.addChild(NativeTouchControls.this,b.action+4);
                     return node;
                 }
                 if(!eligible) return null;

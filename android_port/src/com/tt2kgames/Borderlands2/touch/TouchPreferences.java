@@ -34,7 +34,9 @@ public final class TouchPreferences {
         thread.setDaemon(true);
         return thread;
     });
-    static final int SETTINGS_VERSION = 8, SETTINGS_FIELDS = 37;
+    static final int SETTINGS_VERSION = 10, SETTINGS_FIELDS = 41;
+    /** LOOK and AIM SENSITIVITY reach 3.00 since v10 (1.00 before). */
+    static final float MAX_LOOK = 3, MAX_ADS = 3;
     /** Settings 32 onward, all ON by default. */
     private static final String[] PERFORMANCE_KEYS = {"fasterVisibility", "fasterAudioLimiter", "framePacing"};
     private static final String[] GRAPHICS_KEYS = {"bloom", "motionBlur", "lensFlares", "dynamicShadows",
@@ -42,10 +44,12 @@ public final class TouchPreferences {
             "radialBlur", "anisotropy"};
     static final int HINT_MAP = 1, HINT_WEAPON = 2, HINT_GAME_MORE = 3,
             HINT_MENU_MORE = 4, HINT_DEBUG_MORE = 5, HINT_AUTORUN = 6,
-            HINT_MAP_NAVIGATION = 7, HINT_LAYOUT = 8, HINT_SLOTS = 9, HINT_SKILL_TAP = 10, HINT_STATUS_TAPS = 11;
+            HINT_MAP_NAVIGATION = 7, HINT_LAYOUT = 8, HINT_SLOTS = 9, HINT_SKILL_TAP = 10, HINT_STATUS_TAPS = 11,
+            HINT_EDITOR = 12;
     private static final String[] HINT_KEYS = {"", "mapTapHintSeen", "weaponGestureHintSeen",
             "gameMoreHintSeen", "menuMoreHintSeen", "debugMoreHintSeen", "autoRunHintSeen",
-            "mapNavigationHintSeen", "layoutHintSeen", "weaponSlotsHintSeen", "skillTapHintSeen", "statusTapsHintSeen"};
+            "mapNavigationHintSeen", "layoutHintSeen", "weaponSlotsHintSeen", "skillTapHintSeen", "statusTapsHintSeen",
+            "layoutEditorHintSeen"};
     private final Activity activity;
     /** Host checks only: written without the external game data check. */
     private final File hostFile;
@@ -68,11 +72,21 @@ public final class TouchPreferences {
     public boolean reloadButton;
     /** A short tap on More keeps the radial open for a second tap (RADIAL BY TAP). */
     public boolean radialTap;
+    /** Controls keep clear of the cutout, system bars and gesture areas (earlier builds). */
+    public boolean screenInsets;
+    /** Vector icons instead of captions on the buttons. */
+    public boolean buttonIcons;
+    /** The game hides its own gamepad button images (native StringAliasMap). */
+    public boolean hideGamepadGlyphs;
+    /** Fast camera swipes turn further (LOOK ACCELERATION, since v10). */
+    public boolean lookAcceleration;
     public boolean debugMenuVisible;
     public boolean mapTapHintSeen, weaponGestureHintSeen;
     public boolean gameMoreHintSeen, menuMoreHintSeen, debugMoreHintSeen, autoRunHintSeen;
     public boolean mapNavigationHintSeen, layoutHintSeen;
     public boolean weaponSlotsHintSeen, skillTapHintSeen, statusTapsHintSeen;
+    /** The layout editor with remove badges and the button panel (since v9). */
+    public boolean layoutEditorHintSeen;
     private boolean debugMenuStored;
     public float gyroSensitivity, gyroDeadzone;
     /** In-memory preferences for host protocol checks. */
@@ -133,8 +147,8 @@ public final class TouchPreferences {
         advancedGraphics[1] = 0; // Motion Blur is disabled, including saved values from older builds.
         opacity = TouchInput.finiteClamp(number("opacity", .42f), .15f, .9f);
         scale = TouchInput.finiteClamp(number("scale", 1), .85f, 1.4f);
-        look = TouchInput.finiteClamp(number("look", .22f), .04f, 1);
-        ads = TouchInput.finiteClamp(number("ads", .55f), .1f, 1);
+        look = TouchInput.finiteClamp(number("look", .22f), .04f, MAX_LOOK);
+        ads = TouchInput.finiteClamp(number("ads", .55f), .1f, MAX_ADS);
         leftHanded = Boolean.parseBoolean(store.getProperty("leftHanded", "false"));
         invertY = Boolean.parseBoolean(store.getProperty("invertY", "false"));
         // Old builds saved autoSprint=true even without a deliberate opt-in.
@@ -148,6 +162,10 @@ public final class TouchPreferences {
         aimToggle = Boolean.parseBoolean(store.getProperty("aimToggle", "true"));
         reloadButton = Boolean.parseBoolean(store.getProperty("reloadButton", "true"));
         radialTap = Boolean.parseBoolean(store.getProperty("radialTap", "false"));
+        screenInsets = Boolean.parseBoolean(store.getProperty("screenInsets", "false"));
+        buttonIcons = Boolean.parseBoolean(store.getProperty("buttonIcons", "true"));
+        hideGamepadGlyphs = Boolean.parseBoolean(store.getProperty("hideGamepadButtons", "false"));
+        lookAcceleration = Boolean.parseBoolean(store.getProperty("lookAcceleration", "true"));
         debugMenuStored = store.containsKey("debugMenuVisible");
         debugMenuVisible = Boolean.parseBoolean(store.getProperty("debugMenuVisible", "false"));
         mapTapHintSeen = Boolean.parseBoolean(store.getProperty("mapTapHintSeen", "false"));
@@ -161,6 +179,7 @@ public final class TouchPreferences {
         weaponSlotsHintSeen = Boolean.parseBoolean(store.getProperty("weaponSlotsHintSeen", "false"));
         skillTapHintSeen = Boolean.parseBoolean(store.getProperty("skillTapHintSeen", "false"));
         statusTapsHintSeen = Boolean.parseBoolean(store.getProperty("statusTapsHintSeen", "false"));
+        layoutEditorHintSeen = Boolean.parseBoolean(store.getProperty("layoutEditorHintSeen", "false"));
         gyroSensitivity = TouchInput.finiteClamp(number("gyroSensitivity", 1), .25f, 3);
         gyroDeadzone = TouchInput.finiteClamp(number("gyroDeadzone", .4f), 0, 3);
     }
@@ -173,6 +192,38 @@ public final class TouchPreferences {
     public void position(int action, float x, float y) {
         store.setProperty("x_" + action, Float.toString(x));
         store.setProperty("y_" + action, Float.toString(y));
+    }
+    /** Where the layout editor put an on-foot action (TouchLayout.PLACE_*). */
+    public int placement(int action) {
+        String value = store.getProperty("place_" + action);
+        int place = value == null ? -1 : "screen".equals(value) ? TouchLayout.PLACE_SCREEN
+                : "more".equals(value) ? TouchLayout.PLACE_MORE : "hidden".equals(value) ? TouchLayout.PLACE_HIDDEN : -1;
+        return place >= 0 && TouchLayout.placementAllowed(action, place) ? place : TouchLayout.defaultPlacement(action);
+    }
+    /** Stores an allowed placement; More leaves the screen only while nothing is inside it. */
+    public boolean placement(int action, int place) {
+        if (!TouchLayout.placementAllowed(action, place)) return false;
+        if (action == TouchLayout.MORE_BUTTON && place != TouchLayout.PLACE_SCREEN && moreItemCount() > 0) return false;
+        store.setProperty("place_" + action, place == TouchLayout.PLACE_SCREEN ? "screen"
+                : place == TouchLayout.PLACE_MORE ? "more" : "hidden");
+        // An item put into a removed More brings More back to the screen.
+        if (place == TouchLayout.PLACE_MORE && placement(TouchLayout.MORE_BUTTON) != TouchLayout.PLACE_SCREEN)
+            store.setProperty("place_" + TouchLayout.MORE_BUTTON, "screen");
+        return true;
+    }
+    /** Actions the editor put inside More, in radial order. */
+    public int[] moreItems() {
+        int[] items = new int[TouchLayout.RADIAL_ORDER.length];
+        int count = 0;
+        for (int action : TouchLayout.RADIAL_ORDER) if (placement(action) == TouchLayout.PLACE_MORE) items[count++] = action;
+        return java.util.Arrays.copyOf(items, count);
+    }
+    public int moreItemCount() { return moreItems().length; }
+    /** The editor's own reset: positions and placements, nothing else. */
+    public void resetLayout() {
+        for (String key : store.stringPropertyNames())
+            if (key.startsWith("x_") || key.startsWith("y_") || key.startsWith("place_")) store.remove(key);
+        persist();
     }
     public void save() {
         storeGraphics();
@@ -197,6 +248,10 @@ public final class TouchPreferences {
         store.setProperty("aimToggle", Boolean.toString(aimToggle));
         store.setProperty("reloadButton", Boolean.toString(reloadButton));
         store.setProperty("radialTap", Boolean.toString(radialTap));
+        store.setProperty("screenInsets", Boolean.toString(screenInsets));
+        store.setProperty("buttonIcons", Boolean.toString(buttonIcons));
+        store.setProperty("hideGamepadButtons", Boolean.toString(hideGamepadGlyphs));
+        store.setProperty("lookAcceleration", Boolean.toString(lookAcceleration));
         if (debugMenuStored) store.setProperty("debugMenuVisible", Boolean.toString(debugMenuVisible));
         store.setProperty("gyroSensitivity", Float.toString(gyroSensitivity));
         store.setProperty("gyroDeadzone", Float.toString(gyroDeadzone));
@@ -220,6 +275,7 @@ public final class TouchPreferences {
             case HINT_SLOTS: return weaponSlotsHintSeen;
             case HINT_SKILL_TAP: return skillTapHintSeen;
             case HINT_STATUS_TAPS: return statusTapsHintSeen;
+            case HINT_EDITOR: return layoutEditorHintSeen;
             default: return false;
         }
     }
@@ -236,6 +292,7 @@ public final class TouchPreferences {
             case HINT_SLOTS: weaponSlotsHintSeen = true; break;
             case HINT_SKILL_TAP: skillTapHintSeen = true; break;
             case HINT_STATUS_TAPS: statusTapsHintSeen = true; break;
+            case HINT_EDITOR: layoutEditorHintSeen = true; break;
             default: return;
         }
         store.setProperty(HINT_KEYS[kind], "true");
@@ -266,7 +323,7 @@ public final class TouchPreferences {
             else store.setProperty(GRAPHICS_KEYS[i], Integer.toString(advancedGraphics[i]));
         }
     }
-    /** Shared with bl2_touch_settings: version 8, acknowledged revision, 37 fixed fields. */
+    /** Shared with bl2_touch_settings: version 10, acknowledged revision, 41 fixed fields. */
     public int[] settingsWire(int revision) {
         int[] controls = new int[]{SETTINGS_VERSION, revision, renderPercent, Float.floatToIntBits(opacity), Float.floatToIntBits(scale),
             Float.floatToIntBits(look), Float.floatToIntBits(ads), leftHanded?1:0, invertY?1:0,
@@ -280,6 +337,10 @@ public final class TouchPreferences {
         for (int i = 0; i < performance.length; ++i) values[34+i] = performance[i] ? 1 : 0;
         values[37] = reloadButton ? 1 : 0;
         values[38] = radialTap ? 1 : 0;
+        values[39] = screenInsets ? 1 : 0;
+        values[40] = buttonIcons ? 1 : 0;
+        values[41] = hideGamepadGlyphs ? 1 : 0;
+        values[42] = lookAcceleration ? 1 : 0;
         return values;
     }
     private static boolean wireFloat(int bits, float low, float high) {
@@ -293,7 +354,7 @@ public final class TouchPreferences {
         int base = 3;
         if (words[base] < 20 || words[base] > 150 || words[base]%10 != 0
                 || !wireFloat(words[base+1], .15f, .9f) || !wireFloat(words[base+2], .85f, 1.4f)
-                || !wireFloat(words[base+3], .04f, 1) || !wireFloat(words[base+4], .1f, 1)
+                || !wireFloat(words[base+3], .04f, MAX_LOOK) || !wireFloat(words[base+4], .1f, MAX_ADS)
                 || !wireFloat(words[base+11], .25f, 3) || !wireFloat(words[base+12], 0, 3)
                 || words[base+17] < 100 || words[base+17] > 200
                 || (words[base+17] != 125 && words[base+17]%10 != 0)
@@ -322,6 +383,10 @@ public final class TouchPreferences {
         for (int i = 0; i < performance.length; ++i) performance[i] = words[35+i] != 0;
         reloadButton = words[38] != 0;
         radialTap = words[39] != 0;
+        screenInsets = words[40] != 0;
+        buttonIcons = words[41] != 0;
+        hideGamepadGlyphs = words[42] != 0;
+        lookAcceleration = words[43] != 0;
         debugMenuStored |= (words[2]&8)!=0;
         // Reset wins over edits returned in the same poll, preserving non-touch choices.
         if ((words[2]&2)!=0) resetTouch(); else save();

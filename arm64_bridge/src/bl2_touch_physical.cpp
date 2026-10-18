@@ -6,7 +6,10 @@
 #include <jni.h>
 #endif
 
-namespace { thread_local unsigned legacyPacketDepth = 0; }
+namespace {
+thread_local unsigned legacyPacketDepth = 0;
+thread_local unsigned touchDispatchDepth = 0;
+}
 
 namespace bl2::touch {
 
@@ -17,14 +20,23 @@ PhysicalOwnership::Controller* PhysicalOwnership::controllerLocked(int id) {
     return nullptr;
 }
 void PhysicalOwnership::activityLocked(std::uint64_t now) { seen_ = true; lastActivity_ = now; }
+bool PhysicalOwnership::keyboardKey(int controller, int code) {
+    // UE3JavaApp passes InputDevice.getControllerNumber(): 0 for anything that
+    // is not a game controller. KEYCODE_BUTTON_A..MODE and BUTTON_1..16 stay
+    // gamepad buttons even from such a device.
+    return controller == 0 && !(code >= 96 && code <= 110) && !(code >= 188 && code <= 203);
+}
 void PhysicalOwnership::key(int controller, int action, int code, std::uint64_t now) {
     std::lock_guard<std::mutex> lock(mutex_);
-    activityLocked(now);
+    const bool keyboard = keyboardKey(controller, code);
+    if (keyboard) { keyboardSeen_ = true; keyboardActivity_ = now; }
+    else activityLocked(now);
+    auto& held = keyboard ? keyboardKeys_ : keys_;
     const auto key = std::make_pair(controller, code);
     if (action == 0) {
-        if (keys_.size() < 256) keys_.insert(key);
+        if (held.size() < 256) held.insert(key);
         else unknownController_ = true;
-    } else if (action == 1) keys_.erase(key);
+    } else if (action == 1) held.erase(key);
     else unknownController_ = true; // Unknown action must not admit conflicting touch.
 }
 void PhysicalOwnership::motion(int id, const std::array<float, 8>& axes, std::uint64_t now) {
@@ -51,7 +63,7 @@ void PhysicalOwnership::mouse(int id, int left, int right, int wheel, std::uint6
 }
 void PhysicalOwnership::reset(std::uint64_t now) {
     std::lock_guard<std::mutex> lock(mutex_);
-    controllers_ = {}; keys_.clear(); unknownController_ = false;
+    controllers_ = {}; keys_.clear(); keyboardKeys_.clear(); unknownController_ = false;
     // Preserve a short neutral interval across interruption; never synthesize
     // key-up into the guest or release physical engine state.
     activityLocked(now);
@@ -61,7 +73,7 @@ void PhysicalOwnership::disconnected(int id, std::uint64_t now) {
     // UE3JavaApp reports every device change (pointer capture reconfigures a
     // mouse) as disconnect + connect. Only a device that still held a key, an
     // axis or a button owned input; releasing it keeps the neutral interval.
-    bool held = false;
+    bool held = false, typed = false;
     for (auto& controller : controllers_) if (controller.used && controller.id == id) {
         held |= controller.axes || controller.mouse;
         controller = {};
@@ -69,15 +81,38 @@ void PhysicalOwnership::disconnected(int id, std::uint64_t now) {
     for (auto key = keys_.begin(); key != keys_.end();) {
         if (key->first == id) { key = keys_.erase(key); held = true; } else ++key;
     }
+    for (auto key = keyboardKeys_.begin(); key != keyboardKeys_.end();) {
+        if (key->first == id) { key = keyboardKeys_.erase(key); typed = true; } else ++key;
+    }
     if (held) activityLocked(now);
+    if (typed) keyboardActivity_ = now;
 }
-bool PhysicalOwnership::ownsInput(std::uint64_t now) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+bool PhysicalOwnership::ownsLocked(std::uint64_t now) const {
     if (unknownController_ || !keys_.empty()) return true;
     for (const auto& controller : controllers_) if (controller.axes || controller.mouse) return true;
     return seen_ && (now < lastActivity_ || now - lastActivity_ < kNeutralDelayMs);
 }
+bool PhysicalOwnership::keyboardLocked(std::uint64_t now) const {
+    return !keyboardKeys_.empty() || (keyboardSeen_ &&
+        (now < keyboardActivity_ || now - keyboardActivity_ < kNeutralDelayMs));
+}
+bool PhysicalOwnership::ownsInput(std::uint64_t now) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ownsLocked(now);
+}
+bool PhysicalOwnership::keyboardActive(std::uint64_t now) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return keyboardLocked(now);
+}
+bool PhysicalOwnership::anyPhysical(std::uint64_t now) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ownsLocked(now) || keyboardLocked(now);
+}
 PhysicalOwnership& physicalOwnership() { static PhysicalOwnership state; return state; }
+
+TouchDispatchScope::TouchDispatchScope() { ++touchDispatchDepth; }
+TouchDispatchScope::~TouchDispatchScope() { --touchDispatchDepth; }
+bool TouchDispatchScope::active() { return touchDispatchDepth != 0; }
 
 } // namespace bl2::touch
 

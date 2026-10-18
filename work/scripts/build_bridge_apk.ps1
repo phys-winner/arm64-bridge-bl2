@@ -19,10 +19,10 @@ $stagePack = Get-Item -LiteralPath (Join-Path $root 'app/assets/bl2_shader_stage
 if ($stagePack.Length -le 56 -or $stagePack.Length -gt 256MB) { throw 'Invalid full shader-stage asset size' }
 $stagePackHash = (Get-FileHash -LiteralPath $stagePack.FullName).Hash
 $nativeBuild = Join-Path $build $NativeBuildDir
-$java = 'C:\Portable\jdk-24.0.1\bin\java.exe'
-$apktool = 'D:\ai_test\old_game_restoration\tools\android\apktool.jar'
-$androidTools = 'D:\ai_test\old_game_restoration\tools\android\sdk\build-tools\37.0.0'
-$signer = 'C:\Portable\Total.Commander\Utilites\Just Another Tool for APK\bin'
+$java = "$env:JAVA_HOME\bin\java.exe"
+$apktool = $env:APKTOOL_JAR
+$androidTools = "$env:ANDROID_HOME\build-tools\37.0.0"
+$signer = $env:APK_SIGNER_DIR
 $unsigned = Join-Path $build "bl2-arm64-bridge-seed$Seed-unsigned.apk"
 $aligned = Join-Path $build "bl2-arm64-bridge-seed$Seed-aligned.apk"
 $signed = Join-Path $build "bl2-arm64-bridge-seed$Seed.apk"
@@ -34,17 +34,17 @@ try {
     if (Test-Path -LiteralPath (Join-Path $root 'android_port\src\com\tt2kgames\Borderlands2\LaunchControls.java')) {
         & (Join-Path $PSScriptRoot 'build_launch_controls.ps1')
     }
-    $cmake = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\cmake.exe'
+    $cmake = "$env:ANDROID_HOME\cmake\3.22.1\bin\cmake.exe"
     $diagnosticFlag = if ($Diagnostics) { 'ON' } else { 'OFF' }
     $physxDiagnosticFlag = if ($PhysxCookieWatch) { 'ON' } else { 'OFF' }
     $debugMenuFlag = if ($releaseBuild) { 'OFF' } else { 'ON' }
     $silentFlag = if ($Final) { 'ON' } else { 'OFF' }
     if (!(Test-Path -LiteralPath (Join-Path $nativeBuild 'CMakeCache.txt'))) {
-        $ndk = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018'
+        $ndk = "$env:ANDROID_HOME\ndk\27.2.12479018"
         & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild -G Ninja `
             "-DCMAKE_TOOLCHAIN_FILE=$ndk\build\cmake\android.toolchain.cmake" `
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release `
-            '-DCMAKE_MAKE_PROGRAM=C:\Users\Xilonen\AppData\Local\Android\Sdk\cmake\3.22.1\bin\ninja.exe'
+            "-DCMAKE_MAKE_PROGRAM=$env:ANDROID_HOME\cmake\3.22.1\bin\ninja.exe"
         if ($LASTEXITCODE) { throw 'Fresh offline native configuration failed' }
     }
     & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag" "-DHORN_ENABLE_PHYSX_COOKIE_WATCH=$physxDiagnosticFlag" '-DHORN_GL_SELF_CHECK=OFF' "-DBL2_ENABLE_DEBUG_MENU_DEFAULT=$debugMenuFlag" "-DHORN_SILENT_LOGCAT=$silentFlag"
@@ -83,7 +83,7 @@ try {
     $nativeText = $null
     $nativeUnstrippedBytes = (Get-Item -LiteralPath $nativePath).Length
     if ($releaseBuild) {
-        $llvmBin = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin'
+        $llvmBin = "$env:ANDROID_HOME\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin"
         $exportsBeforeStrip = & "$llvmBin\llvm-nm.exe" -D --defined-only $nativePath
         if ($LASTEXITCODE) { throw 'Native exports inspection failed' }
         & "$llvmBin\llvm-strip.exe" --strip-unneeded $nativePath
@@ -141,10 +141,10 @@ try {
             if ($packedStageHash -ne $stagePackHash) { throw 'Packed full shader-stage asset differs' }
         } finally { $stageStream.Dispose(); $stageHasher.Dispose() }
     } finally { $zip.Dispose() }
-    & 'C:\Program Files\Python313\python.exe' -X utf8 -B (Join-Path $PSScriptRoot 'verify_embedded_locale.py') --apk $signed
+    & python -X utf8 -B (Join-Path $PSScriptRoot 'verify_embedded_locale.py') --apk $signed
     if ($LASTEXITCODE) { throw 'Embedded Russian text payload gate failed' }
     if (!$Diagnostics) {
-        $llvmBin = 'C:\Users\Xilonen\AppData\Local\Android\Sdk\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin'
+        $llvmBin = "$env:ANDROID_HOME\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin"
         $cache = Get-Content -LiteralPath (Join-Path $nativeBuild 'CMakeCache.txt') -Raw
         foreach ($flag in @('HORN_ENABLE_LOGGING','HORN_ENABLE_PERF_PROBE','HORN_ENABLE_PHYSX_COOKIE_WATCH','HORN_GL_SELF_CHECK')) {
             if ($cache -notmatch "(?m)^${flag}:BOOL=OFF\r?$") { throw "Quiet build flag gate failed: $flag" }
@@ -200,7 +200,7 @@ $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;
     ui_scale_default_percent=125;ui_scale_user_min_percent=100;ui_scale_user_max_percent=200;
     ui_scale_user_step_percent=10;ui_scale_user_preference='touch-controls.properties:uiPercent';
     ui_scale_default_first_decrement=120;ui_scale_default_first_increment=130;
-    ui_scale_independent_from_render_resolution=$true;touch_settings_wire_version=5;
+    ui_scale_independent_from_render_resolution=$true;touch_settings_wire_version=10;
     performance_default_mask=33;performance_preferences=@('fasterVisibility','fasterAudioLimiter');
     quality_default='minimum original Android video options';low_quality_diagnostic_property='debug.bl2.low_quality=1';
     additional_graphics_defaults='original runtime values';potato_default=$false;potato_preserves_render_scale=$true;

@@ -24,7 +24,7 @@ Steps (one at a time, in order):
   stick:<lx>,<ly>[,<rx>,<ry>]   -127..127, stays until changed
   trig:<l>,<r>              0..255, stays until changed
   shot:<path.png>           screenshot of the device to a host path
-Example: python -I work/scripts/bl2_virtual_gamepad.py hat:down wait:400 tap:A shot:a.png
+Example: python -I work/scripts/bl2_virtual_gamepad.py --serial SERIAL hat:down wait:400 tap:A shot:a.png
 """
 import argparse
 import json
@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-ADB = r"C:\Users\Xilonen\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+ADB = "adb"
 BUTTONS = ["A", "B", "C", "X", "Y", "Z", "L1", "R1", "L2", "R2", "SELECT", "START", "MODE", "THUMBL", "THUMBR"]
 HAT = {"up": 0, "upright": 1, "right": 2, "downright": 3, "down": 4, "downleft": 5, "left": 6, "upleft": 7}
 DPAD = {"up": 0, "down": 1, "right": 2, "left": 3}
@@ -136,7 +136,7 @@ def run(pad, step):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--serial", default="61151JEA326613")
+    parser.add_argument("--serial", required=True, help="adb device serial")
     parser.add_argument("--settle", type=float, default=7.0)
     parser.add_argument("--gap", type=int, default=250, help="ms between steps")
     parser.add_argument("steps", nargs="*")

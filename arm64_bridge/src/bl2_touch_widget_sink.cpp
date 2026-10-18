@@ -681,15 +681,26 @@ private:
             }
             if (!row(Bl2RussianLocaleSelected() ? "НАЗАД" : "BACK",kTouchSettingsBack)) return false;
         } else if (page == 1) {
-            for (std::size_t i = 1; i < 16; ++i) if (i != 8 &&
-                !row(TouchSettingCaption(i,Bl2RussianLocaleSelected()),kTouchSettingsValue + static_cast<std::int32_t>(i),static_cast<int>(i))) return false;
+            for (std::size_t i = 1; i < 16; ++i) {
+                if (i != 8 &&
+                    !row(TouchSettingCaption(i,Bl2RussianLocaleSelected()),kTouchSettingsValue + static_cast<std::int32_t>(i),static_cast<int>(i))) return false;
+                // v10: look acceleration follows the look and aim sensitivities.
+                if (i == 4 && !row(TouchSettingCaption(kTouchLookAccelerationSetting,Bl2RussianLocaleSelected()),
+                        kTouchSettingsValue + static_cast<std::int32_t>(kTouchLookAccelerationSetting),
+                        static_cast<int>(kTouchLookAccelerationSetting))) return false;
+            }
             if (!row(TouchSettingCaption(kTouchReloadButtonSetting,Bl2RussianLocaleSelected()),
                     kTouchSettingsValue + static_cast<std::int32_t>(kTouchReloadButtonSetting),
                     static_cast<int>(kTouchReloadButtonSetting)) ||
                 !row(TouchSettingCaption(kTouchRadialTapSetting,Bl2RussianLocaleSelected()),
                     kTouchSettingsValue + static_cast<std::int32_t>(kTouchRadialTapSetting),
-                    static_cast<int>(kTouchRadialTapSetting)) ||
-                !row(Bl2RussianLocaleSelected() ? "ИЗМЕНИТЬ РАСКЛАДКУ" : "EDIT BUTTON LAYOUT",kTouchSettingsEdit) ||
+                    static_cast<int>(kTouchRadialTapSetting))) return false;
+            // v9: the inset margin of earlier builds, icons on the buttons and
+            // the game's own gamepad button images.
+            for (const auto id : {kTouchScreenInsetsSetting,kTouchButtonIconsSetting,kTouchHideGamepadGlyphsSetting})
+                if (!row(TouchSettingCaption(id,Bl2RussianLocaleSelected()),kTouchSettingsValue + static_cast<std::int32_t>(id),
+                        static_cast<int>(id))) return false;
+            if (!row(Bl2RussianLocaleSelected() ? "ИЗМЕНИТЬ РАСКЛАДКУ" : "EDIT BUTTON LAYOUT",kTouchSettingsEdit) ||
                 !row(Bl2RussianLocaleSelected() ? "СБРОСИТЬ УПРАВЛЕНИЕ" : "RESET TOUCH CONTROLS",kTouchSettingsReset) ||
                 !row(Bl2RussianLocaleSelected() ? "КАЛИБРОВКА НАКЛОНА" : "CALIBRATE TILT AIMING",kTouchSettingsCalibrate) ||
                 !row(Bl2RussianLocaleSelected() ? "НАЗАД" : "BACK",kTouchSettingsBack)) return false;
@@ -829,9 +840,11 @@ bool InstallPhysicalSettingsKeys(DynarmicHost& host) {
             // r0 movie owner, r1 ControllerId, r2:r3 key FName, [sp] EInputEvent.
             auto& r = jit.Regs();
             r[15] = continuation;
-            // Touch reaches the movie only while it owns input; an ARM caller
-            // (FGFxEngine::InputKey) can be answered by returning to LR.
-            if (!physicalKeySettings || (r[14] & 1u) || !physicalOwnership().ownsInput(monotonicMilliseconds())) return;
+            // Keys the touch runtime dispatches itself are never physical, also
+            // beside a keyboard in use; an ARM caller (FGFxEngine::InputKey)
+            // can be answered by returning to LR.
+            if (!physicalKeySettings || (r[14] & 1u) || TouchDispatchScope::active() ||
+                !physicalOwnership().anyPhysical(monotonicMilliseconds())) return;
             for (const auto& key : kPhysicalKeys) {
                 if (current.MemoryRead32(base + key.rva) != r[2] || current.MemoryRead32(base + key.rva + 4) != r[3]) continue;
                 bool nativeBack = false;
