@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +58,13 @@ public:
     std::uint32_t GuestAlloc(std::size_t n, std::size_t align) const {
         assert(n == 44 && align == 4); return allocationFails ? 0 : 0x3400000;
     }
+    std::uint32_t CreateCodeVeneer(std::span<const std::uint32_t> words) {
+        assert(words.size() == 11);
+        if (allocationFails) return 0;
+        for (std::size_t i = 0; i < words.size(); ++i)
+            MemoryWrite32(0x3400000 + std::uint32_t(i * 4), words[i]);
+        return 0x3400000;
+    }
     void GuestFree(std::uint32_t p) { assert(p == 0x3400000); freed = true; }
     void AddExecutableRange(std::uint32_t p, std::size_t n) { executable.emplace_back(p, n); }
     void InvalidateGuestCode(std::uint32_t p, std::size_t n) { invalidated.emplace_back(p, n); }
@@ -89,7 +97,13 @@ int main() {
         }
     }
     host.allocationFails = true; refused(); host.allocationFails = false;
-    host.thunks.fail = true; refused(); assert(host.freed); host.thunks.fail = false;
+    host.thunks.fail = true; refused();
+#if defined(BL2_NATIVE_ARM32)
+    assert(!host.freed); // The host owns its executable veneer pool.
+#else
+    assert(host.freed);
+#endif
+    host.thunks.fail = false;
     assert(InstallBl2StartupScreens(host));
     assert(host.MemoryRead32(base + kGetField) == 0xE51FF004);
     assert(host.MemoryRead32(base + kGetField + 4) == 0x10000);
@@ -118,8 +132,8 @@ int main() {
         for (unsigned i = 0; i < 15; ++i)
             assert(jit.regs[i] == (skip && i == 0 ? result + 12 : skip && i == 1 ? replay + 40 : before[i]));
     };
-    for (const auto* key : {"<Registry:SkipLegalScreen>", "<Registry:GoStraightToMainMenu>"}) { string(key); dispatch(true); }
-    for (const auto* key : {"", "<Registry:PendingLoginChange>", "<Registry:HasBeenThroughTitleScreen>",
+    string("<Registry:SkipLegalScreen>"); dispatch(true);
+    for (const auto* key : {"", "<Registry:GoStraightToMainMenu>", "<Registry:PendingLoginChange>", "<Registry:HasBeenThroughTitleScreen>",
                            "<Registry:SkipLegalScreen>extra", "<Registry:skiplegalscreen>"}) { string(key); dispatch(false); }
     string("<Registry:SkipLegalScreen>");
     host.MemoryWrite32(input + 8, 1); dispatch(false);
@@ -129,5 +143,5 @@ int main() {
     dispatch(false, 0); dispatch(false, UINT32_MAX - 8); dispatch(false, input + 1);
     string("<Registry:SkipLegalScreen>"); dispatch(false, input, 0); dispatch(false, input, UINT32_MAX - 8);
     dispatch(false, input, input + 257);
-    std::puts("PASS: exact startup flags, untouched login/other keys and registers, bounded FString, ABI guards and allocation failures");
+    std::puts("PASS: legal skip only, preserved character-loading path/login/other keys and registers, bounded FString, ABI guards and allocation failures");
 }

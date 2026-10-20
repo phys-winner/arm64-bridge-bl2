@@ -153,7 +153,8 @@ public final class GameStorage {
                 boolean currentSetting = relative.equals("language.txt")
                         || relative.equals("touch-controls.properties");
                 if (!currentSetting && !sourceHex.equals(previous.getProperty(relative))) {
-                    throw new IOException("Unresolved legacy data conflict: " + relative);
+                    // Changing roots here hides current characters and their selected-slot profile.
+                    Log.w(TAG, "Keeping external data; divergent legacy copy retained: " + source);
                 }
             }
             current.setProperty(relative, sourceHex);

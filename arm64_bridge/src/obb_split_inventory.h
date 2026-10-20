@@ -32,3 +32,15 @@ ObbSplitScanResult ScanObbSplitFd(int fd,
                                  const void* continue_context = nullptr,
                                  bool allow_rebalanced = false,
                                  bool verify_content = true);
+
+struct ExternalObbPair {
+    ObbSplitScanStatus status = ObbSplitScanStatus::NoObbEntry;
+    const char* reason = "external OBB pair absent";
+    std::array<int, 2> fds{{-1, -1}};
+    std::array<uint64_t, 2> sizes{};
+};
+// External files are mutable input: verify their complete known hashes.
+// A verified result transfers both descriptors to the caller; no files are copied.
+ExternalObbPair OpenExternalObbPair(const char* directory,
+                                  ObbSplitContinueFn should_continue = nullptr,
+                                  const void* continue_context = nullptr);

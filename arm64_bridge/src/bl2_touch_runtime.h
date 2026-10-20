@@ -114,3 +114,4 @@ bool Bl2TouchPlayerInWorld();
 // This first integration stage publishes NO input capabilities and must not
 // replace LaunchControls. It never writes UObject fields or invokes actions.
 bool InstallBl2TouchRuntime(DynarmicHost& host);
+bool InstallBl2SubtitleTiming(DynarmicHost& host);

@@ -4,6 +4,13 @@ An ARM32 → ARM64 bridge that runs the original Android build of **Borderlands 
 on 64-bit-only Android devices, plus a native control layer: touch, gamepad,
 mouse and keyboard.
 
+The current mod also includes a native ARM32 compatibility library. The
+seed672 release combines both ABIs in one APK, prefers ARM32 where supported,
+and preserves package version33 and the existing signing certificate.
+See [CHANGELOG.md](CHANGELOG.md) for changes from APK seed663 and the previous
+Git checkpoint, including saves, NPC shooting, Russian subtitle timing and
+the English-language startup crash repair and native directory caching.
+
 The Android version of the game (`com.tt2kgames.Borderlands2`, 1.0.0.0.33) ships
 a 32-bit ARM Unreal Engine 3 library, and more and more phones cannot run 32-bit
 code at all. The bridge is a 64-bit `libUnrealEngine3.so` that takes the place of
@@ -67,6 +74,7 @@ and Android APIs the engine calls.
 | Path | Contents |
 |---|---|
 | `arm64_bridge/` | The bridge (CMake project): ELF loader, Dynarmic host, thunks, engine hooks, renderer and audio work, touch runtime; `patches/` for Dynarmic; `tests/` |
+| `arm32_compat/` | Native ARM32 compatibility library, ABI shims, shared runtime integration and hardware checks |
 | `touch_native_design/` | Native touch input core (mailbox and JNI contract), host tests and the scripts that run them |
 | `android_port/src/` | Java side: touch overlay, launch and port settings, local platform, saves and storage |
 | `work/scripts/` | APK build scripts and device QA tools (virtual HID gamepad, mouse, keyboard, multitouch) |
@@ -154,6 +162,51 @@ build-tools 37.0.0, platforms/android-36), `JAVA_HOME`, `APKTOOL_JAR`,
 `BAKSMALI_JAR` and `APK_SIGNER_DIR` (`apksigner.jar`, `testkey.pk8`,
 `testkey.x509.pem`), and needs Python 3 on `PATH`.
 
+`work/scripts/build_arm32_apk.ps1 -Seed <n> -Quiet -Release -BaseOnly`
+builds the native ARM32 donor. Its SDK, JDK and signing-tool paths are currently
+local Windows paths in the script; adjust those for another workstation.
+The optional Vulkan asset tools require the shader-baking and inventory tools
+in the working project and game-derived inputs; they are not required to run
+the default GLES release.
+
+The exact seed672 universal packaging recipe is retained at
+`work/evidence/startup669-f4668e7b-20261020/packaging672/package_native_parity672.py`.
+Its donor builds use `build_arm32_apk.ps1 -Seed 672 -Quiet -Release -BaseOnly`
+and `build_bridge_apk.ps1 -Seed 672 -Release -Final -BaseOnly`.
+It accepts the native and bridge donor APKs and their build receipts, validates
+the current source hashes, identical DEX/resources, signature and ZIP alignment,
+and assembles both ABIs with `use32bitAbi=true`. It requires Python3.11+ and
+`pyelftools`, the prepared external `app/` tree, shader assets, the original
+engine and the existing Russian voice split. This source checkout alone cannot
+produce a game APK without those user-provided inputs. The recipe keeps the
+local tool paths and exact release input hashes deliberately pinned.
+
+The startup regression checks run the actual verifier/ownership function bodies
+against the original engine and inject failures throughout the actual loader:
+
+```powershell
+python -B -X utf8 work/evidence/pixel10-startup668-20261020/locale/check_locale_identity.py
+python -B -X utf8 work/evidence/pixel10-startup668-20261020/movie/check_loader_lifetime.py
+python -B -X utf8 work/evidence/startup669-f4668e7b-20261020/directory-cache/regression.py
+```
+
+These checks use the local Visual Studio 18 Community C++ toolchain. The locale
+check also compiles both NDK translation units, needs the bridge dependencies
+above, and reads the original engine from
+`work/build/native-arm32-app/lib/armeabi-v7a/libUE3Runtime.so`. Generated harnesses,
+objects, executables and reports stay outside Git.
+The directory-cache check compiles the actual shared helper and extracted native
+adapter with deterministic filesystem stubs, including metadata changes, errors,
+current-directory changes and OBB/DLC bypasses.
+
+In the final universal APK the original engine is stored exactly once at
+`lib/armeabi-v7a/libUE3Runtime.so`, and both execution paths use that copy.
+There is no `assets/guest_libs` directory in the final APK; that older path
+remains an external build input. The release disables DLC content and retains
+compatibility with the existing version33 `split_ru_voice.apk`. PC–Android
+LAN interoperability has not been achieved; the investigation is recorded in
+[LAN_PC_ANDROID_RESEARCH.md](LAN_PC_ANDROID_RESEARCH.md).
+
 ## License
 
 [GNU General Public License v3.0 or later](LICENSE). Any distributed work based
@@ -180,3 +233,6 @@ ARM32 → ARM64-мост, который запускает оригинальн
 через пропатченный Dynarmic и подменяет системные вызовы, OpenGL ES, OpenSL ES и
 JNI. В репозитории только код моста и управления, файлов игры нет — нужна
 собственная копия игры. Сборка и тесты описаны выше. Лицензия — GPL-3.0-or-later.
+
+Текущий мод также содержит нативную ARM32-реализацию и единый APK для двух ABI.
+Список исправлений и границы проверки опубликованы в [CHANGELOG.md](CHANGELOG.md).

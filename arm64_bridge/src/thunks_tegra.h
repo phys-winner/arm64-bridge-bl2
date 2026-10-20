@@ -13,3 +13,6 @@ void RegisterUnavailableTegraThunks(ThunkManager& manager);
 // latter remains an explicit porting/acceptance debt; no snippet returns fake
 // successful output. Only audited, signature-matched guest entries are patched.
 bool InstallBorderlandsNvsiLifecycle(DynarmicHost& host);
+
+// Install after existing startup thunks so static archive SVC IDs stay stable.
+bool InstallBl2WeaponAmmo(DynarmicHost& host);

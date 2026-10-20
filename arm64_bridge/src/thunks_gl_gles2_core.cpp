@@ -78,6 +78,10 @@ GLenum CaptureGlError(const char* operation);
 void SceneAuditCaptureLightingState(uint32_t draw, size_t point);
 void SceneAuditCaptureTargetLightingState(GLuint framebuffer, uint32_t draw,
                                          GLuint expected_program, const char* operation);
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+void SceneAuditCaptureExactSkyLightingState(GLuint framebuffer, uint32_t draw,
+                                           GLuint expected_program, const char* operation);
+#endif
 void InvalidateGlAttribCache();
 void InvalidateLegacyTextureCache();
 void InvalidateLegacyTextureCacheAcrossContexts();
@@ -1033,10 +1037,12 @@ void SyncGuestMappedBuffersForGpuRead(DynarmicHost& host) {
             const size_t past_last_page =
                 (static_cast<uint64_t>(mapping.guest_address) +
                  mapping.length - 1) / page_size + 1;
-            for (size_t page = first_page; page < past_last_page; ++page) {
-                if (software ? software->ConsumeDirty(page) : tracker->IsDirty(page)) {
-                    dirty_pages.push_back(page);
+            if (software) {
+                for (size_t page = first_page; page < past_last_page; ++page) {
+                    if (software->ConsumeDirty(page)) dirty_pages.push_back(page);
                 }
+            } else {
+                tracker->AppendDirtyPages(first_page, past_last_page, dirty_pages);
             }
         }
         if (tracker) {
@@ -1283,6 +1289,10 @@ static int SceneAuditMode() {
 void RefreshSceneAuditMode() {
 #if !defined(BL2_NATIVE_ARM32)
     s_scene_audit_mode.store(ReadSceneAuditMode(), std::memory_order_relaxed);
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    extern void SceneAuditSkyPresent();
+    SceneAuditSkyPresent();
+#endif
 #endif
 }
 
@@ -1671,8 +1681,19 @@ void SceneAuditDrawCompleted(const char* operation) {
     if (SceneAuditEnabled()) {
         GLint framebuffer = 0;
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+        extern void SceneAuditSkyPostDraw(GLint);
+        SceneAuditSkyPostDraw(framebuffer);
+#endif
         if (framebuffer > 2) {
             const auto pass = s_scene_audit_passes.find(static_cast<GLuint>(framebuffer));
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+            // SSO uses current monolithic program0: retain the actual pipeline guard in the selector.
+            if (pass != s_scene_audit_passes.end() && pass->second.draws) {
+                SceneAuditCaptureExactSkyLightingState(static_cast<GLuint>(framebuffer),
+                    pass->second.draws,pass->second.last_program,operation);
+            }
+#endif
             if (pass != s_scene_audit_passes.end() && pass->second.draws && pass->second.last_program) {
                 SceneAuditCaptureTargetLightingState(static_cast<GLuint>(framebuffer),
                     pass->second.draws, pass->second.last_program, operation);

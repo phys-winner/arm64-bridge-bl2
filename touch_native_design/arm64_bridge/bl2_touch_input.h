@@ -208,9 +208,9 @@ private:
 Mailbox& sharedMailbox();
 std::uint64_t monotonicMilliseconds();
 
-// The full-screen (Bink) movie as Java sees it. The arm64 bridge installs the
-// access after checking the guest player; until then, and in the native ARM32
-// build, there is no movie. Both calls only read or write guest memory, so any
+// The full-screen (Bink) movie as Java sees it. Both runtimes install the
+// access after checking the guest player; until then there is no movie.
+// Both calls only read or write guest memory, so any
 // thread may use them, also while the game thread waits for the startup movies.
 // kMovieStartup stays set between the movies of the startup sequence.
 constexpr std::uint32_t kMoviePlaying = 1, kMovieStartup = 2;

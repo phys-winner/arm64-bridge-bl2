@@ -268,6 +268,19 @@ bool GuestMappedDirtyTracker::IsDirty(size_t page_index) const {
     return state == kDirty || state == kDirtyProtected;
 }
 
+void GuestMappedDirtyTracker::AppendDirtyPages(size_t first_page,
+                                               size_t past_last_page,
+                                               std::vector<size_t>& output) const {
+    if (!installed_) return;
+    const size_t end = std::min(past_last_page, page_count_);
+    const auto* states = page_state_.get();
+    for (size_t page = first_page; page < end; ++page) {
+        const uint64_t state =
+            states[page].load(std::memory_order_acquire) & kStateMask;
+        if (state == kDirty || state == kDirtyProtected) output.push_back(page);
+    }
+}
+
 void GuestMappedDirtyTracker::Rearm(std::vector<size_t>& pages) {
     if (!installed_ || pages.empty()) return;
     std::sort(pages.begin(), pages.end());

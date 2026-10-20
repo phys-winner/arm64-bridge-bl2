@@ -140,3 +140,11 @@
 /work/scripts/build_bridge_apk.ps1 -text
 /work/scripts/invoke_game_button.ps1 -text
 /work/scripts/invoke_game_stick.ps1 -text
+
+# Preserve the exact source bytes checked by release build receipts.
+/arm32_compat/** -text
+/arm64_bridge/src/** -text
+/arm64_bridge/tests/** -text
+/touch_native_design/arm64_bridge/** -text
+/touch_native_design/tests/** -text
+/work/scripts/*.ps1 -text

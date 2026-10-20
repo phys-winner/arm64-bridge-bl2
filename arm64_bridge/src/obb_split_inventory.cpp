@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <string>
 #include <string_view>
 #include <sys/stat.h>
 #if defined(BL2_LOCALE_HOST_TEST)
@@ -253,5 +254,51 @@ ObbSplitScanResult ScanObbSplitFd(int fd,
     out.zip_crc32 = static_cast<uint32_t>(crc);
     out.content_verified = true;
     out.sha256 = hex;
+    return out;
+}
+
+ExternalObbPair OpenExternalObbPair(const char* directory,
+                                  ObbSplitContinueFn should_continue,
+                                  const void* continue_context) {
+    ExternalObbPair out;
+    if (!directory || !*directory) return out;
+    const std::string root = std::string(directory) + "/";
+    out.fds = {{open((root + std::string(kMainObbName)).c_str(), O_RDONLY | O_CLOEXEC),
+                open((root + std::string(kPatchObbName)).c_str(), O_RDONLY | O_CLOEXEC)}};
+    if (out.fds[0] < 0 && out.fds[1] < 0) return out;
+    const auto reject = [&](const char* reason, ObbSplitScanStatus status = ObbSplitScanStatus::Rejected) {
+        for (int& fd : out.fds) if (fd >= 0) { close(fd); fd = -1; }
+        out.status = status;
+        out.reason = reason;
+        return out;
+    };
+    if (out.fds[0] < 0 || out.fds[1] < 0) return reject("incomplete external main/patch OBB pair");
+    std::vector<uint8_t> buffer(kHashChunkBytes);
+    for (size_t i = 0; i < 2; ++i) {
+        const bool main = i == 0;
+        struct stat st{};
+        const uint64_t expected_size = main ? kMainObbSize : kPatchObbSize;
+        uint8_t header[8]{};
+        if (fstat(out.fds[i], &st) != 0 || st.st_size < 0 ||
+            static_cast<uint64_t>(st.st_size) != expected_size ||
+            !ReadExact(out.fds[i], expected_size, 0, header, sizeof(header)) ||
+            Le32(header) != (main ? 0x8000U : 0x15000U) ||
+            Le32(header + 4) != (main ? 8136U : 24368U)) return reject("external OBB size/index mismatch");
+        ObbSha256 sha;
+        for (uint64_t at = 0; at < expected_size;) {
+            if (should_continue && !should_continue(continue_context))
+                return reject("external OBB hash deadline exceeded", ObbSplitScanStatus::Cancelled);
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), expected_size - at));
+            if (!ReadExact(out.fds[i], expected_size, at, buffer.data(), count) || !sha.Update(buffer.data(), count))
+                return reject("cannot hash external OBB");
+            at += count;
+        }
+        const auto digest = ObbSha256::Hex(sha.Finalize());
+        if (!sha.IsValid() || std::string_view(digest.data()) != (main ? kMainObbSha256 : kPatchObbSha256))
+            return reject("external OBB SHA-256 mismatch");
+        out.sizes[i] = expected_size;
+    }
+    out.status = ObbSplitScanStatus::Verified;
+    out.reason = "complete external OBB pair verified";
     return out;
 }

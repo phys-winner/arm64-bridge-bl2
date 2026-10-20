@@ -44,6 +44,7 @@
 // afterwards. The ADPF session also covers the guest thread (bl2_perf_hint.cpp).
 #include "dynarmic_host.h"
 #include "thunk_manager.h"
+#include "bl2_gl_worker_wake.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -463,8 +464,8 @@ void FutexWait(std::atomic<uint32_t>* word, uint32_t expected, const timespec* t
     syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAIT_PRIVATE, expected, timeout, nullptr, 0);
 }
 
-void FutexWake(std::atomic<uint32_t>* word) {
-    syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+long FutexWake(std::atomic<uint32_t>* word) {
+    return syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
 }
 
 inline void CpuRelax() { asm volatile("yield" ::: "memory"); }
@@ -694,9 +695,9 @@ void WorkerMain(Worker* worker) {
             if (head == tail) {
                 if (returned != tail) give_back();
                 // Pairs with Announce: if this load misses an announcement, Announce
-                // sees worker_sleeping == 1 and wakes the futex below. An announced
+                // claims Armed -> WakePending and wakes the futex below. An announced
                 // head_word synchronizes with the guest thread, so `head` is current.
-                w.worker_sleeping.store(1, std::memory_order_seq_cst);
+                w.worker_sleeping.store(bl2::gl_worker::kArmed, std::memory_order_seq_cst);
                 const uint32_t announced = w.head_word.load(std::memory_order_seq_cst);
                 if (w.head.load(std::memory_order_acquire) == tail) {
                     // Bounded: work published after the last announcement waits at most 50 ms.
@@ -725,7 +726,7 @@ void WorkerMain(Worker* worker) {
                         }
                     }
                 }
-                w.worker_sleeping.store(0, std::memory_order_relaxed);
+                w.worker_sleeping.store(bl2::gl_worker::kAwake, std::memory_order_relaxed);
                 continue;
             }
         }
@@ -757,9 +758,9 @@ void WorkerMain(Worker* worker) {
 void Announce(Worker& w) {
     w.unannounced = 0;
     w.head_word.store(static_cast<uint32_t>(w.write), std::memory_order_seq_cst);
-    if (w.worker_sleeping.load(std::memory_order_seq_cst)) {
+    if (bl2::gl_worker::ClaimWake(w.worker_sleeping)) {
         w.wake_ns.store(NowNs(), std::memory_order_relaxed);
-        FutexWake(&w.head_word);
+        bl2::gl_worker::CompleteWake(w.worker_sleeping, FutexWake(&w.head_word));
     }
 }
 
@@ -836,7 +837,8 @@ Record* Reserve(Worker& w, uint32_t bytes) {
 void Publish(Worker& w, uint32_t bytes, bool announce = false) {
     w.write += bytes;
     w.head.store(w.write, std::memory_order_release);
-    if (announce || ++w.unannounced >= kAnnounceEvery || w.worker_sleeping.load(std::memory_order_relaxed))
+    if (announce || ++w.unannounced >= kAnnounceEvery ||
+        bl2::gl_worker::NeedsAnnouncement(w.worker_sleeping.load(std::memory_order_relaxed)))
         Announce(w);
 }
 

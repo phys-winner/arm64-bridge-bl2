@@ -47,9 +47,8 @@ void Bl2AutoFlushReset();
 #include <thread>
 #include "bl2_shader_stage_cache.h"
 #include "bl2_hitch_report.h"
-#if !defined(BL2_NATIVE_ARM32)
+#include "bl2_cliffs_sky_observer_qa.h"
 #include "bl2_program_upgrade.h"
-#endif
 
 #define LOG_TAG "Arm32Bridge_GL"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
@@ -1140,11 +1139,9 @@ static void AbandonDeadNativeShaderObjectsLocked() {
         return std::any_of(s_shader_share_groups.begin(), s_shader_share_groups.end(),
             [group](const auto& entry) { return entry.second.group == group; });
     };
-#if !defined(BL2_NATIVE_ARM32)
     // The worker context alone must not keep a dead group's objects alive.
     if (const uint64_t group = Bl2ProgramUpgradeGroup(); group && !alive(group))
         Bl2ProgramUpgradeStop();
-#endif
     for (auto& [name, stage] : s_legacy_stages) {
         std::erase_if(stage.sso_programs, [&](const auto& entry) { return !alive(entry.first); });
         std::erase_if(stage.mono_shaders, [&](const auto& entry) { return !alive(entry.first); });
@@ -1992,8 +1989,14 @@ static uint64_t LearnedClockNs() {
 }
 
 static std::string LearnedStagesPath() {
+#if defined(BL2_NATIVE_ARM32)
+    extern const std::string& NativeShaderCacheRoot();
+    const std::string& directory = NativeShaderCacheRoot();
+#else
     extern std::string g_bl2_shader_cache_dir;
-    return g_bl2_shader_cache_dir.empty() ? std::string{} : g_bl2_shader_cache_dir + "/stage-learned.bin";
+    const std::string& directory = g_bl2_shader_cache_dir;
+#endif
+    return directory.empty() ? std::string{} : directory + "/stage-learned.bin";
 }
 
 // File: magic, version 1, count, then per stage its GL target and the SHA-256
@@ -2071,7 +2074,6 @@ static void SaveLearnedStagesLocked() {
 }
 
 static void LearnStageLocked(const LegacyAssemblyStage& stage) {
-#if !defined(BL2_NATIVE_ARM32)
     extern bool Bl2TouchPlayerInWorld();
     if (!Bl2TouchPlayerInWorld() || stage.sso_source.empty()) return;
     LoadLearnedStagesLocked();
@@ -2079,9 +2081,6 @@ static void LearnStageLocked(const LegacyAssemblyStage& stage) {
     const LearnedStage learned{{LegacyShaderType(stage.target), stage.source_digest},
                                Bl2ShaderWarmup::Hash(stage.sso_source)};
     if (s_learned_keys.insert(learned.key).second) s_learned_stages.push_back(learned);
-#else
-    (void)stage;
-#endif
 }
 
 static std::unique_ptr<LegacyAssemblyPipeline> TakePrewarmedStageLocked(
@@ -2125,14 +2124,9 @@ static LegacyAssemblyPipeline* NativeSsoStageProgramLocked(LegacyAssemblyStage& 
     PreserveSceneAuditGlError(glGetError());
     if (!s_shader_stage_preparation_attempted) {
         s_shader_stage_preparation_attempted = true;
-#if defined(BL2_NATIVE_ARM32)
-        extern bool PrepareBl2ShaderStageCache(Bl2ShaderStageCache&);
-        const bool prepared = PrepareBl2ShaderStageCache(s_shader_stage_cache);
-#else
         // Header-only open; any formation continues on background workers.
         extern bool OpenBl2ShaderStageCache(Bl2ShaderStageCache&);
         const bool prepared = OpenBl2ShaderStageCache(s_shader_stage_cache);
-#endif
         const auto& stats = s_shader_stage_cache.Stats();
         __android_log_print(ANDROID_LOG_INFO, "BL2ShaderCache",
             "all-stage preparation ready=%d stages=%u compiled=%u binary_hits=%u marker=%d failed=%u binary_bytes=%llu",
@@ -2624,7 +2618,6 @@ static LegacyAssemblyPipeline* GetLegacyPipelineLocked(
     return &inserted->second;
 }
 
-#if !defined(BL2_NATIVE_ARM32)
 // Draws after which an SSO pair is worth one linked program.
 constexpr uint32_t kProgramUpgradeDraws = 32;
 
@@ -2714,7 +2707,6 @@ static void ApplyProgramUpgradesLocked(EGLContext context) {
         s_program_cache_valid = false;
     }
 }
-#endif
 
 static void BindLegacyProgram(GLenum target, GLuint name) {
     if (target == kVertexProgramArb) SetBoundLegacyPrograms(name, s_bound_legacy_fragment);
@@ -2745,7 +2737,39 @@ static void RefreshBoundLegacyConstants(GLuint) {
     // stage combinations or requiring an active program during updates.
 }
 
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+void SceneAuditSkyPresent() {
+    auto& counts=bl2_sky_qa::Counts();
+    if (counts.finished) return;
+    char value[PROP_VALUE_MAX]={};
+    __system_property_get("debug.horn.scene_audit",value);
+    const bool requested=std::strcmp(value,"sky83df")==0;
+    const char* reason=counts.Present(requested,LegacyStageClockNs());
+    if (!reason) return;
+    // Independent of HORN_ENABLE_LOGGING; exact opt-in, one line per render thread.
+    __android_log_print(ANDROID_LOG_INFO,"BL2SkyQA",
+        "stage reason=%s presents=%u draw=%u explicit=%u legacy=%u post=%u fboGt2=%u "
+        "name=%u hash=%u entry=%u optInReject=%u selected=%u guard=%u,%u,%u,%u "
+        "validated=%u attempts=%u complete=%u tid=%d context=%p",
+        reason,counts.presents,counts.drawEntries,counts.explicitDraws,counts.legacyDraws,
+        counts.postDraws,counts.eligibleFbo,counts.exactName,counts.exactHash,
+        counts.entries,counts.optInRejected,counts.selected,counts.guardRejected[0],
+        counts.guardRejected[1],counts.guardRejected[2],counts.guardRejected[3],
+        counts.validated,counts.attempts,counts.complete,gettid(),eglGetCurrentContext());
+}
+void SceneAuditSkyPostDraw(GLint framebuffer) {
+    auto& counts=bl2_sky_qa::Counts();
+    if (counts.active) { ++counts.postDraws; counts.eligibleFbo+=framebuffer>2; }
+}
+#endif
+
 bool RefreshLegacyProgramStateForDraw() {
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    if (auto& counts=bl2_sky_qa::Counts(); counts.active) {
+        ++counts.drawEntries;
+        counts.explicitDraws+=s_explicit_gl_program;
+    }
+#endif
     Bl2HitchCountDraw();
     s_current_gfx_text = false;
     s_current_postprocess_blend = false;
@@ -2758,9 +2782,7 @@ bool RefreshLegacyProgramStateForDraw() {
     const bool scene_audit = SceneAuditEnabled();
     if (scene_audit) SceneAuditLogError("before legacy state");
     const EGLContext context = eglGetCurrentContext();
-#if !defined(BL2_NATIVE_ARM32)
     if (Bl2ProgramUpgradeHasResults()) ApplyProgramUpgradesLocked(context);
-#endif
     const uint64_t pair_key = LegacyPipelineKey(vertex_name, fragment_name);
     // Consecutive draws reuse few pairs: resolve stage/pipeline/stage-program
     // nodes once per pair instead of seven hash lookups on every draw.
@@ -2796,6 +2818,54 @@ bool RefreshLegacyProgramStateForDraw() {
     LegacyAssemblyPipeline* pipeline = cached.pipeline;
     const LegacyAssemblyStage* vertex = cached.vertex;
     const LegacyAssemblyStage* fragment = cached.fragment;
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    if (pipeline) {
+        auto& counts=bl2_sky_qa::Counts();
+        if (counts.active) {
+            ++counts.legacyDraws;
+            counts.exactName+=fragment->name==bl2_sky_qa::kName;
+            counts.exactHash+=fragment->source_digest==bl2_sky_qa::kDigest;
+            static thread_local bool identity_dumped=false;
+            if (!identity_dumped && fragment->name==bl2_sky_qa::kName) {
+                identity_dumped=true;
+                const std::string prefix=
+                    "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/"
+                    "scene-lighting-sky83df-pid"+std::to_string(getpid())+"-identity-";
+                struct SourceWrite {
+                    size_t bytes=0, written=0;
+                    int close=-1;
+                    bool opened=false;
+                    ObbSha256::Digest digest{};
+                };
+                const auto write_source=[&](const char* label,std::string_view source) {
+                    SourceWrite out;
+                    out.bytes=source.size();
+                    if (source.empty() || source.size()>128u*1024u) return out;
+                    FILE* file=std::fopen((prefix+label+".glsl").c_str(),"wb");
+                    if (!file) return out;
+                    out.opened=true;
+                    out.written=std::fwrite(source.data(),1,source.size(),file);
+                    out.close=std::fclose(file);
+                    out.digest=Bl2ShaderWarmup::Hash(source.substr(0,out.written));
+                    return out;
+                };
+                const auto original=write_source("original",fragment->original_source);
+                const auto diagnostic=write_source("diagnostic",fragment->diagnostic_source);
+                const auto stage_hash=ObbSha256::Hex(fragment->source_digest);
+                const auto original_hash=ObbSha256::Hex(original.digest);
+                const auto diagnostic_hash=ObbSha256::Hex(diagnostic.digest);
+                __android_log_print(ANDROID_LOG_INFO,"BL2SkyQA",
+                    "identity stageSHA256=%s originalBytes=%zu originalWritten=%zu originalClose=%d originalOk=%d originalWrittenSHA256=%s diagnosticBytes=%zu diagnosticWritten=%zu diagnosticClose=%d diagnosticOk=%d diagnosticWrittenSHA256=%s prefix=%s tid=%d",
+                    stage_hash.data(),original.bytes,original.written,original.close,
+                    original.opened && original.written==original.bytes && original.close==0,
+                    original.opened ? original_hash.data() : "-",
+                    diagnostic.bytes,diagnostic.written,diagnostic.close,
+                    diagnostic.opened && diagnostic.written==diagnostic.bytes && diagnostic.close==0,
+                    diagnostic.opened ? diagnostic_hash.data() : "-",prefix.c_str(),gettid());
+            }
+        }
+    }
+#endif
     if (!pipeline) {
         // Never draw with a previous pipeline after this pair failed. Apart
         // from rendering the wrong effect, the old program's sampler bindings
@@ -2812,11 +2882,9 @@ bool RefreshLegacyProgramStateForDraw() {
              s_bound_legacy_vertex, s_bound_legacy_fragment);
         return false;
     }
-#if !defined(BL2_NATIVE_ARM32)
     if (pipeline->sso_pipeline && pipeline->upgrade == 0 &&
         ++pipeline->sso_draws >= kProgramUpgradeDraws && Bl2ProgramUpgradeEnabled())
         RequestProgramUpgradeLocked(*pipeline, *vertex, *fragment, context, pair_key);
-#endif
     bool skip_program = false;
     const bool cache_program = (GlStateCacheMode() & 1) != 0;
     const bool audit_program = GlStateCacheAuditEnabled();
@@ -3451,18 +3519,27 @@ bool NativeLegacyPipelineSelfCheck(EGLDisplay display, EGLSurface surface,
         s_program_cache_valid = false;
         good = good && refresh() && pixels({255, 255, 0, 255});
         if (!good) break;
-        step = "missing/wrong-target/shader-zero rejection";
+        step = "missing stage rejection";
         bind(kVertexProgramArb, vertex_name + 2);
         good = rejected();
         bind(kVertexProgramArb, vertex_name);
         good = refresh() && good;
+        if (!good) break;
+        step = "wrong-target stage rejection";
+        // Synthetic mutations follow the production stage-replacement invalidation contract.
         v.target = kFragmentProgramArb;
+        InvalidateLegacyDrawCacheLocked();
         good = rejected() && good;
         v.target = kVertexProgramArb;
+        InvalidateLegacyDrawCacheLocked();
         good = refresh() && good;
+        if (!good) break;
+        step = "shader-zero stage rejection";
         v.shader = 0;
+        InvalidateLegacyDrawCacheLocked();
         good = rejected() && good;
         v.shader = shaders[0];
+        InvalidateLegacyDrawCacheLocked();
         good = refresh() && good;
         if (!good) break;
         step = "preexisting errors preserved";
@@ -3799,6 +3876,21 @@ bool NativeLegacyPipelineSelfCheck(EGLDisplay display, EGLSurface surface,
             if (!eglMakeCurrent(display, surface, surface, context)) { good = false; break; }
             InvalidateGlStateCaches();s_explicit_gl_program = false;
             good = refresh() && pixels({255, 255, 0, 255}) && good;
+            if (!good) break;
+            if (Bl2ProgramUpgradeEnabled()) {
+                step = "SSO asynchronous monolithic upgrade/constant and sampler reupload";
+                auto& upgrade = s_native_legacy_pipelines.at(context).at(LegacyPipelineKey(sso_v, sso_f));
+                if (upgrade.upgrade == 0)
+                    RequestProgramUpgradeLocked(upgrade, s_legacy_stages.at(sso_v),
+                        s_legacy_stages.at(sso_f), context, LegacyPipelineKey(sso_v, sso_f));
+                const uint64_t deadline = LearnedClockNs() + 5'000'000'000ull;
+                lock.unlock();
+                while (!Bl2ProgramUpgradeHasResults() && LearnedClockNs() < deadline) usleep(1000);
+                lock.lock();
+                ApplyProgramUpgradesLocked(context);
+                good = upgrade.program && !upgrade.sso_pipeline && upgrade.upgrade == 2 &&
+                    refresh() && pixels({255, 255, 0, 255});
+            }
         } while (false);
         if (eglGetCurrentContext() != context && !eglMakeCurrent(display, surface, surface, context)) good = false;
         for (GLuint name : {sso_v, sso_f, sso_b, sso_duplicate_v}) EraseLegacyPipelinesForStageLocked(name);
@@ -3929,14 +4021,22 @@ static void SceneAuditCaptureLightingTexture(GLuint texture, GLint width,
 static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
                                                GLuint expected_framebuffer,
                                                GLuint expected_program,
-                                               const char* operation) {
+                                               const char* operation,
+                                               bool sky_request = false) {
     if (!SceneAuditEnabled()) return;
     std::lock_guard<std::mutex> lock(s_legacy_program_mutex);
     const auto vertex = s_legacy_stages.find(s_bound_legacy_vertex);
     const auto fragment = s_legacy_stages.find(s_bound_legacy_fragment);
-    const bool target_mode = SceneTextureHashEnabled();
     if (vertex == s_legacy_stages.end() || fragment == s_legacy_stages.end()) return;
-    if (!target_mode &&
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    if (sky_request && (!bl2_sky_qa::Enabled() ||
+        !bl2_sky_qa::Matches(fragment->second.name, fragment->second.source_digest))) return;
+    if (sky_request && bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().selected;
+#else
+    if (sky_request) return;
+#endif
+    const bool target_mode = !sky_request && SceneTextureHashEnabled();
+    if (!target_mode && !sky_request &&
         (fragment->second.name != "DirectionalLightPixelShader" &&
          fragment->second.name != "BasePassPixelShader" &&
          fragment->second.name != "HeightFogPixelShader")) return;
@@ -3958,6 +4058,45 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
     GLint actual_framebuffer = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &actual_framebuffer);
     const uint64_t draw_key = (static_cast<uint64_t>(actual_framebuffer) << 32) | draw;
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    if (sky_request) {
+        static thread_local std::unordered_set<uint64_t> captured_sky_draws;
+        if (vertex->second.target != kVertexProgramArb ||
+            fragment->second.target != kFragmentProgramArb ||
+            actual_framebuffer <= 2 || expected_framebuffer != static_cast<GLuint>(actual_framebuffer) ||
+            expected_program != s_current_program || captured_sky_draws.size() >= 4 ||
+            captured_sky_draws.contains(draw_key)) {
+            if (bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().guardRejected[0];
+            return;
+        }
+        const auto key = LegacyPipelineKey(s_bound_legacy_vertex, s_bound_legacy_fragment);
+        auto* pipelines = &s_legacy_pipelines;
+        if (const auto found = s_native_legacy_pipelines.find(eglGetCurrentContext());
+            found != s_native_legacy_pipelines.end()) pipelines = &found->second;
+        const auto pipeline = pipelines->find(key);
+        if (pipeline == pipelines->end() ||
+            (!pipeline->second.program && !pipeline->second.sso_pipeline) ||
+            pipeline->second.program != s_current_program) {
+            if (bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().guardRejected[1];
+            return;
+        }
+        GLint actual_program=0, actual_pipeline=0;
+        glGetIntegerv(GL_CURRENT_PROGRAM,&actual_program);
+        if (static_cast<GLuint>(actual_program) != s_current_program) {
+            if (bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().guardRejected[2];
+            return;
+        }
+        if (pipeline->second.sso_pipeline) {
+            glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING,&actual_pipeline);
+            if (static_cast<GLuint>(actual_pipeline) != pipeline->second.sso_pipeline) {
+            if (bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().guardRejected[3];
+            return;
+        }
+        }
+        captured_sky_draws.insert(draw_key);
+        if (bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().validated;
+    } else
+#endif
     if (target_mode) {
         if (vertex->second.target != kVertexProgramArb ||
             fragment->second.target != kFragmentProgramArb ||
@@ -4058,10 +4197,16 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
     } else if (captured_draws.size() >= 24 ||
                (point < 9 && captured_programs.contains(CurrentLegacyUniformProgram("P"))) ||
                !captured_draws.insert(draw_key).second) return;
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    if (sky_request && bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().attempts;
+#endif
     captured_programs.insert(CurrentLegacyUniformProgram("P"));
     const std::string prefix =
         "/sdcard/Android/data/com.tt2kgames.Borderlands2/files/scene-lighting-" +
-        (target_mode ? "fbo" + std::to_string(actual_framebuffer) + "-" : "") +
+        (sky_request ? "sky83df-pid" + std::to_string(getpid()) + "-ctx" +
+            std::to_string(reinterpret_cast<uintptr_t>(eglGetCurrentContext())) + "-fbo" +
+            std::to_string(actual_framebuffer) + "-" :
+            target_mode ? "fbo" + std::to_string(actual_framebuffer) + "-" : "") +
         "draw" + std::to_string(draw) + "-program" + std::to_string(s_current_program);
     const auto write_file = [](const std::string& path, const void* data, size_t size) {
         FILE* file = std::fopen(path.c_str(), "wb");
@@ -4085,7 +4230,7 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
     bool complete = true;
     std::string target_receipt;
     const auto record = [&](const char* format, auto... values) {
-        if (!target_mode) return;
+        if (!target_mode && !sky_request) return;
         char row[2048];
         const int length = std::snprintf(row, sizeof(row), format, values...);
         if (length < 0 || static_cast<size_t>(length) >= sizeof(row)) {
@@ -4159,6 +4304,21 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
            blend_enabled, src_rgb, dst_rgb, blend_rgb, src_alpha, dst_alpha, blend_alpha,
            color_mask[0], color_mask[1], color_mask[2], color_mask[3],
            depth_enabled, depth_func, depth_mask);
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    if (sky_request) {
+        const auto output=bl2_sky_qa::QueryOutput(color_type,color_object,color_level);
+        const auto hash=ObbSha256::Hex(fragment->second.source_digest);
+        LOGI("Scene sky exact draw=%u name=%s sourceSHA256=%s fbo=%d outputObserved=%d size=%dx%d internal=0x%X samples=%d unit=%d error=0x%X",
+             draw,fragment->second.name.c_str(),hash.data(),framebuffer,output.observed,
+             output.width,output.height,output.internal,output.samples,output.unit,output.error);
+        record("skyExact name=%s sourceSHA256=%s outputObserved=%d width=%d height=%d internal=0x%X samples=%d unit=%d error=0x%X\n",
+               fragment->second.name.c_str(),hash.data(),output.observed,output.width,
+               output.height,output.internal,output.samples,output.unit,output.error);
+        record("skyAttachment componentsObserved=%d componentType=0x%X bitsRGBA=%d,%d,%d,%d colorEncoding=0x%X\n",
+               output.componentsObserved,output.componentType,output.redBits,output.greenBits,
+               output.blueBits,output.alphaBits,output.colorEncoding);
+    }
+#endif
     for (const auto& [stage, label] :
          {std::pair{&vertex->second, "vertex"}, std::pair{&fragment->second, "fragment"}}) {
         const std::string base = prefix + "-" + label;
@@ -4304,12 +4464,35 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
                hash.c_str(), sampler, sampler_location, actual_unit, min_filter, mag_filter,
                base_level, max_level, color_type == GL_TEXTURE && texture > 0 &&
                texture == color_object && color_level >= base_level && color_level <= max_level);
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+        if (sky_request && texture > 0) {
+            for (GLint level = 0; level < 10; ++level) {
+                GLint mip_width = 0, mip_height = 0, mip_format = 0;
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_WIDTH, &mip_width);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_HEIGHT, &mip_height);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_INTERNAL_FORMAT, &mip_format);
+                record("samplerMip unit=%zu texture=%d level=%d width=%d height=%d internal=0x%X\n",
+                       unit, texture, level, mip_width, mip_height, mip_format);
+            }
+            const GLenum mip_error = glGetError();
+            PreserveSceneAuditGlError(mip_error);
+            record("samplerMips unit=%zu error=0x%X\n", unit, mip_error);
+        }
+#endif
         if (!target_mode && point >= 9 && unit == 0 && format == GL_RGBA8 &&
             fragment->second.name == "DirectionalLightPixelShader") {
             SceneAuditCaptureLightingTexture(static_cast<GLuint>(texture), width, height, prefix);
         }
     }
     glActiveTexture(static_cast<GLenum>(previous_active));
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+    if (sky_request) {
+        complete = write_file(prefix + ".sky.txt",target_receipt.data(),target_receipt.size()) && complete;
+        if (complete && bl2_sky_qa::Counts().active) ++bl2_sky_qa::Counts().complete;
+        LOGI("Scene sky exact result draw=%u fbo=%d status=%s prefix=%s",draw,
+             actual_framebuffer,complete ? "complete" : "write-failed",prefix.c_str());
+    }
+#endif
     if (target_mode) {
         GLint restored_active = 0;
         glGetIntegerv(GL_ACTIVE_TEXTURE, &restored_active);
@@ -4333,6 +4516,19 @@ static void SceneAuditCaptureLightingStateImpl(uint32_t draw, size_t point,
              pending_targets, captured_draws.size(), captured_targets.size(), prefix.c_str());
     }
 }
+
+#if defined(BL2_ENABLE_QA_CONSOLE) && BL2_ENABLE_QA_CONSOLE
+void SceneAuditCaptureExactSkyLightingState(GLuint framebuffer, uint32_t draw,
+                                           GLuint expected_program, const char* operation) {
+    auto& counts=bl2_sky_qa::Counts();
+    if (counts.active) ++counts.entries;
+    if (!bl2_sky_qa::Enabled()) {
+        if (counts.active) ++counts.optInRejected;
+        return;
+    }
+    SceneAuditCaptureLightingStateImpl(draw,0,framebuffer,expected_program,operation,true);
+}
+#endif
 
 void SceneAuditCaptureLightingState(uint32_t draw, size_t point) {
     SceneAuditCaptureLightingStateImpl(draw, point, 0, 0, nullptr);
@@ -5891,11 +6087,9 @@ void ThunkManager::RegisterGLThunks() {
         }
         const uint64_t creation_ns = LegacyStageClockNs() - created_at;
         Bl2HitchAddStageNs(creation_ns, driver_compiled);
-#if !defined(BL2_NATIVE_ARM32)
         extern void Bl2ShaderFormerNoteDemandCompile(GLenum, const uint8_t*);
         if (driver_compiled)
             Bl2ShaderFormerNoteDemandCompile(LegacyShaderType(target), prepared_stage.source_digest.data());
-#endif
         TraceLegacyStageCreation(target, prepared_stage.source_digest, shader_name,
                                  driver_compiled, creation_ns);
         const uint32_t log_index =
@@ -7495,7 +7689,6 @@ void ThunkManager::RegisterGLThunks() {
 // stages while the player is in a menu or a loading screen (4 ms per frame), or
 // within a paced frame's idle time. Unsaved learned stages are written out.
 void Bl2LegacyStagePrewarmFrame(uint64_t next_start_ns) {
-#if !defined(BL2_NATIVE_ARM32)
     extern bool Bl2TouchPlayerInWorld();
     const uint64_t start = LearnedClockNs();
     const bool in_world = Bl2TouchPlayerInWorld();
@@ -7512,9 +7705,19 @@ void Bl2LegacyStagePrewarmFrame(uint64_t next_start_ns) {
     if (cursor >= s_learned_stages.size()) return;
     auto& pool = s_prewarmed_stages[group];
     const auto& created = s_group_stage_keys[group];
+#if defined(BL2_NATIVE_ARM32)
+    // Unused driver programs share the limited ARM32 address space with level resources.
+    size_t room = 32;
+    for (const auto& entry : s_prewarmed_stages)
+        room -= std::min(room, entry.second.size());
+    if (!room) return;
+#endif
     PreserveSceneAuditGlError(glGetError());
     try {
         while (cursor < s_learned_stages.size() && LearnedClockNs() - start < budget) {
+#if defined(BL2_NATIVE_ARM32)
+            if (!room) break;
+#endif
             const LearnedStage& learned = s_learned_stages[cursor++];
             if (created.contains(learned.key) || pool.contains(learned.key)) continue;
             const GLuint program = s_shader_stage_cache.ImportStage(
@@ -7528,6 +7731,9 @@ void Bl2LegacyStagePrewarmFrame(uint64_t next_start_ns) {
             state->samplers_initialized = true;
             pool.emplace(learned.key, PrewarmedStage{learned.padded, std::move(state)});
             ++s_prewarm_imported;
+#if defined(BL2_NATIVE_ARM32)
+            --room;
+#endif
         }
     } catch (...) {
     }
@@ -7537,7 +7743,4 @@ void Bl2LegacyStagePrewarmFrame(uint64_t next_start_ns) {
             "group=%llu learned=%zu imported=%u taken=%u",
             static_cast<unsigned long long>(group), s_learned_stages.size(),
             s_prewarm_imported, s_prewarm_taken);
-#else
-    (void)next_start_ns;
-#endif
 }

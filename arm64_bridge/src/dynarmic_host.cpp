@@ -1220,7 +1220,7 @@ uint64_t DynarmicHost::RunGuestCallback64(uint32_t target_pc,
 
 bool DynarmicHost::CallGuest(uint32_t target_pc, const std::vector<uint32_t>& args, uint32_t& result) {
     ThreadContext* context = GetOrCreateThreadContext();
-    if (!context || !context->jit || !context->callback_jit || !target_pc || args.size() > 7) return false;
+    if (!context || !context->jit || !context->callback_jit || !target_pc || args.size() > 32) return false;
     std::lock_guard<std::recursive_mutex> lock(context->mutex);
     if (s_active_host != this || !s_active_jit) return false;
     Dynarmic::A32::Jit* selected = nullptr;

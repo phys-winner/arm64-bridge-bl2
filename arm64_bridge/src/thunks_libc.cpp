@@ -6,6 +6,7 @@
 #include "bl2_directory_cache.h"
 #include "bl2_io_failure_probe.h"
 #include "dynarmic_host.h"
+#include "bl2_iris_load_svc_trace_qa.h"
 #include "thunk_types.h"
 #include "thunks_opensles.h"
 #include "elf_loader.h"
@@ -450,6 +451,27 @@ extern "C" int IndexObbSplitApks(const char* const* paths, size_t count) {
     g_verified_obb_pair = false;
     g_verified_obb_entries[0] = {};
     g_verified_obb_entries[1] = {};
+    const auto external_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    const auto external = OpenExternalObbPair(Bl2ExternalObbDirectory(), [](const void* value) {
+        return std::chrono::steady_clock::now() <
+            *static_cast<const std::chrono::steady_clock::time_point*>(value);
+    }, &external_deadline);
+    if (external.status == ObbSplitScanStatus::Verified) {
+        for (size_t i = 0; i < 2; ++i) {
+            auto& entry = g_verified_obb_entries[i];
+            snprintf(entry.name, sizeof(entry.name), "assets/%s", i == 0 ? kMainObbName.data() : kPatchObbName.data());
+            entry.apk_fd = external.fds[i];
+            entry.file_size = static_cast<off_t>(external.sizes[i]);
+        }
+        g_verified_obb_pair = true;
+        SetBl2LocaleMainObb(external.fds[0], 0, external.sizes[0]);
+        LOGI("Selected external OBB pair: %s", Bl2ExternalObbDirectory());
+        return 0;
+    }
+    if (external.status != ObbSplitScanStatus::NoObbEntry) {
+        LOGE("External OBB pair rejected: %s", external.reason);
+        return -2;
+    }
     if (count == 0) return 0;
     if (!paths || count > 64) return -1;
 
@@ -547,8 +569,8 @@ static int OriginalObbIndex(const char* path) {
     if (!path) return -1;
     const char* slash = strrchr(path, '/');
     const char* base = slash ? slash + 1 : path;
-    if (base == std::string_view(kMainObbName)) return 0;
-    if (base == std::string_view(kPatchObbName)) return 1;
+    if (base == kMainObbName) return 0;
+    if (base == kPatchObbName) return 1;
     return -1;
 }
 
@@ -625,6 +647,7 @@ static FILE* OpenApkEntryStream(const ApkEntry& entry) {
 }
 
 static bool EmbeddedObbStat(const char* path, struct stat& st) {
+    if (Bl2OrchidStat(path, st)) return true;
     if (const auto* locale = FindBl2LocaleEntry(path)) {
         memset(&st, 0, sizeof(st));
         st.st_size = locale->file_size;
@@ -776,6 +799,8 @@ struct GuestDirHandle {
     uint8_t next_embedded_obb = 0;
     std::shared_ptr<const Bl2DirectorySnapshot> snapshot;
     size_t next_snapshot_entry = 0;
+    const std::vector<bl2_orchid::Child>* orchid_entries = nullptr;
+    size_t next_orchid_entry = 0;
 };
 static std::mutex g_dir_mutex;
 static std::unordered_map<uint32_t, GuestDirHandle> g_dir_map;
@@ -3436,6 +3461,9 @@ void ThunkManager::RegisterLibcThunks() {
 
     // Android & Runtime
     RegisterThunk("__android_log_write", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+#if BL2_ENABLE_QA_CONSOLE && !defined(BL2_NATIVE_ARM32) && !defined(BL2_STATIC_AOT)
+        bl2::iris::load_trace_qa::ForwardLog(host,host.GetGuestMemoryBase(),host.GetGuestMemorySize(),jit.Regs().data(),true);
+#endif
 #if HORN_ENABLE_LOGGING
         int prio = static_cast<int>(jit.Regs()[0]);
         uint32_t tag_ptr = jit.Regs()[1];
@@ -3870,6 +3898,9 @@ void ThunkManager::RegisterLibcThunks() {
 
     // Logging & Formatted output
     RegisterThunk("__android_log_print", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+#if BL2_ENABLE_QA_CONSOLE && !defined(BL2_NATIVE_ARM32) && !defined(BL2_STATIC_AOT)
+        bl2::iris::load_trace_qa::ForwardLog(host,host.GetGuestMemoryBase(),host.GetGuestMemorySize(),jit.Regs().data(),false);
+#endif
         ObserveBl2IoFailureLog(jit, host);
 #if HORN_ENABLE_LOGGING
         int prio = static_cast<int>(jit.Regs()[0]);
@@ -3898,6 +3929,9 @@ void ThunkManager::RegisterLibcThunks() {
         jit.Regs()[0] = 0;
     });
     RegisterThunk("__android_log_assert", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+#if BL2_ENABLE_QA_CONSOLE && !defined(BL2_NATIVE_ARM32) && !defined(BL2_STATIC_AOT)
+        bl2::iris::load_trace_qa::ForwardLog(host,host.GetGuestMemoryBase(),host.GetGuestMemorySize(),jit.Regs().data(),false);
+#endif
 #if HORN_ENABLE_LOGGING
         const char* condition = GuestCString(host.GetGuestMemoryBase(),
                                              host.GetGuestMemorySize(), jit.Regs()[0]);
@@ -4858,6 +4892,9 @@ void ThunkManager::RegisterLibcThunks() {
         const char* path = reinterpret_cast<const char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]));
         const char* mode = reinterpret_cast<const char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[1]));
         if (!path) { jit.Regs()[0] = 0; return; }
+        if (Bl2OrchidKind(path) == bl2_orchid::NodeKind::Directory) {
+            SetGuestErrno(host, EISDIR); jit.Regs()[0] = 0; return;
+        }
 
         uint32_t trace_index = 0;
         const bool trace = ShouldTraceFileCall(
@@ -5206,6 +5243,9 @@ void ThunkManager::RegisterLibcThunks() {
         const char* path = reinterpret_cast<const char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]));
         int flags = static_cast<int>(jit.Regs()[1]);
         int mode = static_cast<int>(jit.Regs()[2]);
+        if (Bl2OrchidKind(path) == bl2_orchid::NodeKind::Directory) {
+            SetGuestErrno(host, EISDIR); jit.Regs()[0] = static_cast<uint32_t>(-1); return;
+        }
         uint32_t trace_index = 0;
         const bool trace = ShouldTraceFileCall(
             g_open_trace_count, 96, "open", path, &trace_index);
@@ -5404,6 +5444,12 @@ void ThunkManager::RegisterLibcThunks() {
     RegisterThunk("access", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
         const char* path = reinterpret_cast<const char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]));
         int mode = static_cast<int>(jit.Regs()[1]);
+        int orchid_result = 0;
+        if (Bl2OrchidAccess(path, mode, orchid_result)) {
+            if (orchid_result < 0) SetGuestErrno(host, errno);
+            jit.Regs()[0] = static_cast<uint32_t>(orchid_result);
+            return;
+        }
         if ((g_verified_obb_pair && OriginalObbIndex(path) >= 0) || IsBl2LocalePath(path)) {
             if ((mode & W_OK) != 0 || (mode & X_OK) != 0) {
                 SetGuestErrno(host, EACCES);
@@ -5475,17 +5521,38 @@ void ThunkManager::RegisterLibcThunks() {
     RegisterThunk("utimes", deny_filesystem_mutation("utimes"));
 
     RegisterThunk("opendir", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+#if BL2_ENABLE_QA_CONSOLE
+        static std::atomic<unsigned> qaRows{0};
+        const auto qaRow=qaRows.fetch_add(1)+1;
+#endif
+        EnsureBl2OrchidMount(host);
         const char* path = reinterpret_cast<const char*>(GuestToHost(host.GetGuestMemoryBase(), jit.Regs()[0]));
+#if BL2_ENABLE_QA_CONSOLE
+        if(qaRow<=32)__android_log_print(ANDROID_LOG_INFO,"BL2_QaDir","open row=%u stage=path lr=%08X path=%.240s",qaRow,jit.Regs()[14],path?path:"(null)");
+#endif
+        if (Bl2OrchidKind(path) == bl2_orchid::NodeKind::File) {
+            SetGuestErrno(host, ENOTDIR); jit.Regs()[0] = 0; return;
+        }
+        const auto* orchid_entries = Bl2OrchidChildren(path);
         const bool include_embedded_obbs = g_verified_obb_pair && IsOriginalObbDirectory(path);
-        std::shared_ptr<const Bl2DirectorySnapshot> snapshot = include_embedded_obbs
+#if BL2_ENABLE_QA_CONSOLE
+        if(qaRow<=32)__android_log_print(ANDROID_LOG_INFO,"BL2_QaDir","open row=%u stage=before_snapshot orchid=%zu obbs=%u",qaRow,orchid_entries?orchid_entries->size():0,unsigned(include_embedded_obbs));
+#endif
+        std::shared_ptr<const Bl2DirectorySnapshot> snapshot = include_embedded_obbs || orchid_entries
             ? nullptr : Bl2GetDirectorySnapshot(path);
-        DIR* dir = path && !snapshot ? opendir(path) : nullptr;
-        if (!dir && !snapshot && !include_embedded_obbs) {
+#if BL2_ENABLE_QA_CONSOLE
+        if(qaRow<=32)__android_log_print(ANDROID_LOG_INFO,"BL2_QaDir","open row=%u stage=after_snapshot snapshot=%u",qaRow,unsigned(snapshot!=nullptr));
+#endif
+        DIR* dir = path && !snapshot && !orchid_entries ? opendir(path) : nullptr;
+        if (!dir && !snapshot && !include_embedded_obbs && !orchid_entries) {
             SetGuestErrno(host, path ? errno : EFAULT);
             jit.Regs()[0] = 0;
             return;
         }
         uint32_t dirent_addr = host.GuestAlloc(sizeof(Arm32Dirent), 8);
+#if BL2_ENABLE_QA_CONSOLE
+        if(qaRow<=32)__android_log_print(ANDROID_LOG_INFO,"BL2_QaDir","open row=%u stage=allocated guest=%08X native=%u",qaRow,dirent_addr,unsigned(dir!=nullptr));
+#endif
         if (!dirent_addr) {
             if (dir) closedir(dir);
             SetGuestErrno(host, ENOMEM);
@@ -5495,7 +5562,10 @@ void ThunkManager::RegisterLibcThunks() {
         std::lock_guard<std::mutex> lock(g_dir_mutex);
         uint32_t handle = g_next_dir_handle++;
         g_dir_map.emplace(handle, GuestDirHandle{
-            dir, dirent_addr, include_embedded_obbs, 0, std::move(snapshot), 0});
+            dir, dirent_addr, include_embedded_obbs, 0, std::move(snapshot), 0, orchid_entries, 0});
+#if BL2_ENABLE_QA_CONSOLE
+        if(qaRow<=32)__android_log_print(ANDROID_LOG_INFO,"BL2_QaDir","open row=%u stage=return handle=%08X",qaRow,handle);
+#endif
         if (include_embedded_obbs) {
             LOGI("opendir: verified embedded OBB names virtualized for '%s' (native_dir=%d)",
                  path, dir != nullptr);
@@ -5507,6 +5577,25 @@ void ThunkManager::RegisterLibcThunks() {
         auto it = g_dir_map.find(jit.Regs()[0]);
         if (it == g_dir_map.end()) { SetGuestErrno(host, EBADF); jit.Regs()[0] = 0; return; }
         GuestDirHandle& handle = it->second;
+        if (handle.orchid_entries) {
+#if BL2_ENABLE_QA_CONSOLE
+            static std::atomic<unsigned> qaRows{0};
+            const auto qaRow=qaRows.fetch_add(1)+1;
+            if(qaRow<=128)__android_log_print(ANDROID_LOG_INFO,"BL2_QaDir","read row=%u handle=%08X index=%zu size=%zu name=%.240s",qaRow,jit.Regs()[0],handle.next_orchid_entry,handle.orchid_entries->size(),handle.next_orchid_entry<handle.orchid_entries->size()?(*handle.orchid_entries)[handle.next_orchid_entry].name.c_str():"<end>");
+#endif
+            errno = 0;
+            if (handle.next_orchid_entry == handle.orchid_entries->size()) { jit.Regs()[0] = 0; return; }
+            const auto& entry = (*handle.orchid_entries)[handle.next_orchid_entry++];
+            Arm32Dirent out{};
+            out.d_ino = 0xB12D0000u + handle.next_orchid_entry;
+            out.d_off = handle.next_orchid_entry;
+            out.d_type = entry.kind == bl2_orchid::NodeKind::Directory ? DT_DIR : DT_REG;
+            memcpy(out.d_name, entry.name.c_str(), entry.name.size() + 1);
+            out.d_reclen = static_cast<uint16_t>(offsetof(Arm32Dirent, d_name) + entry.name.size() + 1);
+            memcpy(GuestToHost(host.GetGuestMemoryBase(), handle.guest_dirent), &out, sizeof(out));
+            jit.Regs()[0] = handle.guest_dirent;
+            return;
+        }
         if (handle.snapshot) {
             Bl2DirectoryCacheRecordRead(true);
             errno = 0;
@@ -5542,7 +5631,8 @@ void ThunkManager::RegisterLibcThunks() {
         }
         errno = 0;
         dirent* native = handle.dir ? readdir(handle.dir) : nullptr;
-        while (native && handle.include_embedded_obbs && OriginalObbIndex(native->d_name) >= 0) {
+        while (native && handle.include_embedded_obbs &&
+               (OriginalObbIndex(native->d_name) >= 0 || IsManagedBl2ZipObbName(native->d_name))) {
             native = readdir(handle.dir);
         }
         if (!native) { if (errno) SetGuestErrno(host, errno); jit.Regs()[0] = 0; return; }
@@ -5556,12 +5646,16 @@ void ThunkManager::RegisterLibcThunks() {
         jit.Regs()[0] = handle.guest_dirent;
     });
     RegisterThunk("closedir", [](Dynarmic::A32::Jit& jit, DynarmicHost& host) {
+#if BL2_ENABLE_QA_CONSOLE
+        static std::atomic<unsigned> qaRows{0};
+        if(qaRows.fetch_add(1)<32)__android_log_print(ANDROID_LOG_INFO,"BL2_QaDir","close handle=%08X",jit.Regs()[0]);
+#endif
         std::lock_guard<std::mutex> lock(g_dir_mutex);
         auto it = g_dir_map.find(jit.Regs()[0]);
         if (it == g_dir_map.end()) { SetGuestErrno(host, EBADF); jit.Regs()[0] = static_cast<uint32_t>(-1); return; }
         int result = it->second.dir ? closedir(it->second.dir) : 0;
         const int close_errno = errno;
-        if (!it->second.include_embedded_obbs) Bl2DirectoryCacheRecordClose();
+        if (!it->second.include_embedded_obbs && !it->second.orchid_entries) Bl2DirectoryCacheRecordClose();
         host.GuestFree(it->second.guest_dirent);
         g_dir_map.erase(it);
         if (result < 0) SetGuestErrno(host, close_errno);

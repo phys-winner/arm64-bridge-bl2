@@ -2,5 +2,5 @@
 
 class DynarmicHost;
 
-// Use the game's existing direct-to-menu path after the loading movies.
+// Skip legal screens while preserving the normal profile and character-loading startup.
 bool InstallBl2StartupScreens(DynarmicHost& host);

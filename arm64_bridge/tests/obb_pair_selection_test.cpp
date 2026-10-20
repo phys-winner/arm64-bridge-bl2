@@ -2,6 +2,22 @@
 
 #include <array>
 
+static_assert(IsManagedBl2ZipObbName("dlc_captain_scarlett.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(IsManagedBl2ZipObbName("dlc_captain_scarlett_registration.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(IsManagedBl2ZipObbName("dlc_captain_scarlett_russian_voice.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(IsManagedBl2ZipObbName("dlc_tiny_tina_russian_cinematics.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(IsManagedBl2ZipObbName("russian_voice.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(!IsManagedBl2ZipObbName(kMainObbName));
+static_assert(!IsManagedBl2ZipObbName(kPatchObbName));
+static_assert(!IsManagedBl2ZipObbName("custom.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(!IsManagedBl2ZipObbName("dlc_captain_scarlett.32.com.tt2kgames.Borderlands2.obb"));
+static_assert(!IsManagedBl2ZipObbName("DLC_captain_scarlett.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(!IsManagedBl2ZipObbName("dlc_captain_scarlett.31.com.other.game.obb"));
+static_assert(!IsManagedBl2ZipObbName("dlc_captain_scarlett.31.com.tt2kgames.Borderlands2.obb.held"));
+static_assert(!IsManagedBl2ZipObbName("dlc_dir/name.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(!IsManagedBl2ZipObbName("dlc_dir\\name.31.com.tt2kgames.Borderlands2.obb"));
+static_assert(!IsManagedBl2ZipObbName(""));
+
 constexpr ObbCandidate kMainSplit{ObbSource::EmbeddedSplits, kMainObbName,
                                   kMainObbSha256, kMainObbSize, true};
 constexpr ObbCandidate kPatchSplit{ObbSource::EmbeddedSplits, kPatchObbName,

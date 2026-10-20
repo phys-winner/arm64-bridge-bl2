@@ -50,6 +50,7 @@
 #include "bl2_audio_decode_fastpath.h"
 #include "bl2_guest_integrity.h"
 #include "bl2_touch_runtime.h"
+#include "bl2_iris_wheeled_runtime.h"
 #include "bl2_io_failure_probe.h"
 #include "bl2_movie_skip.h"
 #include "bl2_startup_screens.h"
@@ -63,6 +64,8 @@
 #include "bl2_touch_settings.h"
 #include "engine_hooks.h"
 #include "obb_pair_selection.h"
+#include "bl2_lan_discovery_compat.h"
+#include "bl2_lan_runtime_adapter.h"
 
 #define LOG_TAG "Arm32Bridge_JNI"
 #define LOGI(...) HORN_LOGI(LOG_TAG, __VA_ARGS__)
@@ -518,6 +521,9 @@ static void SeedBl2LearnedJitProfile(const std::string& directory) {
 
 // Candidate paths inside the APK for one library name.
 static std::vector<std::string> ApkCandidates(const char* lib) {
+    if (std::strcmp(lib, cfg::kGuestLib) == 0)
+        return {"lib/armeabi-v7a/libUE3Runtime.so",
+                "assets/guest_libs/libUnrealEngine3.so"};
     return {std::string("assets/guest_libs/") + lib,
             std::string("lib/armeabi/") + lib,
             std::string("lib/armeabi-v7a/") + lib,
@@ -1599,6 +1605,9 @@ static void CaptureHostPaths(JNIEnv* env, jobject candidate_context) {
         if (env->ExceptionCheck()) ClearPathLookupException(env, method);
     };
     if (g_saved_files_dir.empty()) capture_directory("getFilesDir", g_saved_files_dir);
+    std::string obb_directory;
+    capture_directory("getObbDir", obb_directory);
+    SetBl2ExternalObbDirectory(obb_directory.c_str());
     if (!g_shader_cache_dir_capture_attempted) {
         capture_directory("getCacheDir", g_bl2_shader_cache_dir);
         ResetBl2ShaderCachesForQa(g_bl2_shader_cache_dir);
@@ -2085,7 +2094,14 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
             for (const auto& path : g_saved_split_apk_paths) {
                 split_paths.push_back(path.c_str());
             }
-            if (IndexObbSplitApks(split_paths.data(), split_paths.size()) != 0) {
+            const int cache_status = IndexObbSplitApks(split_paths.data(), split_paths.size());
+            if (cache_status == -2) {
+                LOGE("External OBB pair rejected; replace both files with the verified export");
+                g_host.reset();
+                g_guest_load_state = GuestLoadState::Fatal;
+                return false;
+            }
+            if (cache_status != 0) {
                 // An incompatible/incomplete embedded set must not shadow the
                 // existing external path. Downloader checks its names/sizes;
                 // the original guest parses FOOB without a full-content hash.
@@ -2127,7 +2143,7 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
         g_guest_load_state = GuestLoadState::Fatal;
         return false;
     }
-    if (!InstallBl2LocalSessionPatch(*g_host)) {
+    if (!InstallBl2LocalSessionPatch(*g_host) || !InstallBl2LanDiscoveryCompat(*g_host)) {
         g_host.reset();
         g_guest_load_state = GuestLoadState::Fatal;
         return false;
@@ -2195,11 +2211,32 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
     if (!InstallBl2AudioDecodeFastpaths(*g_host,(kBl2PerformanceDefaults>>6)&3)) {
         LOGE("Optional BL2 audio decode fast path unavailable; retaining guest path");
     }
-    if (!InstallBl2MovieSkip(*g_host)) {
-        LOGE("Movie skip unavailable: unexpected FFullScreenMovieBink code");
-    }
     if (!InstallBl2StartupScreens(*g_host)) {
         LOGE("Startup screen skip unavailable: unexpected registry getter code");
+    }
+    if (!InstallBl2WeaponAmmo(*g_host)) {
+        LOGE("BL2 weapon ammo CPU hook rejected guest input");
+        g_host.reset();g_guest_load_state = GuestLoadState::Fatal;return false;
+    }
+    if (!InstallBl2LanPacketAdapter(*g_host)) {
+        LOGE("BL2 LAN packet adapter rejected guest input");
+        g_host.reset();g_guest_load_state = GuestLoadState::Fatal;return false;
+    }
+    // Append new thunks after existing hooks to preserve certified AOT SVC IDs.
+    if (!InstallBl2SubtitleTiming(*g_host)) {
+        LOGE("BL2 subtitle timing hook rejected guest input");
+        g_host.reset();g_guest_load_state = GuestLoadState::Fatal;return false;
+    }
+    if (!InstallBl2OrchidOwnership(*g_host)) {
+        LOGE("BL2 local Orchid ownership hook rejected guest input");
+        g_host.reset();g_guest_load_state = GuestLoadState::Fatal;return false;
+    }
+#if BL2_ENABLE_QA_CONSOLE
+    __android_log_print(ANDROID_LOG_INFO, "BL2_QaInit", "initial guest hooks installed including local Orchid ownership");
+#endif
+    // Append only callback addresses before original JNI/render execution.
+    if (!bl2::iris::wheeled::InstallCallbacks(*g_host)) {
+        g_host.reset();g_guest_load_state = GuestLoadState::Fatal;return false;
     }
     // Last: snapshots RELRO after every bridge patch (bl2_guest_integrity.h).
     StartBl2GuestIntegrityWatch(*g_host);
@@ -2230,10 +2267,20 @@ static bool EnsureGameLoaded(JNIEnv* env, jobject context) {
     fj.SetJavaVM(g_jvm);
     fj.Init(*g_host);
     PinHostForProcessLifetime();
+    // UI movie callbacks must never retain a host that a later load check resets.
+    if (!InstallBl2MovieSkip(*g_host)) {
+        LOGE("Movie skip unavailable: unexpected FFullScreenMovieBink code");
+    }
     fj.AttachHostEnv(env);
 
+#if BL2_ENABLE_QA_CONSOLE
+    __android_log_print(ANDROID_LOG_INFO, "BL2_QaInit", "original guest JNI_OnLoad begin");
+#endif
     const jint guest_jni_version = static_cast<jint>(g_host->RunFunction(
         guest_jni_on_load, {fj.VmTableGuestAddr(), 0}));
+#if BL2_ENABLE_QA_CONSOLE
+    __android_log_print(ANDROID_LOG_INFO, "BL2_QaInit", "original guest JNI_OnLoad end version=%08X", unsigned(guest_jni_version));
+#endif
     if (env->ExceptionCheck()) {
         LOGE("Guest JNI_OnLoad left a pending Java exception");
         env->ExceptionDescribe();

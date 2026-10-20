@@ -89,6 +89,10 @@ bool Activate(DynarmicHost& host, std::uint32_t base) {
 }  // namespace
 
 void Bl2GcDeferTick(DynarmicHost& host, bool ui_frame) {
+#if defined(BL2_NATIVE_ARM32)
+    // Keep the engine schedule in the native process's limited 32-bit address space.
+    return;
+#endif
     if (g_state == State::Off) return;
     const std::uint32_t base = host.GetElfLoader().GetBaseAddress();
     if (g_state == State::Unchecked) g_state = Activate(host, base) ? State::Active : State::Off;

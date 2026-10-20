@@ -3,7 +3,9 @@ param(
     [ValidateRange(0,99999)][int]$PreviousSeed = 0,
     [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$NativeBuildDir = 'bridge-seed2',
     [switch]$Diagnostics,
+    [switch]$QaConsole,
     [switch]$PhysxCookieWatch,
+    [switch]$BaseOnly,
     [switch]$Release,
     # A release whose bridge never writes to logcat and whose process drops the
     # BL2*/Arm32Bridge* Java tags on Android 11+ (HORN_SILENT_LOGCAT).
@@ -11,7 +13,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($PhysxCookieWatch -and !$Diagnostics) { throw 'PhysX cookie watch requires a diagnostic build' }
-if ($Final -and $Diagnostics) { throw 'A final build excludes diagnostics' }
+if ($Final -and ($Diagnostics -or $QaConsole)) { throw 'A final build excludes diagnostics and the QA console' }
 $releaseBuild = $Release.IsPresent -or $Final.IsPresent
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $build = Join-Path $root 'work\build'
@@ -21,7 +23,7 @@ $stagePackHash = (Get-FileHash -LiteralPath $stagePack.FullName).Hash
 $nativeBuild = Join-Path $build $NativeBuildDir
 $java = "$env:JAVA_HOME\bin\java.exe"
 $apktool = $env:APKTOOL_JAR
-$androidTools = "$env:ANDROID_HOME\build-tools\37.0.0"
+$androidTools = Join-Path $root '..\tools\android\sdk\build-tools\37.0.0'
 $signer = $env:APK_SIGNER_DIR
 $unsigned = Join-Path $build "bl2-arm64-bridge-seed$Seed-unsigned.apk"
 $aligned = Join-Path $build "bl2-arm64-bridge-seed$Seed-aligned.apk"
@@ -36,6 +38,8 @@ try {
     }
     $cmake = "$env:ANDROID_HOME\cmake\3.22.1\bin\cmake.exe"
     $diagnosticFlag = if ($Diagnostics) { 'ON' } else { 'OFF' }
+    $qaConsoleFlag = if ($QaConsole) { 'ON' } else { 'OFF' }
+    $dlcContentFlag = if ($BaseOnly) { 'OFF' } else { 'ON' }
     $physxDiagnosticFlag = if ($PhysxCookieWatch) { 'ON' } else { 'OFF' }
     $debugMenuFlag = if ($releaseBuild) { 'OFF' } else { 'ON' }
     $silentFlag = if ($Final) { 'ON' } else { 'OFF' }
@@ -47,7 +51,7 @@ try {
             "-DCMAKE_MAKE_PROGRAM=$env:ANDROID_HOME\cmake\3.22.1\bin\ninja.exe"
         if ($LASTEXITCODE) { throw 'Fresh offline native configuration failed' }
     }
-    & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag" "-DHORN_ENABLE_PHYSX_COOKIE_WATCH=$physxDiagnosticFlag" '-DHORN_GL_SELF_CHECK=OFF' "-DBL2_ENABLE_DEBUG_MENU_DEFAULT=$debugMenuFlag" "-DHORN_SILENT_LOGCAT=$silentFlag"
+    & $cmake -S (Join-Path $root 'arm64_bridge') -B $nativeBuild "-DHORN_ENABLE_LOGGING=$diagnosticFlag" "-DBL2_ENABLE_QA_CONSOLE=$qaConsoleFlag" "-DBL2_ENABLE_DLC_CONTENT=$dlcContentFlag" "-DHORN_ENABLE_PERF_PROBE=$diagnosticFlag" "-DHORN_ENABLE_PHYSX_COOKIE_WATCH=$physxDiagnosticFlag" '-DHORN_GL_SELF_CHECK=OFF' "-DBL2_ENABLE_DEBUG_MENU_DEFAULT=$debugMenuFlag" "-DHORN_SILENT_LOGCAT=$silentFlag"
     if ($LASTEXITCODE) { throw 'Native configuration failed' }
     & $cmake --build $nativeBuild --config Release --parallel 8
     if ($LASTEXITCODE) { throw 'Native build failed' }
@@ -177,8 +181,10 @@ try {
 }
 $manifest = [ordered]@{seed=$Seed;native_build_dir=$NativeBuildDir;path=$signed;bytes=(Get-Item -LiteralPath $signed).Length;
     bridge_logging=[bool]$Diagnostics.IsPresent;perf_probe_compiled=[bool]$Diagnostics.IsPresent;
+    qa_console_compiled=($Diagnostics.IsPresent -or $QaConsole.IsPresent);
     release_build=$releaseBuild;debug_menu_default_enabled=(!$releaseBuild);
     final_build=[bool]$Final.IsPresent;silent_logcat=[bool]$Final.IsPresent;
+    base_only=[bool]$BaseOnly.IsPresent;dlc_content_enabled=(!$BaseOnly.IsPresent);
     bridge_stripped=$releaseBuild;bridge_unstripped_bytes=$nativeUnstrippedBytes;
     bridge_bytes=(Get-Item -LiteralPath $nativePath).Length;
     russian_text_in_base=$true;app_locales=@('en','ru');cache_layout='full';

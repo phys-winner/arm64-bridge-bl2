@@ -21,6 +21,11 @@ public:
     bool Track(uint32_t guest_address, size_t length);
     void Untrack(uint32_t guest_address, size_t length);
     bool IsDirty(size_t page_index) const;
+    // Caller holds the mapping mutex, excluding Initialize/Shutdown. Append
+    // the same ascending dirty indexes as IsDirty over this clipped range;
+    // preserve existing output entries/duplicates and do not consume state.
+    void AppendDirtyPages(size_t first_page, size_t past_last_page,
+                          std::vector<size_t>& output) const;
     // Lock-free: false only when no page of the range is watched. A Track()
     // racing a write protects first, so the fault path or its initial full
     // copy still observes that write.

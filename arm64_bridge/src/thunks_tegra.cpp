@@ -1,7 +1,9 @@
 #include "thunks_tegra.h"
 
 #include "bridge_log.h"
+#include "bl2_weapon_ammo.h"
 #include "dynarmic_host.h"
+#include "elf_loader.h"
 #include "thunk_manager.h"
 #include <dynarmic/interface/A32/a32.h>
 
@@ -132,6 +134,48 @@ bool InstallBorderlandsNvsiLifecycle(DynarmicHost& host) {
         LOGI("NVSI local lifecycle hook %s at 0x%08X -> 0x%08X",
              hooks[i].symbol, functions[i], trampolines[i]);
     }
+    return true;
+}
+
+bool InstallBl2WeaponAmmo(DynarmicHost& host) {
+    const auto& loader = host.GetElfLoader();
+    const auto base = loader.GetBaseAddress();
+    const auto ammo = host.FindSymbol("nvsiRunCalSnippet_Ammo");
+    constexpr std::array<uint32_t, 12> ammo_signature{
+        0xE5D01008, 0xE3510000, 0x1590100C, 0x1A000004,
+        0xE5D01010, 0xE3510000, 0x15901018, 0x1A000000,
+        0xE3A01000, 0xE580101C, 0xE3A00000, 0xE12FFF1E};
+    if (loader.GetImageSize() != 0x03089000 || base > UINT32_MAX - 0x03089000 ||
+        ammo != base + 0x01E1BDE8 ||
+        host.FindSymbol("_ZN13AWillowWeapon12GetAmmoCountEv") != base + 0x023EA030 ||
+        !loader.IsCodeRange(ammo, sizeof(ammo_signature)) ||
+        !loader.IsReadOnlyRange(ammo, sizeof(ammo_signature))) return false;
+    for (size_t i = 0; i < ammo_signature.size(); ++i)
+        if (host.MemoryRead32(ammo + uint32_t(i * 4)) != ammo_signature[i]) return false;
+    const auto ammo_thunk = host.GetThunkManager().RegisterThunk(
+        "bl2_cpu_weapon_ammo", [](Dynarmic::A32::Jit& jit, DynarmicHost& current) {
+            const auto parameters = jit.Regs()[0];
+            if ((jit.Cpsr() & 0x20u) || (parameters & 3u) || parameters < 0x10000 ||
+                uint64_t{parameters} + 0x20 > current.GetGuestMemorySize()) {
+                LOGE("Weapon ammo rejected invalid guest parameter span: %08X", parameters);
+                jit.HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+                return;
+            }
+            const auto count = Bl2WeaponAmmoCount(
+                current.MemoryRead8(parameters) != 0, current.MemoryRead32(parameters + 4),
+                current.MemoryRead8(parameters + 8) != 0, current.MemoryRead32(parameters + 12),
+                current.MemoryRead8(parameters + 16) != 0, current.MemoryRead32(parameters + 24));
+            current.MemoryWrite32(parameters + 28, count);
+            jit.Regs()[0] = 0;
+        });
+    if (!ammo_thunk) return false;
+    constexpr uint32_t kArmLdrPcLiteral = 0xE51FF004;
+    host.MemoryWrite32(ammo, kArmLdrPcLiteral);
+    host.MemoryWrite32(ammo + 4, ammo_thunk);
+    host.InvalidateGuestCode(ammo, 8);
+    if (host.MemoryRead32(ammo) != kArmLdrPcLiteral ||
+        host.MemoryRead32(ammo + 4) != ammo_thunk) return false;
+    LOGI("Weapon ammo CPU hook at 0x%08X includes the infinite-ammo clip capacity", ammo);
     return true;
 }
 

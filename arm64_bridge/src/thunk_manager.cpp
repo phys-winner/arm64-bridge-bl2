@@ -9,6 +9,10 @@
 #include "thunks_android.h"
 #include "thunks_tegra.h"
 #include "bl2_startup_profile.h"
+#include "bl2_iris_load_svc_trace_qa.h"
+#if BL2_ENABLE_QA_CONSOLE && !defined(BL2_NATIVE_ARM32) && !defined(BL2_STATIC_AOT)
+#include <cstring>
+#endif
 #if defined(BL2_NATIVE_ARM32)
 #include "../../arm32_compat/src/native_vfs.h"
 #include "../../arm32_compat/src/native_gl_inventory.h"
@@ -411,6 +415,28 @@ bool Bl2GlWorkerDispatch(uint32_t id, const std::string& name, const ThunkHandle
                          Dynarmic::A32::Jit& jit, DynarmicHost& host);
 
 void ThunkManager::DispatchThunk(uint32_t thunk_id, Dynarmic::A32::Jit& jit) {
+#if BL2_ENABLE_QA_CONSOLE && !defined(BL2_NATIVE_ARM32) && !defined(BL2_STATIC_AOT)
+    auto& load_trace=bl2::iris::load_trace_qa::state;
+    if(load_trace.owner==&m_host) {
+        const auto event=++load_trace.events;
+        const char* name=thunk_id<m_id_to_name.size()?m_id_to_name[thunk_id].c_str():"unknown";
+        const bool critical=!std::strncmp(name,"__android_log_",14)||std::strstr(name,"appError")||std::strstr(name,"appFail")||std::strstr(name,"assert")||!std::strcmp(name,"abort");
+        const bool diagnostic=critical&&load_trace.diagnosticEvents<32;
+        if(diagnostic)++load_trace.diagnosticEvents;
+        if(event<=32||event%1000==0||diagnostic) {
+            const bl2::iris::load_trace_qa::ErrnoGuard preserve;
+            const auto& regs=jit.Regs();
+            const auto sp=regs[13];
+            std::uint32_t stack[4]={};
+            const bool stack_valid=bl2::iris::load_trace_qa::Read(m_host.GetGuestMemoryBase(),m_host.GetGuestMemorySize(),sp,stack,sizeof(stack));
+            if(!stack_valid)std::memset(stack,0,sizeof(stack));
+            __android_log_print(ANDROID_LOG_INFO,"BL2IrisLoadSVC",
+                "load-svc event=%llu id=%u name=%.96s pc=%08X lr=%08X sp=%08X r0_3=%08X,%08X,%08X,%08X stack_valid=%u stack=%08X,%08X,%08X,%08X",
+                static_cast<unsigned long long>(event),thunk_id,name,regs[15],regs[14],sp,regs[0],regs[1],regs[2],regs[3],
+                unsigned(stack_valid),stack[0],stack[1],stack[2],stack[3]);
+        }
+    }
+#endif
     if (thunk_id < m_id_to_handler.size() && m_id_to_handler[thunk_id]) {
 #if !defined(BL2_NATIVE_ARM32)
         if (Bl2GlWorkerDispatch(thunk_id, m_id_to_name[thunk_id], m_id_to_handler[thunk_id], jit, m_host))

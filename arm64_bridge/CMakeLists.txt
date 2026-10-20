@@ -11,9 +11,11 @@ option(HORN_ENABLE_PERF_PROBE "Compile on-device performance diagnostics" OFF)
 option(HORN_ENABLE_LOGGING "Compile bridge and forwarded guest logcat output" OFF)
 option(HORN_ENABLE_PHYSX_COOKIE_WATCH "Compile optional default-off BL2 PhysX first-write diagnostic" OFF)
 option(HORN_GL_SELF_CHECK "Compile bounded real GLES guest-thunk regression" OFF)
+option(BL2_ENABLE_QA_CONSOLE "Compile the opt-in QA console without other diagnostics" OFF)
+option(BL2_ENABLE_DLC_CONTENT "Load optional external DLC OBB content" ON)
 option(BL2_ENABLE_DEBUG_MENU_DEFAULT "Show Pause Debug by default in development builds" OFF)
 option(HORN_SILENT_LOGCAT "Final build: no bridge logcat output, BL2* Java tags dropped on Android 11+" OFF)
-if(HORN_SILENT_LOGCAT AND (HORN_ENABLE_LOGGING OR HORN_ENABLE_PERF_PROBE OR HORN_ENABLE_PHYSX_COOKIE_WATCH))
+if(HORN_SILENT_LOGCAT AND (HORN_ENABLE_LOGGING OR HORN_ENABLE_PERF_PROBE OR HORN_ENABLE_PHYSX_COOKIE_WATCH OR BL2_ENABLE_QA_CONSOLE))
     message(FATAL_ERROR "HORN_SILENT_LOGCAT excludes the diagnostic options")
 endif()
 
@@ -360,6 +362,8 @@ add_subdirectory(
     "${CMAKE_CURRENT_BINARY_DIR}/bl2_touch")
 target_link_libraries(${BRIDGE_TARGET} PRIVATE bl2_touch_sources)
 target_compile_definitions(${BRIDGE_TARGET} PRIVATE
+    BL2_ENABLE_QA_CONSOLE=$<BOOL:${BL2_ENABLE_QA_CONSOLE}>
+    BL2_ENABLE_DLC_CONTENT=$<BOOL:${BL2_ENABLE_DLC_CONTENT}>
     BL2_ENABLE_DEBUG_MENU_DEFAULT=$<BOOL:${BL2_ENABLE_DEBUG_MENU_DEFAULT}>)
 target_compile_definitions(bl2_touch_sources PRIVATE
     BL2_ENABLE_DEBUG_MENU_DEFAULT=$<BOOL:${BL2_ENABLE_DEBUG_MENU_DEFAULT}>)

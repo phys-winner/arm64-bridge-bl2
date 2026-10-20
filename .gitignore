@@ -53,16 +53,24 @@
 *.crt
 *.der
 
-# This project versions only the ARM64 bridge, its controls and build tools.
+# Version the ARM32 compatibility layer, ARM64 bridge, controls and build tools.
 /*
 !/.gitattributes
 !/.gitignore
 !/LICENSE
 !/README.md
+!/CHANGELOG.md
 !/android_port/
+!/arm32_compat/
 !/arm64_bridge/
 !/touch_native_design/
 !/work/
+
+/arm32_compat/*
+!/arm32_compat/CMakeLists.txt
+!/arm32_compat/include/
+!/arm32_compat/src/
+!/arm32_compat/tests/
 
 /arm64_bridge/*
 !/arm64_bridge/CMakeLists.txt
@@ -79,7 +87,11 @@
 !/work/scripts/bl2_virtual_mouse.py
 !/work/scripts/bl2_virtual_multitouch.py
 !/work/scripts/build_bridge_apk.ps1
+!/work/scripts/build_arm32_apk.ps1
 !/work/scripts/build_launch_controls.ps1
+!/work/scripts/bake_bl2_vulkan_stages.py
+!/work/scripts/pack_bl2_vulkan_stages.py
+!/work/scripts/verify_removed_classes_in_apk.py
 !/work/scripts/invoke_game_button.ps1
 !/work/scripts/invoke_game_stick.ps1
 !/work/scripts/invoke_native_ui_gesture.ps1

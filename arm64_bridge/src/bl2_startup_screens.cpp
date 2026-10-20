@@ -30,10 +30,9 @@ bool StartupFlag(DynarmicHost& host, std::uint32_t string) {
     const auto count = host.MemoryRead32(string + 4);
     const auto capacity = host.MemoryRead32(string + 8);
     if (count > capacity || capacity > 4096 || !Span(host, data, count)) return false;
-    for (const std::string_view key : {"<Registry:SkipLegalScreen>", "<Registry:GoStraightToMainMenu>"})
-        if (count == key.size() + 1 && host.MemoryRead8(data + count - 1) == 0 &&
-            std::memcmp(host.GetGuestMemoryBase() + data, key.data(), key.size()) == 0) return true;
-    return false;
+    constexpr std::string_view key = "<Registry:SkipLegalScreen>";
+    return count == key.size() + 1 && host.MemoryRead8(data + count - 1) == 0 &&
+        std::memcmp(host.GetGuestMemoryBase() + data, key.data(), key.size()) == 0;
 }
 } // namespace
 
@@ -49,26 +48,37 @@ bool InstallBl2StartupScreens(DynarmicHost& host) {
     for (std::size_t i = 0; i < std::size(kGetFieldWords); ++i)
         if (host.MemoryRead32(base + kGetField + static_cast<std::uint32_t>(i * 4)) != kGetFieldWords[i] ||
             host.MemoryRead32(base + kStringAssign + static_cast<std::uint32_t>(i * 4)) != kAssignWords[i]) return false;
-    const auto replay = host.GuestAlloc(44, 4);
-    if (!replay) return false;
     const std::array<std::uint32_t, 11> words{
         kGetFieldWords[0], kGetFieldWords[1], 0xE51FF004, base + kGetField + 8,
         0xE92D4010, 0xE59FC008, 0xE12FFF3C, 0xE3A00001, 0xE8BD8010,
         base + kStringAssign, 0x31}; // Assign StringValue, return TRUE; "1" + NUL.
+#if defined(BL2_NATIVE_ARM32)
+    // Native execution needs the same owned executable veneer as its thunk entry.
+    const auto replay = host.CreateCodeVeneer(words);
+    if (!replay) return false;
+#else
+    const auto replay = host.GuestAlloc(sizeof(words), 4);
+    if (!replay) return false;
     for (std::size_t i = 0; i < words.size(); ++i)
         host.MemoryWrite32(replay + static_cast<std::uint32_t>(i * 4), words[i]);
+#endif
     const auto thunk = host.GetThunkManager().RegisterThunk("bl2_startup_screens",
         [replay](Dynarmic::A32::Jit& jit, DynarmicHost& current) {
             auto& regs = jit.Regs();
             if (Span(current, regs[2], 24) && !(regs[2] & 3) && StartupFlag(current, regs[1])) {
-                // Start/OnTick keep PendingLoginChange, SignIn and every save/session startup step.
+                // GoStraightToMainMenu runs before Start binds WPCOwner and bypasses loading the last save.
                 // UIRoot's script getter copies FUIProviderFieldValue.StringValue at +0x0C.
                 regs[0] = regs[2] + 12;
                 regs[1] = replay + 40;
                 regs[15] = replay + 16;
             } else regs[15] = replay;
         });
-    if (!thunk) { host.GuestFree(replay); return false; }
+    if (!thunk) {
+#if !defined(BL2_NATIVE_ARM32)
+        host.GuestFree(replay);
+#endif
+        return false;
+    }
     host.AddExecutableRange(replay, 40);
     host.MemoryWrite32(base + kGetField, 0xE51FF004);
     host.MemoryWrite32(base + kGetField + 4, thunk);

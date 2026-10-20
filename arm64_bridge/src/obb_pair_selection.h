@@ -35,6 +35,14 @@ constexpr std::string_view kMainObbName =
     "main.31.com.tt2kgames.Borderlands2.obb";
 constexpr std::string_view kPatchObbName =
     "patch.31.com.tt2kgames.Borderlands2.obb";
+// These ZIP containers use the retained-region loader; original FOOB::mount
+// trusts a raw OBB index header and must never receive them from readdir.
+constexpr bool IsManagedBl2ZipObbName(std::string_view name) {
+    constexpr std::string_view suffix = ".31.com.tt2kgames.Borderlands2.obb";
+    return name.find_first_of("/\\") == std::string_view::npos &&
+           (name == "russian_voice.31.com.tt2kgames.Borderlands2.obb" ||
+            (name.starts_with("dlc_") && name.ends_with(suffix)));
+}
 constexpr uint64_t kMainObbSize = 2113753088ULL;
 // This base is paired with the fully verified ASTC4 cache. Earlier seed280
 // and its ETC2 cache remain the rollback pair; never infer a codec from size.
